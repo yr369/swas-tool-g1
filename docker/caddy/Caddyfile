@@ -1,0 +1,18 @@
+# Caddyfile - reverse proxy configuration
+#
+# This is set up for plain HTTP on your OCI server's IP address for now.
+# Once you point a real domain name at this server, change ":80" below to
+# your domain (e.g. "swas.yourdomain.com") and Caddy will automatically
+# get you a free HTTPS certificate - no extra config needed for that part.
+
+:80 {
+	# API requests go to the backend
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+
+	# Everything else goes to the frontend
+	handle {
+		reverse_proxy frontend:80
+	}
+}

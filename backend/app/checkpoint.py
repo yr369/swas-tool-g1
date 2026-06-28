@@ -1,0 +1,171 @@
+"""
+checkpoint.py - the resilience layer. Every pipeline phase, for every
+target, MUST go through this module to record its progress.
+
+Plain-language explanation: think of this as a logbook. Before doing any
+scanning work, we write "starting recon on target X" to the database.
+When it finishes, we write "done" or "failed: <reason>". If the whole
+app crashes mid-scan, the logbook still has the last entry - so on
+restart, we can look at the logbook and know exactly what was happening,
+instead of guessing or silently losing track.
+
+This is the module that makes the "self-healing" / "crash-safe" behavior
+actually work. Nothing about scan progress should ever live only in
+Python memory - it goes through here, into Postgres, every time.
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+import asyncpg
+
+logger = logging.getLogger("swas.checkpoint")
+
+# Phases that don't improve by being retried blindly forever - cap retries
+# so a permanently broken target doesn't loop forever.
+MAX_RETRIES = 1
+
+
+async def create_pending_run(
+    conn: asyncpg.Connection, project_id: int, target_id: int, phase_name: str
+) -> int:
+    """
+    Creates a 'pending' row for a phase before any work starts. Returns
+    the new phase_run's id, which the caller uses to update it later.
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO phase_runs (project_id, target_id, phase_name, status)
+        VALUES ($1, $2, $3, 'pending')
+        RETURNING id
+        """,
+        project_id,
+        target_id,
+        phase_name,
+    )
+    return row["id"]
+
+
+@asynccontextmanager
+async def run_phase(conn: asyncpg.Connection, phase_run_id: int):
+    """
+    A context manager that wraps the ACTUAL scanning work for one phase,
+    on one target. Use it like this:
+
+        async with run_phase(conn, phase_run_id):
+            result = await run_subfinder(target)
+            ...
+
+    What it does automatically:
+      - Marks the row 'in_progress' with a start time, right before your
+        code runs
+      - If your code finishes without raising an exception, marks the
+        row 'completed' with an end time
+      - If your code raises ANY exception, it is caught here, logged with
+        the real error message (never silently swallowed), the row is
+        marked 'failed', and the exception is then re-raised so the
+        caller (the pipeline orchestrator) knows this phase didn't
+        succeed and can decide whether to retry or move on.
+
+    This is the single place that implements "never silently lose a
+    failure" - every phase, no matter what tool it's running, gets this
+    same safety net.
+    """
+    await conn.execute(
+        """
+        UPDATE phase_runs
+        SET status = 'in_progress', started_at = $2
+        WHERE id = $1
+        """,
+        phase_run_id,
+        datetime.now(timezone.utc),
+    )
+
+    try:
+        yield
+    except Exception as exc:
+        # Log the REAL error - this is the fix for the known "silent
+        # exception swallowing" bug from earlier versions of this tool.
+        logger.exception("Phase run %s failed", phase_run_id)
+
+        await conn.execute(
+            """
+            UPDATE phase_runs
+            SET status = 'failed',
+                completed_at = $2,
+                error_message = $3,
+                retry_count = retry_count + 1
+            WHERE id = $1
+            """,
+            phase_run_id,
+            datetime.now(timezone.utc),
+            str(exc)[:2000],  # cap length so one giant error can't bloat the row
+        )
+        # Re-raise so the orchestrator (pipeline.py) knows this failed and
+        # can apply retry/skip logic. We never swallow the error here.
+        raise
+    else:
+        await conn.execute(
+            """
+            UPDATE phase_runs
+            SET status = 'completed', completed_at = $2
+            WHERE id = $1
+            """,
+            phase_run_id,
+            datetime.now(timezone.utc),
+        )
+
+
+async def mark_needs_attention(
+    conn: asyncpg.Connection, phase_run_id: int, reason: str
+) -> None:
+    """
+    Used when a phase has failed and already used up its retries. Instead
+    of trying again and again, we flag it for a human to look at and move
+    the pipeline on to the next target - this is what stops one broken
+    target from blocking the whole queue.
+    """
+    await conn.execute(
+        """
+        UPDATE phase_runs
+        SET status = 'needs_attention', error_message = $2
+        WHERE id = $1
+        """,
+        phase_run_id,
+        reason[:2000],
+    )
+
+
+async def get_interrupted_runs(conn: asyncpg.Connection) -> list[asyncpg.Record]:
+    """
+    Called once when the app starts up. Finds any phase_runs that were
+    left 'in_progress' the last time the app ran - meaning the app
+    crashed or was restarted mid-scan, and that phase never got a chance
+    to mark itself completed or failed.
+
+    These get flagged 'needs_attention' rather than silently resumed,
+    because we can't be sure how much of the tool's work actually
+    finished before the crash - it's safer to have a human glance at it
+    than to guess.
+    """
+    rows = await conn.fetch(
+        "SELECT id, project_id, target_id, phase_name FROM phase_runs WHERE status = 'in_progress'"
+    )
+    return rows
+
+
+async def recover_interrupted_runs(conn: asyncpg.Connection) -> int:
+    """
+    Marks any leftover 'in_progress' rows as 'needs_attention' on
+    startup. Returns how many were found, so the app can log a clear
+    message like "found 2 interrupted scans from before a restart."
+    """
+    interrupted = await get_interrupted_runs(conn)
+    for row in interrupted:
+        await mark_needs_attention(
+            conn,
+            row["id"],
+            "Interrupted: app restarted while this phase was in progress",
+        )
+    return len(interrupted)

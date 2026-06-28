@@ -1,0 +1,25 @@
+# Secrets - never commit these
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Node / frontend
+node_modules/
+dist/
+frontend/.vite/
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scan data / logs (these live in Docker volumes on the server, not in git)
+backend/scan_data/
+*.log
