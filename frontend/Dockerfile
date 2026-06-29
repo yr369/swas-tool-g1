@@ -1,9 +1,19 @@
-# Placeholder Dockerfile - will be completed when we build the actual
-# React frontend in a later step.
+# Frontend Dockerfile - multi-stage build.
+#
+# Stage 1 compiles the React app into static files (HTML/JS/CSS).
+# Stage 2 serves those static files with nginx - a much smaller, simpler
+# final image than shipping Node.js itself, which isn't needed at runtime.
+
+FROM node:20-alpine AS build
+
+WORKDIR /app
+COPY package.json ./
+RUN npm install
+COPY . .
+RUN npm run build
 
 FROM nginx:alpine
 
-# Real build steps (npm install, npm run build, copy dist/) will replace
-# this once frontend/src/ has actual code in it.
+COPY --from=build /app/dist /usr/share/nginx/html
 
-RUN echo "SWAS frontend placeholder" > /usr/share/nginx/html/index.html
+EXPOSE 80

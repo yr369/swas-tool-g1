@@ -1,0 +1,94 @@
+/* ---------- Design tokens ---------- */
+:root {
+  /* Surfaces */
+  --bg-canvas: #14171c;
+  --bg-surface: #1c2128;
+  --bg-surface-raised: #242a33;
+  --border: #2d333d;
+  --border-strong: #3d4654;
+
+  /* Text */
+  --text-primary: #e6e8eb;
+  --text-secondary: #a8b0bb;
+  --text-muted: #6e7681;
+
+  /* Accent (used sparingly: primary actions, active pipeline stage) */
+  --accent: #4fd1c5;
+  --accent-dim: #2a4a47;
+  --on-accent: #0a1f1d;
+
+  /* Severity - this is the actual content of the tool, not decoration */
+  --sev-critical: #f85149;
+  --sev-critical-bg: #3d1f1d;
+  --sev-high: #db6d28;
+  --sev-high-bg: #3d2a1a;
+  --sev-medium: #d4a72c;
+  --sev-medium-bg: #3a321a;
+  --sev-low: #58a6ff;
+  --sev-low-bg: #1a2a3d;
+  --sev-info: #6e7681;
+  --sev-info-bg: #2a2d33;
+
+  /* Status */
+  --status-success: #3fb950;
+  --status-fail: #f85149;
+  --status-pending: #6e7681;
+
+  /* Layout */
+  --radius: 6px;
+  --radius-lg: 10px;
+
+  /* Type */
+  --font-ui: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+button {
+  font-family: var(--font-ui);
+}
+
+/* Visible keyboard focus - accessibility floor, not optional */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+}
