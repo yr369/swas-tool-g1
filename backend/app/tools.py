@@ -163,10 +163,17 @@ async def run_subfinder(domain: str) -> ToolResult:
 
 
 async def run_httpx(hosts: list[str]) -> ToolResult:
-    """Probes a list of hosts to see which are actually alive/responding."""
+    """
+    Probes a list of hosts to see which are actually alive/responding.
+
+    Calls the binary as "httpx-pd" (not "httpx") because the Python httpx
+    library's own CLI wrapper collides with the real security tool's name
+    in this container - see the comment in the Dockerfile for the full
+    explanation. "pd" = ProjectDiscovery, the tool's maker.
+    """
     return await run_tool(
         "httpx",
-        ["httpx", "-silent"] + hosts,
+        ["httpx-pd", "-silent"] + hosts,
         timeout_seconds=120,
     )
 

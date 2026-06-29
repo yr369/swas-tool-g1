@@ -30,6 +30,15 @@ WORKDIR /app
 # Copy the Go-built tool binaries from the builder stage above
 COPY --from=tools-builder /go/bin/ /usr/local/bin/
 
+# IMPORTANT: the Python "httpx" library (an HTTP client, listed in
+# requirements.txt for our own backend code to use) installs its own small
+# CLI wrapper also named "httpx". Since pip runs AFTER this COPY step, it
+# would silently overwrite the real security tool at /usr/local/bin/httpx
+# with its own unrelated script - this caused a real bug where the actual
+# scanner silently stopped working. Fix: rename the REAL tool to a name
+# that can't collide, and update tools.py to call it by that name.
+RUN mv /usr/local/bin/httpx /usr/local/bin/httpx-pd
+
 # System dependencies needed for sqlmap (it's a Python tool but ships as
 # a git-cloned script, not a pip package) and for arjun (pip package).
 RUN apt-get update && apt-get install -y --no-install-recommends \

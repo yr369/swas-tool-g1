@@ -18,6 +18,7 @@ that proves the foundation works.
 """
 
 import logging
+import os
 
 import asyncpg
 
@@ -268,8 +269,21 @@ async def _save_finding(
 
 
 async def _phase_notify(target: str) -> None:
-    """Best-effort notification. A failure here should not be treated as
-    a pipeline failure - it's a courtesy, not a critical step."""
+    """
+    Best-effort notification. A failure here should not be treated as a
+    pipeline failure - it's a courtesy, not a critical step.
+
+    Phase 1 has no notification destination configured yet (no Slack/
+    Discord webhook, etc.) - rather than calling the notify tool and
+    logging a confusing-looking error every single scan, we skip it
+    cleanly and say so. Once a real destination is set up (a later,
+    deliberate decision - see NOTIFY_WEBHOOK_URL in .env), this will
+    start actually sending alerts.
+    """
+    if not os.environ.get("NOTIFY_WEBHOOK_URL"):
+        logger.info("notify: skipped (no notification destination configured yet)")
+        return
+
     result = await tools.run_notify(f"Scan completed for {target}")
     if not result.success:
         logger.info("notify phase had a non-fatal issue: %s", result.error)
