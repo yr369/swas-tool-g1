@@ -170,10 +170,20 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
     library's own CLI wrapper collides with the real security tool's name
     in this container - see the comment in the Dockerfile for the full
     explanation. "pd" = ProjectDiscovery, the tool's maker.
+
+    IMPORTANT: httpx-pd does NOT accept bare hostnames as positional
+    arguments - each host must be passed with "-u" (its "-target" flag).
+    Passing hosts without "-u" silently produces no output and no error,
+    which is exactly the bug this comment is here to prevent someone from
+    reintroducing.
     """
+    target_flags = []
+    for host in hosts:
+        target_flags.extend(["-u", host])
+
     return await run_tool(
         "httpx",
-        ["httpx-pd", "-silent"] + hosts,
+        ["httpx-pd", "-silent"] + target_flags,
         timeout_seconds=120,
     )
 
