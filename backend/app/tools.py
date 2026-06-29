@@ -24,6 +24,7 @@ to guess.
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 
 logger = logging.getLogger("swas.tools")
@@ -31,6 +32,15 @@ logger = logging.getLogger("swas.tools")
 # Default timeout for any single tool invocation. Individual calls can
 # override this, but everything gets SOME timeout - no tool runs forever.
 DEFAULT_TIMEOUT_SECONDS = 300  # 5 minutes
+
+# Many CLI security tools (nuclei, dalfox, etc.) colorize their terminal
+# output by default using ANSI escape codes. Those codes are meant for a
+# human looking at a terminal - they're useless and unreadable once
+# stored as text in our database or shown in a web UI. NO_COLOR is a
+# widely-supported convention (https://no-color.org/) that tells any
+# tool respecting it to skip colorizing. We set this for every subprocess
+# we launch, rather than hunting down each tool's own specific flag.
+_SUBPROCESS_ENV = {**os.environ, "NO_COLOR": "1"}
 
 
 @dataclass
@@ -66,6 +76,7 @@ async def run_tool(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_SUBPROCESS_ENV,
         )
 
         try:
@@ -225,10 +236,18 @@ async def run_ffuf(url: str, wordlist_path: str) -> ToolResult:
 
 
 async def run_nuclei(target: str) -> ToolResult:
-    """Runs template-based vulnerability scanning against a target."""
+    """
+    Runs template-based vulnerability scanning against a target.
+
+    -no-color is important here, not just cosmetic: without it, nuclei's
+    output contains ANSI terminal color codes (e.g. "\x1b[92m"), which
+    get stored as-is in the findings table and show up as unreadable
+    garbage in any UI or report - this was caught during real testing
+    against scanme.nmap.org.
+    """
     return await run_tool(
         "nuclei",
-        ["nuclei", "-u", target, "-silent"],
+        ["nuclei", "-u", target, "-silent", "-no-color"],
         timeout_seconds=300,
     )
 
