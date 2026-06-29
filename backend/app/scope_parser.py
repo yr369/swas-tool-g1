@@ -12,15 +12,25 @@ actually use. The operator ALWAYS reviews this list before anything is
 saved - Gemini's output here is a draft, never the final word.
 """
 
+import asyncio
 import json
 import logging
 import os
 
 from google import genai
+from google.genai import errors as genai_errors
 
 from .models import ParsedScopeItem
 
 logger = logging.getLogger("swas.scope_parser")
+
+# Gemini models occasionally return 503 "high demand" errors, especially
+# right after a new model version launches - this is a known, documented,
+# widespread issue on Google's side, not specific to this app. A small
+# number of retries with increasing delay smooths over these temporary
+# blips without the operator ever noticing.
+_MAX_RETRIES = 3
+_RETRY_DELAY_SECONDS = 3
 
 _PROMPT_TEMPLATE = """You are helping parse a bug bounty program's scope \
 definition into a structured format. The program is on the "{platform}" \
@@ -62,6 +72,40 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+async def _call_gemini_with_retry(client: genai.Client, prompt: str):
+    """
+    Calls Gemini, retrying a limited number of times if the error looks
+    like a temporary server-side overload (503/UNAVAILABLE). Other kinds
+    of errors (bad API key, invalid request, etc.) are NOT retried - there
+    is no point retrying something that will fail the same way every time.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+        except genai_errors.ServerError as exc:
+            # ServerError covers 503/UNAVAILABLE and similar - these are
+            # the genuinely transient, worth-retrying cases.
+            last_error = exc
+            logger.warning(
+                "Gemini call failed (attempt %d/%d), will retry: %s",
+                attempt, _MAX_RETRIES, exc,
+            )
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_RETRY_DELAY_SECONDS * attempt)
+        except Exception as exc:
+            # Anything else (bad API key, malformed request, etc.) - fail
+            # immediately rather than retrying something that won't change.
+            raise
+
+    # If we get here, every retry was exhausted.
+    raise last_error
+
+
 async def parse_scope_text(platform: str, raw_text: str) -> list[ParsedScopeItem]:
     """
     Sends raw scope text to Gemini and returns a list of validated
@@ -77,13 +121,12 @@ async def parse_scope_text(platform: str, raw_text: str) -> list[ParsedScopeItem
     prompt = _PROMPT_TEMPLATE.format(platform=platform, raw_text=raw_text.strip())
 
     try:
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt,
-        )
+        response = await _call_gemini_with_retry(client, prompt)
     except Exception as exc:
-        logger.exception("Gemini API call failed during scope parsing")
-        raise ValueError(f"Could not reach the AI parser: {exc}") from exc
+        logger.exception("Gemini API call failed during scope parsing (all retries exhausted)")
+        raise ValueError(
+            f"Could not reach the AI parser after {_MAX_RETRIES} attempts: {exc}"
+        ) from exc
 
     raw_response_text = (response.text or "").strip()
 
