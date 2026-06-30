@@ -31,6 +31,9 @@ from .models import (
     ScopeConfirmRequest,
     Finding,
     PhaseRun,
+    OutcomeLogRequest,
+    OutcomeRecord,
+    SignatureStats,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -354,6 +357,82 @@ async def triage_all_findings(project_id: int):
             triaged += 1
 
     return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
+
+
+# ---------- Outcome tracking (the learning loop) ----------
+
+@app.post("/api/outcomes", response_model=OutcomeRecord)
+async def log_outcome(payload: OutcomeLogRequest):
+    """
+    Records a real-world result for a finding (accepted/duplicate/
+    rejected/etc. from Bugcrowd or HackerOne). This is the actual
+    training signal for the learning loop - logged by the operator after
+    a program responds to a submission.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO finding_outcomes (finding_id, signature, outcome, platform, notes)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, finding_id, signature, outcome, platform, notes, recorded_at
+            """,
+            payload.finding_id,
+            payload.signature,
+            payload.outcome,
+            payload.platform,
+            payload.notes,
+        )
+    return dict(row)
+
+
+@app.get("/api/outcomes/signature-stats", response_model=List[SignatureStats])
+async def get_signature_stats(signature: str = None):
+    """
+    Returns aggregated outcome history per signature. If a specific
+    signature is passed, returns just that one; otherwise returns all
+    signatures with at least one logged outcome. This is what future
+    triage logic will query before scoring a new finding - "have we
+    seen this pattern before, and what happened?"
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        if signature:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    signature,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE outcome = 'accepted') AS accepted,
+                    COUNT(*) FILTER (WHERE outcome = 'duplicate') AS duplicate,
+                    COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected,
+                    COUNT(*) FILTER (WHERE outcome = 'informative') AS informative,
+                    COUNT(*) FILTER (WHERE outcome = 'not_applicable') AS not_applicable,
+                    COUNT(*) FILTER (WHERE outcome = 'no_response') AS no_response
+                FROM finding_outcomes
+                WHERE signature = $1
+                GROUP BY signature
+                """,
+                signature,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    signature,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE outcome = 'accepted') AS accepted,
+                    COUNT(*) FILTER (WHERE outcome = 'duplicate') AS duplicate,
+                    COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected,
+                    COUNT(*) FILTER (WHERE outcome = 'informative') AS informative,
+                    COUNT(*) FILTER (WHERE outcome = 'not_applicable') AS not_applicable,
+                    COUNT(*) FILTER (WHERE outcome = 'no_response') AS no_response
+                FROM finding_outcomes
+                GROUP BY signature
+                ORDER BY total DESC
+                """
+            )
+    return [dict(row) for row in rows]
 
 
 # ---------- Scanning pipeline ----------

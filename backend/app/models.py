@@ -120,3 +120,39 @@ class ScopeConfirmRequest(BaseModel):
     platform: Literal["bugcrowd", "hackerone"]
     items: list[ParsedScopeItem]
 
+
+# ---------- Outcome tracking (the learning loop) ----------
+
+class OutcomeLogRequest(BaseModel):
+    """What the operator submits after a real Bugcrowd/HackerOne result
+    comes back for a finding they reported."""
+    finding_id: Optional[int] = None
+    signature: str  # e.g. "nuclei:CVE-2023-48795:website"
+    outcome: Literal["accepted", "duplicate", "rejected", "informative", "not_applicable", "no_response"]
+    platform: Optional[Literal["bugcrowd", "hackerone"]] = None
+    notes: Optional[str] = None
+
+
+class OutcomeRecord(BaseModel):
+    id: int
+    finding_id: Optional[int]
+    signature: str
+    outcome: str
+    platform: Optional[str]
+    notes: Optional[str]
+    recorded_at: datetime
+
+
+class SignatureStats(BaseModel):
+    """Aggregated history for a signature - what triage can look up to
+    see 'findings like this were rejected 4 times before'."""
+    signature: str
+    total: int
+    accepted: int
+    duplicate: int
+    rejected: int
+    informative: int
+    not_applicable: int
+    no_response: int
+
+
