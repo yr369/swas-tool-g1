@@ -20,7 +20,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from . import checkpoint, database, pipeline, scope_parser
+from . import checkpoint, database, pipeline, scope_parser, triage
 from .models import (
     Project,
     ProjectCreate,
@@ -302,6 +302,58 @@ async def list_findings(project_id: int):
             project_id,
         )
     return [dict(row) for row in rows]
+
+
+@app.post("/api/findings/{finding_id}/triage")
+async def triage_one_finding(finding_id: int):
+    """
+    Runs AI triage on a single finding (tiered: cheap model first,
+    escalates only if confidence is low) and updates its severity.
+    Kept as an explicit, on-demand call rather than automatic during
+    scanning, so triage cost/time never slows down the live scan.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        finding = await conn.fetchrow(
+            "SELECT id, tool_name, evidence FROM findings WHERE id = $1", finding_id
+        )
+        if finding is None:
+            raise HTTPException(status_code=404, detail="Finding not found")
+
+        result = await triage.triage_finding(finding["tool_name"], finding["evidence"] or "")
+
+        await conn.execute(
+            "UPDATE findings SET severity = $1 WHERE id = $2",
+            result["severity"] if result["severity"] in
+            ("critical", "high", "medium", "low", "info") else "unknown",
+            finding_id,
+        )
+
+    return {"finding_id": finding_id, **result}
+
+
+@app.post("/api/projects/{project_id}/triage-all")
+async def triage_all_findings(project_id: int):
+    """Triages every 'unknown'-severity finding in a project, one at a time."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, tool_name, evidence FROM findings WHERE project_id = $1 AND severity = 'unknown'",
+            project_id,
+        )
+
+        triaged = 0
+        for row in rows:
+            result = await triage.triage_finding(row["tool_name"], row["evidence"] or "")
+            await conn.execute(
+                "UPDATE findings SET severity = $1 WHERE id = $2",
+                result["severity"] if result["severity"] in
+                ("critical", "high", "medium", "low", "info") else "unknown",
+                row["id"],
+            )
+            triaged += 1
+
+    return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
 
 
 # ---------- Scanning pipeline ----------
