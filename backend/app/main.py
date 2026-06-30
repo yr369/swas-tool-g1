@@ -20,7 +20,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from . import checkpoint, database, pipeline, scope_parser, triage, vrt
+from . import checkpoint, database, pipeline, readiness, scope_parser, triage, vrt
 from .models import (
     Project,
     ProjectCreate,
@@ -34,6 +34,7 @@ from .models import (
     OutcomeLogRequest,
     OutcomeRecord,
     SignatureStats,
+    ReadinessResponse,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -543,3 +544,35 @@ async def list_phase_runs(project_id: int):
             project_id,
         )
     return [dict(row) for row in rows]
+
+
+# ---------- Submission readiness ----------
+
+@app.get("/api/findings/{finding_id}/readiness", response_model=ReadinessResponse)
+async def get_finding_readiness(finding_id: int):
+    """
+    Runs the submission readiness checklist against a finding - catches
+    common, avoidable rejection reasons (untriaged severity, thin
+    evidence, stale scope, info-level findings rarely worth submitting)
+    before the operator spends time writing up a report.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        finding = await conn.fetchrow(
+            "SELECT id, severity, evidence, status, target_id FROM findings WHERE id = $1",
+            finding_id,
+        )
+        if finding is None:
+            raise HTTPException(status_code=404, detail="Finding not found")
+
+        target = await conn.fetchrow(
+            "SELECT in_scope FROM scope_targets WHERE id = $1", finding["target_id"]
+        )
+        target_in_scope = bool(target["in_scope"]) if target else False
+
+    result = readiness.check_finding_readiness(dict(finding), target_in_scope)
+    return {
+        "finding_id": finding_id,
+        "ready": result.ready,
+        "checks": [{"name": c.name, "passed": c.passed, "detail": c.detail} for c in result.checks],
+    }

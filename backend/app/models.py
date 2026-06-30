@@ -156,3 +156,17 @@ class SignatureStats(BaseModel):
     no_response: int
 
 
+# ---------- Submission readiness ----------
+
+class ReadinessCheckResult(BaseModel):
+    name: str
+    passed: bool
+    detail: str
+
+
+class ReadinessResponse(BaseModel):
+    finding_id: int
+    ready: bool
+    checks: list[ReadinessCheckResult]
+
+
