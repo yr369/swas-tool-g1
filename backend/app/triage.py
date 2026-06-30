@@ -34,7 +34,7 @@ Evidence (raw tool output, may contain multiple lines):
 ---
 {evidence}
 ---
-
+{outcome_context}
 Respond with ONLY a JSON object, no other text, no markdown fences:
 {{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence"}}
 
@@ -47,6 +47,38 @@ classification (the evidence is ambiguous, contradictory, or you're
 guessing), set confidence below 0.6 - this is expected and fine, it
 routes the finding to a closer look rather than forcing a bad guess.
 """
+
+
+def build_signature(tool_name: str, vuln_type: str, target_type: str = "website") -> str:
+    """
+    Builds the stable pattern key used to look up past outcomes - e.g.
+    "nuclei:CVE-2023-48795:website". Keeping this in one function means
+    triage and outcome-logging always agree on the same format.
+    """
+    return f"{tool_name}:{vuln_type}:{target_type}"
+
+
+def _format_outcome_context(stats: dict | None) -> str:
+    """
+    Turns aggregated past-outcome stats into a short block injected into
+    the prompt. Returns "" (nothing added) if there's no history yet -
+    this is the realistic case for a brand-new signature, and the prompt
+    should read naturally without it, not reference an empty history.
+    """
+    if not stats or stats.get("total", 0) == 0:
+        return ""
+
+    total = stats["total"]
+    return (
+        f"\nHistorical context: findings matching this exact pattern have been "
+        f"submitted {total} time(s) before, with these outcomes: "
+        f"{stats.get('accepted', 0)} accepted, {stats.get('duplicate', 0)} duplicate, "
+        f"{stats.get('rejected', 0)} rejected, {stats.get('informative', 0)} informative, "
+        f"{stats.get('not_applicable', 0)} not applicable. Weigh this history when judging "
+        f"severity and confidence - e.g. a pattern rejected every time before should lower "
+        f"your confidence in it being worth high severity, unless this specific evidence "
+        f"clearly differs from past instances.\n"
+    )
 
 
 def _get_client() -> genai.Client:
@@ -77,13 +109,20 @@ def _parse_triage_response(text: str) -> dict:
     return json.loads(text)
 
 
-async def triage_finding(tool_name: str, evidence: str) -> dict:
+async def triage_finding(tool_name: str, evidence: str, outcome_stats: dict | None = None) -> dict:
     """
     Returns {"severity": str, "confidence": float, "reasoning": str,
     "model_used": str}. Token budget is kept small on purpose - evidence
     is capped, and we send one finding at a time rather than dumping
     unrelated context, so cost scales with actual findings, not with
     everything we happen to know.
+
+    outcome_stats (optional): aggregated past-outcome history for this
+    finding's signature, from finding_outcomes via get_signature_stats().
+    When provided and non-empty, it's woven into the prompt as real
+    context - this is the actual "learns from mistakes" mechanism. When
+    absent (a brand-new pattern with no history), triage proceeds exactly
+    as before with no behavior change.
 
     Tries the cheap model first. If its own reported confidence is below
     0.6, escalates ONE retry to the stronger model - this is the
@@ -93,7 +132,10 @@ async def triage_finding(tool_name: str, evidence: str) -> dict:
     # Cap evidence length sent to the model - keeps prompts small/cheap
     # and avoids wasting tokens on truncated-anyway giant tool dumps.
     capped_evidence = evidence[:2000]
-    prompt = _TRIAGE_PROMPT.format(tool_name=tool_name, evidence=capped_evidence)
+    outcome_context = _format_outcome_context(outcome_stats)
+    prompt = _TRIAGE_PROMPT.format(
+        tool_name=tool_name, evidence=capped_evidence, outcome_context=outcome_context
+    )
 
     try:
         response = await _call_with_retry(client, _CHEAP_MODEL, prompt)

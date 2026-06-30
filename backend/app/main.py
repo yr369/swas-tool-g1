@@ -314,16 +314,26 @@ async def triage_one_finding(finding_id: int):
     escalates only if confidence is low) and updates its severity.
     Kept as an explicit, on-demand call rather than automatic during
     scanning, so triage cost/time never slows down the live scan.
+
+    Before scoring, looks up past outcomes for this finding's signature
+    (tool + vuln_type) and feeds that history into the prompt - this is
+    the actual retrieval step that makes triage "learn" from prior
+    accept/reject results over time.
     """
     pool = database.get_pool()
     async with pool.acquire() as conn:
         finding = await conn.fetchrow(
-            "SELECT id, tool_name, evidence FROM findings WHERE id = $1", finding_id
+            "SELECT id, tool_name, vuln_type, evidence FROM findings WHERE id = $1", finding_id
         )
         if finding is None:
             raise HTTPException(status_code=404, detail="Finding not found")
 
-        result = await triage.triage_finding(finding["tool_name"], finding["evidence"] or "")
+        signature = triage.build_signature(finding["tool_name"], finding["vuln_type"])
+        outcome_stats = await _fetch_signature_stats(conn, signature)
+
+        result = await triage.triage_finding(
+            finding["tool_name"], finding["evidence"] or "", outcome_stats=outcome_stats
+        )
 
         await conn.execute(
             "UPDATE findings SET severity = $1 WHERE id = $2",
@@ -332,22 +342,46 @@ async def triage_one_finding(finding_id: int):
             finding_id,
         )
 
-    return {"finding_id": finding_id, **result}
+    return {"finding_id": finding_id, "signature": signature, **result}
+
+
+async def _fetch_signature_stats(conn, signature: str) -> dict | None:
+    """Shared helper: looks up aggregated outcome history for one signature."""
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE outcome = 'accepted') AS accepted,
+            COUNT(*) FILTER (WHERE outcome = 'duplicate') AS duplicate,
+            COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected,
+            COUNT(*) FILTER (WHERE outcome = 'informative') AS informative,
+            COUNT(*) FILTER (WHERE outcome = 'not_applicable') AS not_applicable
+        FROM finding_outcomes
+        WHERE signature = $1
+        """,
+        signature,
+    )
+    return dict(row) if row and row["total"] else None
 
 
 @app.post("/api/projects/{project_id}/triage-all")
 async def triage_all_findings(project_id: int):
-    """Triages every 'unknown'-severity finding in a project, one at a time."""
+    """Triages every 'unknown'-severity finding in a project, one at a time,
+    looking up past outcome history per signature before each call."""
     pool = database.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, tool_name, evidence FROM findings WHERE project_id = $1 AND severity = 'unknown'",
+            "SELECT id, tool_name, vuln_type, evidence FROM findings WHERE project_id = $1 AND severity = 'unknown'",
             project_id,
         )
 
         triaged = 0
         for row in rows:
-            result = await triage.triage_finding(row["tool_name"], row["evidence"] or "")
+            signature = triage.build_signature(row["tool_name"], row["vuln_type"])
+            outcome_stats = await _fetch_signature_stats(conn, signature)
+            result = await triage.triage_finding(
+                row["tool_name"], row["evidence"] or "", outcome_stats=outcome_stats
+            )
             await conn.execute(
                 "UPDATE findings SET severity = $1 WHERE id = $2",
                 result["severity"] if result["severity"] in
