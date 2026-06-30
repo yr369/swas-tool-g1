@@ -194,7 +194,12 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
 
     return await run_tool(
         "httpx",
-        ["httpx-pd", "-silent"] + target_flags,
+        # -td: tech-detect, fingerprints the tech stack (server, CMS,
+        # frameworks) in one pass. -json: structured output so we can
+        # parse out the tech list reliably instead of scraping text.
+        # This is fingerprint-once, reuse-everywhere: every other tool
+        # downstream gets this info instead of re-detecting on its own.
+        ["httpx-pd", "-silent", "-td", "-json"] + target_flags,
         timeout_seconds=120,
     )
 

@@ -17,8 +17,10 @@ phases is NOT in this file yet - this is the straightforward version
 that proves the foundation works.
 """
 
+import json
 import logging
 import os
+import re
 
 import asyncpg
 
@@ -49,11 +51,12 @@ async def run_target_pipeline(
     live_hosts: list[str] = []
     discovered_urls: list[str] = []
     params_found: dict[str, bool] = {}
+    tech_stack: dict[str, list[str]] = {}  # host -> list of detected technologies
 
     for phase_name in PHASES:
         success = await _run_phase_with_retry(
             pool, project_id, target_id, phase_name, target,
-            discovered_subdomains, live_hosts, discovered_urls, params_found,
+            discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
         )
         if not success:
             logger.warning(
@@ -78,6 +81,31 @@ async def run_target_pipeline(
                 )
             break
 
+        # Out-of-scope drift check: scope can change mid-engagement (a
+        # program updates its brief while a scan is already running).
+        # Before the more invasive phases (fuzz/scan) run, re-read the
+        # CURRENT in_scope value from the database rather than trusting
+        # whatever it was when the scan started. This is a real safety
+        # behavior, not just an efficiency one - it stops us from
+        # actively fuzzing/scanning something that just got pulled out
+        # of scope.
+        if phase_name == "probe":
+            async with pool.acquire() as conn:
+                still_in_scope = await conn.fetchval(
+                    "SELECT in_scope FROM scope_targets WHERE id = $1", target_id
+                )
+            if not still_in_scope:
+                logger.warning(
+                    "target_id=%s: target was marked out-of-scope after the scan started - "
+                    "stopping before fuzz/scan phases run",
+                    target_id,
+                )
+                async with pool.acquire() as conn:
+                    await checkpoint.mark_remaining_phases_skipped(
+                        conn, project_id, target_id, after_phase="probe"
+                    )
+                break
+
     logger.info("Finished pipeline for target_id=%s", target_id)
 
 
@@ -91,6 +119,7 @@ async def _run_phase_with_retry(
     live_hosts: list[str],
     discovered_urls: list[str],
     params_found: dict[str, bool],
+    tech_stack: dict[str, list[str]],
 ) -> bool:
     """
     Runs one phase, retrying once if it fails, then giving up and
@@ -111,7 +140,7 @@ async def _run_phase_with_retry(
                 async with checkpoint.run_phase(conn, phase_run_id):
                     await _execute_phase(
                         conn, project_id, target_id, phase_name, target,
-                        discovered_subdomains, live_hosts, discovered_urls, params_found,
+                        discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
                     )
                 return True  # checkpoint.run_phase already marked it completed
 
@@ -143,6 +172,7 @@ async def _execute_phase(
     live_hosts: list[str],
     discovered_urls: list[str],
     params_found: dict[str, bool],
+    tech_stack: dict[str, list[str]],
 ) -> None:
     """
     The actual work for each phase. Raises an exception if something
@@ -153,13 +183,13 @@ async def _execute_phase(
         await _phase_recon(target, discovered_subdomains)
 
     elif phase_name == "probe":
-        await _phase_probe(target, discovered_subdomains, live_hosts, discovered_urls)
+        await _phase_probe(target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
 
     elif phase_name == "fuzz":
         await _phase_fuzz(live_hosts, params_found)
 
     elif phase_name == "scan":
-        await _phase_scan(conn, project_id, target_id, live_hosts, discovered_urls, params_found)
+        await _phase_scan(conn, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
 
     elif phase_name == "notify":
         await _phase_notify(target)
@@ -184,15 +214,36 @@ async def _phase_probe(
     discovered_subdomains: list[str],
     live_hosts: list[str],
     discovered_urls: list[str],
+    tech_stack: dict[str, list[str]],
 ) -> None:
-    """Check which discovered hosts are alive, and gather historical URLs."""
+    """Check which discovered hosts are alive, and gather historical URLs.
+
+    httpx now runs with -json -td (tech-detect), so each output line is a
+    JSON object with the host's URL and its detected tech stack, instead
+    of a plain hostname string. We parse that here once - this is the
+    "fingerprint once, reuse everywhere" behavior: every other tool
+    downstream gets tech_stack instead of re-detecting independently.
+    """
     hosts_to_check = discovered_subdomains or [target]
 
     httpx_result = await tools.run_httpx(hosts_to_check)
     if httpx_result.success:
-        live_hosts.extend(
-            line.strip() for line in httpx_result.stdout.splitlines() if line.strip()
-        )
+        for line in httpx_result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                url = record.get("url", "").strip()
+                if url:
+                    live_hosts.append(url)
+                    tech_stack[url] = record.get("tech", [])
+            except json.JSONDecodeError:
+                # Fall back to treating the raw line as a plain host -
+                # never silently drop a live host just because one line
+                # wasn't valid JSON (e.g. a stray log line mixed into
+                # stdout). No tech info for this one, that's fine.
+                live_hosts.append(line)
     # A non-fatal httpx failure shouldn't kill the whole phase - URL
     # discovery below can still proceed even without a live host list.
     # We still raise if BOTH httpx and the URL tools fail (see below).
@@ -239,6 +290,7 @@ async def _phase_scan(
     live_hosts: list[str],
     discovered_urls: list[str],
     params_found: dict[str, bool],
+    tech_stack: dict[str, list[str]],
 ) -> None:
     """
     Run the actual vulnerability scanners. nuclei runs against all live
@@ -246,11 +298,22 @@ async def _phase_scan(
     against hosts known to have parameters - this is the rule from the
     spec that avoids wasting time running injection tools against hosts
     with nothing to inject into.
+
+    tech_stack (from probe's httpx -td) is logged here for visibility -
+    knowing "this host runs Apache 2.4.7" alongside its findings is
+    useful context. We deliberately do NOT use it to skip tools yet
+    (e.g. "no CMS detected, skip CMS-specific templates") - that's a
+    real future optimization, but doing it safely needs care about which
+    detections are reliable enough to gate on. The proven params_found
+    check above stays as the sole gating logic for now.
     """
     for host in live_hosts[:10]:  # Phase 1: cap scope for the first working version
+        if tech_stack.get(host):
+            logger.info("scan: %s detected tech: %s", host, ", ".join(tech_stack[host]))
+
         nuclei_result = await tools.run_nuclei(host)
         if tools.looks_like_real_output(nuclei_result):
-            await _save_finding(conn, project_id, target_id, "nuclei", nuclei_result.stdout)
+            await _save_nuclei_findings(conn, project_id, target_id, nuclei_result.stdout)
 
         if params_found.get(host):
             dalfox_result = await tools.run_dalfox(host)
@@ -260,6 +323,74 @@ async def _phase_scan(
             sqlmap_result = await tools.run_sqlmap(host)
             if tools.looks_like_real_output(sqlmap_result):
                 await _save_finding(conn, project_id, target_id, "sqlmap", sqlmap_result.stdout)
+
+
+# nuclei's own severity tags map directly onto our schema's severity
+# values - no AI needed to know that nuclei already says "[medium]".
+_NUCLEI_SEVERITY_TAGS = {"critical", "high", "medium", "low", "info"}
+
+
+async def _save_nuclei_findings(
+    conn: asyncpg.Connection, project_id: int, target_id: int, raw_output: str
+) -> None:
+    """
+    Splits nuclei's bundled multi-line output into individual findings,
+    one per template match, instead of one blended finding for everything
+    nuclei found. This matters because nuclei already tells us the real
+    severity per line (e.g. "[CVE-2023-48795] ... [medium] ...") - bundling
+    27 results of mixed severity into one finding meant AI triage had to
+    guess at one verdict for a mix of info-level noise and a real CVE,
+    which is exactly the inconsistency we saw in real testing (the same
+    bundle got triaged as medium one time, high another). Splitting lets
+    each line get scored on its own merits.
+
+    Falls back to saving the whole block as one finding if a line doesn't
+    match nuclei's expected bracket format - never silently drops output
+    just because it didn't parse as expected.
+    """
+    cleaned_output, removed = fp_filter.filter_noise("nuclei", raw_output)
+    if removed:
+        logger.info("fp_filter: dropped %d noisy line(s) from nuclei output", removed)
+
+    unparsed_lines = []
+    saved_count = 0
+
+    for line in cleaned_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # nuclei -silent format: [template-id:tag] [protocol] [severity] target [extras]
+        # The severity is always the SECOND bracketed group after the
+        # template id and protocol.
+        brackets = re.findall(r"\[([^\]]*)\]", line)
+        severity = None
+        if len(brackets) >= 3 and brackets[2].lower() in _NUCLEI_SEVERITY_TAGS:
+            severity = brackets[2].lower()
+
+        vuln_type = brackets[0].split(":")[0] if brackets else "nuclei"
+
+        if severity is None:
+            unparsed_lines.append(line)
+            continue
+
+        await conn.execute(
+            """
+            INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
+            VALUES ($1, $2, 'nuclei', $3, $4, $5)
+            """,
+            project_id, target_id, vuln_type, severity, line[:1000],
+        )
+        saved_count += 1
+
+    if unparsed_lines:
+        # Anything that didn't match the expected format still gets
+        # saved, just bundled and left as 'unknown' for triage to handle
+        # - we never want a parsing miss to mean lost data.
+        await _save_finding(conn, project_id, target_id, "nuclei", "\n".join(unparsed_lines))
+
+    logger.info("nuclei: saved %d individual findings, %d unparsed line(s) bundled separately",
+                saved_count, len(unparsed_lines))
 
 
 async def _save_finding(
