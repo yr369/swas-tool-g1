@@ -22,7 +22,7 @@ import os
 
 import asyncpg
 
-from . import checkpoint, tools
+from . import checkpoint, fp_filter, tools
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -254,7 +254,20 @@ async def _save_finding(
     as 'unknown' and vuln_type as the tool name - the AI-assisted
     triage that assigns real severity/VRT categories comes in a later
     phase. This just makes sure no tool output is silently lost.
+
+    Known-noisy lines (per fp_filter.py) are stripped before storage -
+    zero-cost, no AI call, based on well-documented FP patterns. If
+    filtering removes EVERYTHING, we skip saving a finding at all rather
+    than storing an empty/useless row.
     """
+    cleaned_output, removed = fp_filter.filter_noise(tool_name, raw_output)
+    if removed:
+        logger.info("fp_filter: dropped %d noisy line(s) from %s output", removed, tool_name)
+
+    if not cleaned_output.strip():
+        logger.info("fp_filter: all %s output was noise, skipping finding", tool_name)
+        return
+
     await conn.execute(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
@@ -264,7 +277,7 @@ async def _save_finding(
         target_id,
         tool_name,
         tool_name,  # Phase 1: vuln_type defaults to the tool name until triage exists
-        raw_output[:5000],  # cap stored evidence length
+        cleaned_output[:5000],  # cap stored evidence length
     )
 
 
