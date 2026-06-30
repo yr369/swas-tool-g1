@@ -62,6 +62,22 @@ async def run_target_pipeline(
             )
             break
 
+        # Signal-based budgeting: if probe found zero live hosts, every
+        # later phase (fuzz, scan) would just run pointlessly against
+        # nothing. Stop here rather than burning time/compute on a dead
+        # target - this is the "don't waste resources" behavior we
+        # specifically designed for.
+        if phase_name == "probe" and not live_hosts:
+            logger.info(
+                "target_id=%s: no live hosts found, skipping remaining phases (dead target)",
+                target_id,
+            )
+            async with pool.acquire() as conn:
+                await checkpoint.mark_remaining_phases_skipped(
+                    conn, project_id, target_id, after_phase="probe"
+                )
+            break
+
     logger.info("Finished pipeline for target_id=%s", target_id)
 
 

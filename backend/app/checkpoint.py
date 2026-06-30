@@ -137,6 +137,45 @@ async def mark_needs_attention(
     )
 
 
+# Phases listed here so this module doesn't need to import pipeline.py
+# (which would create a circular import - pipeline.py imports checkpoint).
+_ALL_PHASES = ["recon", "probe", "fuzz", "scan", "notify"]
+
+
+async def mark_remaining_phases_skipped(
+    conn: asyncpg.Connection, project_id: int, target_id: int, after_phase: str
+) -> None:
+    """
+    Signal-based budgeting: when a target shows zero signal (e.g. probe
+    found no live hosts), running fuzz/scan against it would just waste
+    time and compute for no benefit. Rather than silently doing nothing,
+    we explicitly create 'completed' rows for the skipped phases with a
+    clear error_message explaining why - so this shows up honestly in
+    phase-runs as "skipped, here's why" rather than looking like it never
+    ran or like something crashed.
+
+    There's no separate 'skipped' status in the schema (avoiding a
+    migration for Phase 2) - 'completed' + an explanatory message is the
+    honest, queryable choice here.
+    """
+    remaining = _ALL_PHASES[_ALL_PHASES.index(after_phase) + 1:]
+    now = datetime.now(timezone.utc)
+
+    for phase_name in remaining:
+        await conn.execute(
+            """
+            INSERT INTO phase_runs
+                (project_id, target_id, phase_name, status, started_at, completed_at, error_message)
+            VALUES ($1, $2, $3, 'completed', $4, $4, $5)
+            """,
+            project_id,
+            target_id,
+            phase_name,
+            now,
+            f"Skipped: no live hosts found in probe phase (signal-based budgeting)",
+        )
+
+
 async def get_interrupted_runs(conn: asyncpg.Connection) -> list[asyncpg.Record]:
     """
     Called once when the app starts up. Finds any phase_runs that were
