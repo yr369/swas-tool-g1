@@ -87,10 +87,13 @@ export function ProjectDetail() {
   return (
     <div>
       <div style={{ marginBottom: 24 }}>
-        <h1 style={{ fontSize: 20, fontWeight: 600, margin: "0 0 4px" }}>{project.name}</h1>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <h1 style={{ fontSize: 20, fontWeight: 600, margin: "0 0 4px" }}>{project.name}</h1>
+          <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>#{project.id}</span>
+        </div>
         <p style={{ color: "var(--text-muted)", fontSize: 13, margin: 0 }}>
           {project.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {inScopeCount} in-scope target
-          {inScopeCount === 1 ? "" : "s"}
+          {inScopeCount === 1 ? "" : "s"} · Created {formatDate(project.created_at)}
         </p>
       </div>
 
@@ -185,3 +188,9 @@ const secondaryButtonStyle = {
   fontSize: 14,
   cursor: "pointer",
 };
+
+function formatDate(isoString) {
+  const date = new Date(isoString);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) +
+    " · " + date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}

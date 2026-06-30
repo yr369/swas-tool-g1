@@ -53,9 +53,14 @@ export function ProjectList() {
               }}
             >
               <div>
-                <div style={{ fontWeight: 500 }}>{p.name}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontWeight: 500 }}>{p.name}</span>
+                  <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                    #{p.id}
+                  </span>
+                </div>
                 <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-                  {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"}
+                  {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
                 </div>
               </div>
               <StatusPill status={p.status} />
@@ -65,6 +70,12 @@ export function ProjectList() {
       )}
     </div>
   );
+}
+
+function formatDate(isoString) {
+  const date = new Date(isoString);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) +
+    " · " + date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
 function StatusPill({ status }) {
