@@ -17,6 +17,7 @@ export function ProjectDetail() {
   const [phaseRuns, setPhaseRuns] = useState([]);
   const [findings, setFindings] = useState([]);
   const [scanStarting, setScanStarting] = useState(false);
+  const [triagingAll, setTriagingAll] = useState(false);
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
 
@@ -61,6 +62,19 @@ export function ProjectDetail() {
       setError(err.message);
     } finally {
       setScanStarting(false);
+    }
+  }
+
+  async function handleTriageAll() {
+    setTriagingAll(true);
+    setError(null);
+    try {
+      await api.triageAll(id);
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setTriagingAll(false);
     }
   }
 
@@ -125,7 +139,14 @@ export function ProjectDetail() {
       </Section>
 
       <Section title="Findings">
-        <FindingsList findings={findings} />
+        {findings.length > 0 && (
+          <div style={{ marginBottom: 12 }}>
+            <button onClick={handleTriageAll} disabled={triagingAll} style={secondaryButtonStyle}>
+              {triagingAll ? "Triaging…" : "Triage all untriaged findings"}
+            </button>
+          </div>
+        )}
+        <FindingsList findings={findings} onTriaged={loadAll} />
       </Section>
 
       {error && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{error}</p>}
@@ -152,5 +173,15 @@ const primaryButtonStyle = {
   padding: "8px 16px",
   fontSize: 14,
   fontWeight: 500,
+  cursor: "pointer",
+};
+
+const secondaryButtonStyle = {
+  background: "transparent",
+  color: "var(--text-secondary)",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius)",
+  padding: "8px 16px",
+  fontSize: 14,
   cursor: "pointer",
 };

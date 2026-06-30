@@ -59,6 +59,18 @@ export const api = {
   // Findings
   listFindings: (projectId) => request(`/projects/${projectId}/findings`),
 
+  // Triage
+  triageFinding: (findingId) => request(`/findings/${findingId}/triage`, { method: "POST" }),
+  triageAll: (projectId) => request(`/projects/${projectId}/triage-all`, { method: "POST" }),
+
+  // Readiness
+  getReadiness: (findingId) => request(`/findings/${findingId}/readiness`),
+
+  // Outcomes
+  logOutcome: (payload) => request("/outcomes", { method: "POST", body: JSON.stringify(payload) }),
+  getSignatureStats: (signature) =>
+    request(`/outcomes/signature-stats${signature ? `?signature=${encodeURIComponent(signature)}` : ""}`),
+
   // Health
   health: () => request("/health"),
 };
