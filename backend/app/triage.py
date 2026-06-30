@@ -34,9 +34,9 @@ Evidence (raw tool output, may contain multiple lines):
 ---
 {evidence}
 ---
-{outcome_context}
+{outcome_context}{vrt_context}
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence"}}
+{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence", "vrt_category": "closest matching VRT category name or null"}}
 
 Guidance: missing security headers, generic fingerprinting (server/version
 detection), and DNS records are almost always "info". Known CVEs with
@@ -109,13 +109,15 @@ def _parse_triage_response(text: str) -> dict:
     return json.loads(text)
 
 
-async def triage_finding(tool_name: str, evidence: str, outcome_stats: dict | None = None) -> dict:
+async def triage_finding(
+    tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None
+) -> dict:
     """
     Returns {"severity": str, "confidence": float, "reasoning": str,
-    "model_used": str}. Token budget is kept small on purpose - evidence
-    is capped, and we send one finding at a time rather than dumping
-    unrelated context, so cost scales with actual findings, not with
-    everything we happen to know.
+    "vrt_category": str|None, "model_used": str}. Token budget is kept
+    small on purpose - evidence is capped, and we send one finding at a
+    time rather than dumping unrelated context, so cost scales with
+    actual findings, not with everything we happen to know.
 
     outcome_stats (optional): aggregated past-outcome history for this
     finding's signature, from finding_outcomes via get_signature_stats().
@@ -123,6 +125,11 @@ async def triage_finding(tool_name: str, evidence: str, outcome_stats: dict | No
     context - this is the actual "learns from mistakes" mechanism. When
     absent (a brand-new pattern with no history), triage proceeds exactly
     as before with no behavior change.
+
+    vrt_entries (optional): Bugcrowd's real VRT categories (from vrt.py),
+    given to the model so it can name the closest matching Bugcrowd
+    category - grounding our generic severity scale in Bugcrowd's actual
+    scoring language, not just our own words.
 
     Tries the cheap model first. If its own reported confidence is below
     0.6, escalates ONE retry to the stronger model - this is the
@@ -133,8 +140,11 @@ async def triage_finding(tool_name: str, evidence: str, outcome_stats: dict | No
     # and avoids wasting tokens on truncated-anyway giant tool dumps.
     capped_evidence = evidence[:2000]
     outcome_context = _format_outcome_context(outcome_stats)
+    from . import vrt as vrt_module  # local import avoids a circular import at module load time
+    vrt_context = vrt_module.format_vrt_context(vrt_entries or [])
     prompt = _TRIAGE_PROMPT.format(
-        tool_name=tool_name, evidence=capped_evidence, outcome_context=outcome_context
+        tool_name=tool_name, evidence=capped_evidence,
+        outcome_context=outcome_context, vrt_context=vrt_context,
     )
 
     try:

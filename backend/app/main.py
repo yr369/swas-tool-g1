@@ -20,7 +20,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from . import checkpoint, database, pipeline, scope_parser, triage
+from . import checkpoint, database, pipeline, scope_parser, triage, vrt
 from .models import (
     Project,
     ProjectCreate,
@@ -330,9 +330,11 @@ async def triage_one_finding(finding_id: int):
 
         signature = triage.build_signature(finding["tool_name"], finding["vuln_type"])
         outcome_stats = await _fetch_signature_stats(conn, signature)
+        vrt_entries = await vrt.get_vrt_entries()
 
         result = await triage.triage_finding(
-            finding["tool_name"], finding["evidence"] or "", outcome_stats=outcome_stats
+            finding["tool_name"], finding["evidence"] or "",
+            outcome_stats=outcome_stats, vrt_entries=vrt_entries,
         )
 
         await conn.execute(
@@ -376,11 +378,13 @@ async def triage_all_findings(project_id: int):
         )
 
         triaged = 0
+        vrt_entries = await vrt.get_vrt_entries()  # fetched once, reused for every finding in this batch
         for row in rows:
             signature = triage.build_signature(row["tool_name"], row["vuln_type"])
             outcome_stats = await _fetch_signature_stats(conn, signature)
             result = await triage.triage_finding(
-                row["tool_name"], row["evidence"] or "", outcome_stats=outcome_stats
+                row["tool_name"], row["evidence"] or "",
+                outcome_stats=outcome_stats, vrt_entries=vrt_entries,
             )
             await conn.execute(
                 "UPDATE findings SET severity = $1 WHERE id = $2",
