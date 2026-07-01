@@ -504,6 +504,29 @@ async def start_scan(project_id: int, background_tasks: BackgroundTasks):
                 detail="No in-scope targets found for this project - add scope first",
             )
 
+        # Hard denylist, defense-in-depth beyond the in_scope flag: some
+        # programs explicitly exclude specific domains even though they
+        # might look related (e.g. JustEatTakeaway's program explicitly
+        # excludes *.leadfamly.com and *.playable.com despite being
+        # owned-adjacent). If a target was accidentally marked in_scope
+        # during intake (operator error, or a future scope-parsing bug),
+        # this is the second layer that stops it from actually being
+        # scanned. Configured via DENYLIST_DOMAINS in .env, comma-separated.
+        denylist_raw = os.environ.get("DENYLIST_DOMAINS", "")
+        denylist = [d.strip().lower() for d in denylist_raw.split(",") if d.strip()]
+        if denylist:
+            blocked = [t for t in targets if any(d in t["target"].lower() for d in denylist)]
+            if blocked:
+                blocked_names = ", ".join(t["target"] for t in blocked)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Refusing to scan: {blocked_names} matches DENYLIST_DOMAINS. "
+                        f"These are explicitly excluded even if marked in-scope - "
+                        f"remove them from scope or check your program's exclusion list."
+                    ),
+                )
+
         await conn.execute(
             "UPDATE projects SET status = 'scanning' WHERE id = $1", project_id
         )

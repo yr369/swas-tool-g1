@@ -348,7 +348,8 @@ async def _save_nuclei_findings(
     match nuclei's expected bracket format - never silently drops output
     just because it didn't parse as expected.
     """
-    cleaned_output, removed = fp_filter.filter_noise("nuclei", raw_output)
+    strict_mode = os.environ.get("FP_FILTER_STRICT_MODE", "").lower() in ("1", "true", "yes")
+    cleaned_output, removed = fp_filter.filter_noise("nuclei", raw_output, strict_mode=strict_mode)
     if removed:
         logger.info("fp_filter: dropped %d noisy line(s) from nuclei output", removed)
 
@@ -407,7 +408,8 @@ async def _save_finding(
     filtering removes EVERYTHING, we skip saving a finding at all rather
     than storing an empty/useless row.
     """
-    cleaned_output, removed = fp_filter.filter_noise(tool_name, raw_output)
+    strict_mode = os.environ.get("FP_FILTER_STRICT_MODE", "").lower() in ("1", "true", "yes")
+    cleaned_output, removed = fp_filter.filter_noise(tool_name, raw_output, strict_mode=strict_mode)
     if removed:
         logger.info("fp_filter: dropped %d noisy line(s) from %s output", removed, tool_name)
 

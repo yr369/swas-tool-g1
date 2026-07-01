@@ -42,6 +42,24 @@ DEFAULT_TIMEOUT_SECONDS = 300  # 5 minutes
 # we launch, rather than hunting down each tool's own specific flag.
 _SUBPROCESS_ENV = {**os.environ, "NO_COLOR": "1"}
 
+# Many bug bounty programs require an identifying header on all traffic
+# (e.g. Bugcrowd's "X-Bug-Bounty: <username>") so the target's security
+# team can distinguish authorized researcher traffic from real attacks,
+# and so testing isn't accidentally blocked/rate-limited as if it were
+# malicious. This is configured once via .env and applied everywhere -
+# never hardcoded, since the exact header name/value is program-specific.
+_RESEARCH_HEADER_NAME = os.environ.get("RESEARCH_HEADER_NAME", "")
+_RESEARCH_HEADER_VALUE = os.environ.get("RESEARCH_HEADER_VALUE", "")
+
+
+def _research_header() -> str | None:
+    """Returns 'Name: Value' if both env vars are set, else None - tools
+    that build a header flag should skip adding one when this is None,
+    rather than sending a malformed empty header."""
+    if _RESEARCH_HEADER_NAME and _RESEARCH_HEADER_VALUE:
+        return f"{_RESEARCH_HEADER_NAME}: {_RESEARCH_HEADER_VALUE}"
+    return None
+
 
 @dataclass
 class ToolResult:
@@ -192,6 +210,10 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
     for host in hosts:
         target_flags.extend(["-u", host])
 
+    header_flags = []
+    if header := _research_header():
+        header_flags = ["-H", header]
+
     return await run_tool(
         "httpx",
         # -td: tech-detect, fingerprints the tech stack (server, CMS,
@@ -199,7 +221,7 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
         # parse out the tech list reliably instead of scraping text.
         # This is fingerprint-once, reuse-everywhere: every other tool
         # downstream gets this info instead of re-detecting on its own.
-        ["httpx-pd", "-silent", "-td", "-json"] + target_flags,
+        ["httpx-pd", "-silent", "-td", "-json"] + target_flags + header_flags,
         timeout_seconds=120,
     )
 
@@ -224,20 +246,22 @@ async def run_waybackurls(domain: str) -> ToolResult:
 
 async def run_arjun(url: str) -> ToolResult:
     """Discovers hidden/unused HTTP parameters on a given URL."""
-    return await run_tool(
-        "arjun",
-        ["arjun", "-u", url, "-q"],
-        timeout_seconds=180,
-    )
+    args = ["arjun", "-u", url, "-q"]
+    if header := _research_header():
+        # IMPORTANT: --headers MUST be given a string argument here. If
+        # called bare (no value), Arjun opens an interactive text editor
+        # and hangs forever - confirmed via Arjun's own documentation.
+        # Always pass the header value directly, never call --headers alone.
+        args += ["--headers", header]
+    return await run_tool("arjun", args, timeout_seconds=180)
 
 
 async def run_ffuf(url: str, wordlist_path: str) -> ToolResult:
     """Fuzzes a URL for hidden directories/files using a wordlist."""
-    return await run_tool(
-        "ffuf",
-        ["ffuf", "-u", f"{url}/FUZZ", "-w", wordlist_path, "-s"],
-        timeout_seconds=300,
-    )
+    args = ["ffuf", "-u", f"{url}/FUZZ", "-w", wordlist_path, "-s"]
+    if header := _research_header():
+        args += ["-H", header]
+    return await run_tool("ffuf", args, timeout_seconds=300)
 
 
 async def run_nuclei(target: str) -> ToolResult:
@@ -250,31 +274,31 @@ async def run_nuclei(target: str) -> ToolResult:
     garbage in any UI or report - this was caught during real testing
     against scanme.nmap.org.
     """
-    return await run_tool(
-        "nuclei",
-        ["nuclei", "-u", target, "-silent", "-no-color"],
-        timeout_seconds=300,
-    )
+    args = ["nuclei", "-u", target, "-silent", "-no-color"]
+    if header := _research_header():
+        args += ["-H", header]
+    return await run_tool("nuclei", args, timeout_seconds=300)
 
 
 async def run_dalfox(url: str) -> ToolResult:
     """Scans a URL for XSS vulnerabilities."""
-    return await run_tool(
-        "dalfox",
-        ["dalfox", "url", url, "--silence"],
-        timeout_seconds=180,
-    )
+    args = ["dalfox", "url", url, "--silence"]
+    if header := _research_header():
+        args += ["-H", header]
+    return await run_tool("dalfox", args, timeout_seconds=180)
 
 
 async def run_sqlmap(url: str) -> ToolResult:
     """Tests a URL for SQL injection vulnerabilities. Only call this on
     URLs that are already known to have parameters - running it blind
     against every host wastes significant time."""
-    return await run_tool(
-        "sqlmap",
-        ["sqlmap", "-u", url, "--batch", "--level=1", "--risk=1"],
-        timeout_seconds=300,
-    )
+    args = ["sqlmap", "-u", url, "--batch", "--level=1", "--risk=1"]
+    if header := _research_header():
+        # sqlmap uses the long-form --header flag, not -H like the
+        # Go-based tools (subfinder/httpx/nuclei share -H by convention,
+        # but sqlmap's own CLI predates and differs from that).
+        args += ["--header", header]
+    return await run_tool("sqlmap", args, timeout_seconds=300)
 
 
 async def run_notify(message: str) -> ToolResult:
