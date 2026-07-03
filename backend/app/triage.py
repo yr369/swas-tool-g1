@@ -11,20 +11,18 @@ not the rule, which keeps cost and time down without sacrificing
 accuracy on the genuinely ambiguous cases.
 """
 
-import asyncio
 import json
 import logging
 import os
 
 from google import genai
-from google.genai import errors as genai_errors
+
+from .gemini_rotation import generate_with_rotation
 
 logger = logging.getLogger("swas.triage")
 
 _CHEAP_MODEL = "gemini-2.5-flash"
 _ESCALATION_MODEL = "gemini-2.5-pro"
-_MAX_RETRIES = 3
-_RETRY_DELAY_SECONDS = 3
 
 _TRIAGE_PROMPT = """You are triaging a security finding from an automated \
 bug bounty scan. Assign a severity and a confidence score.
@@ -85,21 +83,6 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
-async def _call_with_retry(client: genai.Client, model: str, prompt: str):
-    last_error = None
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            return client.models.generate_content(model=model, contents=prompt)
-        except genai_errors.ServerError as exc:
-            last_error = exc
-            logger.warning("Triage call failed (attempt %d/%d): %s", attempt, _MAX_RETRIES, exc)
-            if attempt < _MAX_RETRIES:
-                await asyncio.sleep(_RETRY_DELAY_SECONDS * attempt)
-        except Exception:
-            raise
-    raise last_error
-
-
 def _parse_triage_response(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
@@ -148,23 +131,32 @@ async def triage_finding(
     )
 
     try:
-        response = await _call_with_retry(client, _CHEAP_MODEL, prompt)
+        # generate_with_rotation tries _CHEAP_MODEL first, then rotates
+        # through the rest of MODEL_ROTATION automatically if it hits a
+        # 429 quota error - so a single exhausted free-tier model no
+        # longer kills triage for the rest of the scan.
+        response, model_used = await generate_with_rotation(client, prompt, preferred_model=_CHEAP_MODEL)
         result = _parse_triage_response(response.text or "")
-        result["model_used"] = _CHEAP_MODEL
+        result["model_used"] = model_used
     except Exception as exc:
-        logger.exception("Cheap-tier triage failed entirely")
+        logger.exception("Triage failed on every model in the rotation")
         return {"severity": "unknown", "confidence": 0.0, "reasoning": f"Triage failed: {exc}", "model_used": "none"}
 
     if result.get("confidence", 1.0) < 0.6:
-        logger.info("Low confidence (%.2f) on cheap model, escalating", result.get("confidence", 0))
+        logger.info("Low confidence (%.2f) on %s, escalating", result.get("confidence", 0), result["model_used"])
         try:
-            response = await _call_with_retry(client, _ESCALATION_MODEL, prompt)
+            # Escalation also rotates, starting from the pro model, so an
+            # exhausted pro quota falls back through the rest of the
+            # chain rather than giving up after one try.
+            response, escalation_model_used = await generate_with_rotation(
+                client, prompt, preferred_model=_ESCALATION_MODEL
+            )
             escalated = _parse_triage_response(response.text or "")
-            escalated["model_used"] = _ESCALATION_MODEL
+            escalated["model_used"] = escalation_model_used
             return escalated
         except Exception as exc:
-            logger.warning("Escalation failed, keeping cheap-tier result: %s", exc)
-            # Fall back to the cheap-tier result rather than losing the
+            logger.warning("Escalation failed on every model, keeping first-pass result: %s", exc)
+            # Fall back to the first-pass result rather than losing the
             # finding entirely - a low-confidence guess is still more
             # useful than nothing, and it's clearly labeled as such.
             return result
