@@ -311,6 +311,8 @@ async def _phase_scan(
         if tech_stack.get(host):
             logger.info("scan: %s detected tech: %s", host, ", ".join(tech_stack[host]))
 
+        _log_aem_pivot_hint(host, tech_stack.get(host, []))
+
         nuclei_result = await tools.run_nuclei(host)
         if tools.looks_like_real_output(nuclei_result):
             await _save_nuclei_findings(conn, project_id, target_id, nuclei_result.stdout)
@@ -323,6 +325,39 @@ async def _phase_scan(
             sqlmap_result = await tools.run_sqlmap(host)
             if tools.looks_like_real_output(sqlmap_result):
                 await _save_finding(conn, project_id, target_id, "sqlmap", sqlmap_result.stdout)
+
+
+# A hostname like "aem-prod.example.com" or a tech-stack detection
+# ("AEM", "Adobe Experience Manager") is a strong recon signal, not a
+# vulnerability by itself. When it shows up, it's worth pointing manual
+# testing effort at AEM-specific attack surface (exposed dispatcher
+# config, /crx/de and other default admin interfaces, SSRF via AEM's
+# own fetch/import features) instead of spending time on generic
+# TLS/cert scanner output for that host.
+_AEM_HOSTNAME_PATTERN = re.compile(r"\baem\b|aem[-_]?(prod|stage|dev|author|publish)", re.IGNORECASE)
+_AEM_TECH_PATTERN = re.compile(r"aem|adobe experience manager", re.IGNORECASE)
+
+
+def _log_aem_pivot_hint(host: str, tech: list[str]) -> None:
+    """
+    Zero-cost recon nudge: if this host looks like it's running Adobe
+    Experience Manager (by hostname convention or by httpx -td tech
+    detection), log a note pointing at AEM-specific manual testing
+    rather than letting the host just blend in as "another target for
+    generic nuclei/dalfox/sqlmap runs". This does not change what scans
+    are run in Phase 1 - it's a visibility aid so a human reviewing logs
+    knows where the higher-value manual effort is likely to pay off.
+    """
+    hostname_hit = bool(_AEM_HOSTNAME_PATTERN.search(host))
+    tech_hit = any(_AEM_TECH_PATTERN.search(t) for t in tech)
+    if hostname_hit or tech_hit:
+        logger.info(
+            "recon: %s looks like Adobe Experience Manager (AEM) - consider pivoting "
+            "manual testing to dispatcher config exposure, default/misconfigured admin "
+            "interfaces (e.g. /crx/de), and SSRF opportunities, rather than reporting "
+            "generic TLS/cert findings for this host",
+            host,
+        )
 
 
 # nuclei's own severity tags map directly onto our schema's severity

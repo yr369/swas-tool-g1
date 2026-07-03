@@ -264,6 +264,20 @@ async def run_ffuf(url: str, wordlist_path: str) -> ToolResult:
     return await run_tool("ffuf", args, timeout_seconds=300)
 
 
+# Bug bounty programs overwhelmingly triage SSL/TLS findings (weak
+# ciphers, self-signed certs, expired certs, missing HSTS/CSP, etc.) as
+# Informational or Not Applicable unless paired with a demonstrated
+# exploit - reporting them alone tends to hurt signal/accuracy rating
+# more than it helps. Excluding these tags at the nuclei level (rather
+# than just filtering them out after the fact) also saves real scan
+# time, since nuclei never runs those templates in the first place.
+# Certificate/TLS data is still useful for recon (identifying tech and
+# infra) - that just happens via httpx -td and manual follow-up, not by
+# nuclei reporting it as a "finding". Configurable via env so a program
+# whose brief explicitly wants these can still opt back in.
+_DEFAULT_NUCLEI_EXCLUDE_TAGS = "ssl,tls"
+
+
 async def run_nuclei(target: str) -> ToolResult:
     """
     Runs template-based vulnerability scanning against a target.
@@ -273,10 +287,20 @@ async def run_nuclei(target: str) -> ToolResult:
     get stored as-is in the findings table and show up as unreadable
     garbage in any UI or report - this was caught during real testing
     against scanme.nmap.org.
+
+    -etags excludes noisy, low-value template categories by default (see
+    _DEFAULT_NUCLEI_EXCLUDE_TAGS above). Set NUCLEI_EXCLUDE_TAGS="" in
+    .env to disable and scan everything, or override with a different
+    comma-separated tag list for a specific program's needs.
     """
     args = ["nuclei", "-u", target, "-silent", "-no-color"]
     if header := _research_header():
         args += ["-H", header]
+
+    exclude_tags = os.environ.get("NUCLEI_EXCLUDE_TAGS", _DEFAULT_NUCLEI_EXCLUDE_TAGS)
+    if exclude_tags.strip():
+        args += ["-etags", exclude_tags.strip()]
+
     return await run_tool("nuclei", args, timeout_seconds=300)
 
 

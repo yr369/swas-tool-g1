@@ -44,6 +44,23 @@ bypass) is "high" or "critical". If you are NOT confident in this
 classification (the evidence is ambiguous, contradictory, or you're
 guessing), set confidence below 0.6 - this is expected and fine, it
 routes the finding to a closer look rather than forcing a bad guess.
+
+SSL/TLS/certificate findings (weak ciphers, self-signed or expired
+certs, missing HSTS/CSP, protocol version warnings, and similar scanner
+output) are ALWAYS "info", high confidence (0.9+), and should NOT be
+escalated - mature programs consistently close these as Informational
+or Not Applicable unless paired with a demonstrated exploit. Treat the
+certificate/TLS data as reconnaissance (it can reveal org names,
+internal hostnames, or infrastructure) rather than as a reportable
+vulnerability in its own right - say so in "reasoning" rather than
+inventing a higher severity.
+
+If the evidence mentions or the target hostname suggests Adobe
+Experience Manager (AEM), note in "reasoning" that this is worth manual
+follow-up on AEM-specific attack surface (dispatcher config exposure,
+default admin interfaces like /crx/de, SSRF via AEM), not just the raw
+scanner line - but still classify the raw scanner output itself by its
+own actual severity, don't inflate it just because AEM was mentioned.
 """
 
 

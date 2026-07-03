@@ -15,11 +15,37 @@ import re
 
 # Universal patterns: well-documented false-positive behaviors of these
 # specific tools, true regardless of which program you're scanning.
+#
+# SSL/TLS/certificate findings and generic security-header warnings
+# (missing CSP, missing HSTS, weak ciphers, self-signed/expired certs,
+# etc.) now live here rather than in _STRICT_PATTERNS. Across mature
+# programs (e.g. Bugcrowd's JustEatTakeaway) these are consistently
+# closed as Informational or Not Applicable unless paired with a
+# demonstrated exploit, and reporting scanner output alone for these
+# categories tends to hurt accuracy/signal rating rather than pay out.
+# Note: run_nuclei() also excludes the ssl/tls tags at the tool level
+# (see tools.py) so most of this never even runs - these patterns are a
+# defense-in-depth backstop for output that slips through with different
+# tag names, and for tools other than nuclei.
 _NOISY_PATTERNS: dict[str, list[re.Pattern]] = {
     "nuclei": [
         # WAF/CDN block pages frequently trigger generic detection
         # templates without being a real vulnerability.
         re.compile(r"waf-detect", re.IGNORECASE),
+        re.compile(r"missing-security-headers", re.IGNORECASE),
+        re.compile(r"http-missing-security-headers", re.IGNORECASE),
+        re.compile(r"insecure-cipher-suite", re.IGNORECASE),
+        re.compile(r"ssl[-_]?(config|cert|issuer|version)", re.IGNORECASE),
+        re.compile(r"weak-cipher", re.IGNORECASE),
+        re.compile(r"self[-_]?signed", re.IGNORECASE),
+        re.compile(r"(expired|deprecated)[-_]?(tls|ssl|cert)", re.IGNORECASE),
+        re.compile(r"\b(csp|hsts)[-_]?(missing|not-set)?\b", re.IGNORECASE),
+        # Backstop for any nuclei line tagged [ssl] or [tls] (or
+        # "template-id:ssl"/"template-id:tls") that the -etags exclusion
+        # in tools.py didn't catch - e.g. output produced with a
+        # different nuclei invocation, or NUCLEI_EXCLUDE_TAGS overridden.
+        re.compile(r"[:\[]ssl[:\]]", re.IGNORECASE),
+        re.compile(r"[:\[]tls[:\]]", re.IGNORECASE),
     ],
     "dalfox": [
         # dalfox often flags reflected params that are HTML-encoded and
@@ -30,20 +56,14 @@ _NOISY_PATTERNS: dict[str, list[re.Pattern]] = {
 
 # "Strict" patterns: NOT universal false positives - these are real,
 # technically-correct findings that some programs explicitly state they
-# will NOT pay for (e.g. JustEatTakeaway's brief: missing security
-# headers, SSL/TLS config, open redirects, subdomain takeover without
-# proven exploitation are all explicitly excluded). Filtering these out
-# globally would be wrong for OTHER programs that DO want them - this is
+# will NOT pay for (e.g. open redirects, subdomain takeover without
+# proven exploitation, DNS SPF/DMARC gaps). Filtering these out globally
+# would be wrong for OTHER programs that DO want them - this stays
 # opt-in per scan via the strict_mode flag, not a universal rule.
 _STRICT_PATTERNS: dict[str, list[re.Pattern]] = {
     "nuclei": [
-        re.compile(r"missing-security-headers", re.IGNORECASE),
-        re.compile(r"http-missing-security-headers", re.IGNORECASE),
-        re.compile(r"insecure-cipher-suite", re.IGNORECASE),
-        re.compile(r"ssl[-_]?(config|cert)", re.IGNORECASE),
         re.compile(r"open-redirect", re.IGNORECASE),
         re.compile(r"subdomain-takeover", re.IGNORECASE),
-        re.compile(r"weak-cipher", re.IGNORECASE),
         re.compile(r"dns-(spf|dmarc)", re.IGNORECASE),
     ],
 }
