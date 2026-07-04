@@ -13,14 +13,35 @@ export function App() {
             padding: "14px 24px",
             display: "flex",
             alignItems: "center",
+            justifyContent: "space-between",
           }}
         >
-          <Link to="/" style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-primary)" }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--accent)" }} aria-hidden="true" />
-            <span className="mono" style={{ fontWeight: 600, fontSize: 14, letterSpacing: "0.02em" }}>
+          <Link to="/" style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-primary)" }}>
+            <span
+              aria-hidden="true"
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                background: "var(--signal)",
+                animation: "signal-pulse 2.2s ease-out infinite",
+              }}
+            />
+            <span
+              className="mono"
+              style={{
+                fontFamily: "var(--font-display)",
+                fontWeight: 600,
+                fontSize: 16,
+                letterSpacing: "0.02em",
+              }}
+            >
               SWAS
             </span>
           </Link>
+          <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
+            SECURITY WEB AUTOMATION SYSTEM
+          </span>
         </header>
 
         <main style={{ flex: 1, padding: "32px 24px", maxWidth: 880, width: "100%", margin: "0 auto" }}>

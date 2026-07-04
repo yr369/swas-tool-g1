@@ -1,0 +1,768 @@
+diff --git a/frontend/index.html b/frontend/index.html
+index bf8c653..df237b3 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -7,7 +7,7 @@
+     <link rel="preconnect" href="https://fonts.googleapis.com" />
+     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+     <link
+-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap"
++      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+       rel="stylesheet"
+     />
+   </head>
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 1272feb..266b321 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -13,14 +13,35 @@ export function App() {
+             padding: "14px 24px",
+             display: "flex",
+             alignItems: "center",
++            justifyContent: "space-between",
+           }}
+         >
+-          <Link to="/" style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-primary)" }}>
+-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--accent)" }} aria-hidden="true" />
+-            <span className="mono" style={{ fontWeight: 600, fontSize: 14, letterSpacing: "0.02em" }}>
++          <Link to="/" style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-primary)" }}>
++            <span
++              aria-hidden="true"
++              style={{
++                width: 8,
++                height: 8,
++                borderRadius: "50%",
++                background: "var(--signal)",
++                animation: "signal-pulse 2.2s ease-out infinite",
++              }}
++            />
++            <span
++              className="mono"
++              style={{
++                fontFamily: "var(--font-display)",
++                fontWeight: 600,
++                fontSize: 16,
++                letterSpacing: "0.02em",
++              }}
++            >
+               SWAS
+             </span>
+           </Link>
++          <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
++            SECURITY WEB AUTOMATION SYSTEM
++          </span>
+         </header>
+ 
+         <main style={{ flex: 1, padding: "32px 24px", maxWidth: 880, width: "100%", margin: "0 auto" }}>
+diff --git a/frontend/src/components/FindingsList.jsx b/frontend/src/components/FindingsList.jsx
+index 9dbb5bf..f93ee78 100644
+--- a/frontend/src/components/FindingsList.jsx
++++ b/frontend/src/components/FindingsList.jsx
+@@ -3,10 +3,15 @@
+  * with inline actions: triage (AI severity + VRT category), readiness
+  * check (pre-submission pitfalls), and outcome logging (the actual
+  * learning-loop input once you get a real Bugcrowd/HackerOne result).
++ *
++ * Also owns the filter/sort/search bar and the severity distribution
++ * chart above the list - both computed client-side from the findings
++ * already loaded by ProjectDetail, no extra API calls needed.
+  */
+ 
+-import { useState } from "react";
++import { useMemo, useState } from "react";
+ import { api } from "../api/client";
++import { Donut } from "./charts/Donut";
+ 
+ const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"];
+ 
+@@ -19,6 +24,12 @@ const SEVERITY_LABEL = {
+   unknown: "Unknown",
+ };
+ 
++const SORT_OPTIONS = [
++  { value: "severity", label: "Severity" },
++  { value: "newest", label: "Newest first" },
++  { value: "tool", label: "Tool" },
++];
++
+ const OUTCOME_OPTIONS = [
+   { value: "accepted", label: "Accepted" },
+   { value: "duplicate", label: "Duplicate" },
+@@ -224,7 +235,79 @@ function FindingRow({ finding, onTriaged }) {
+   );
+ }
+ 
++function SeverityChip({ severity, count, active, onToggle }) {
++  const color = severity === "unknown" ? "var(--text-muted)" : `var(--sev-${severity})`;
++  return (
++    <button
++      className="chip"
++      data-active={active}
++      onClick={() => onToggle(severity)}
++      style={{ color, borderColor: active ? color : "var(--border)" }}
++      type="button"
++    >
++      {SEVERITY_LABEL[severity]}
++      <span className="mono" style={{ color: "var(--text-muted)" }}>
++        {count}
++      </span>
++    </button>
++  );
++}
++
+ export function FindingsList({ findings, onTriaged }) {
++  const [activeSeverities, setActiveSeverities] = useState(() => new Set(SEVERITY_ORDER));
++  const [toolFilter, setToolFilter] = useState("all");
++  const [search, setSearch] = useState("");
++  const [sortBy, setSortBy] = useState("severity");
++
++  const counts = useMemo(() => {
++    const c = Object.fromEntries(SEVERITY_ORDER.map((s) => [s, 0]));
++    for (const f of findings) {
++      const sev = f.severity in c ? f.severity : "unknown";
++      c[sev] += 1;
++    }
++    return c;
++  }, [findings]);
++
++  const tools = useMemo(
++    () => Array.from(new Set(findings.map((f) => f.tool_name))).sort(),
++    [findings]
++  );
++
++  function toggleSeverity(sev) {
++    setActiveSeverities((prev) => {
++      const next = new Set(prev);
++      if (next.has(sev)) next.delete(sev);
++      else next.add(sev);
++      return next;
++    });
++  }
++
++  const visible = useMemo(() => {
++    const q = search.trim().toLowerCase();
++    let list = findings.filter((f) => {
++      const sev = f.severity in counts ? f.severity : "unknown";
++      if (!activeSeverities.has(sev)) return false;
++      if (toolFilter !== "all" && f.tool_name !== toolFilter) return false;
++      if (q && !(f.evidence || "").toLowerCase().includes(q) && !(f.vuln_type || "").toLowerCase().includes(q)) {
++        return false;
++      }
++      return true;
++    });
++
++    list = [...list].sort((a, b) => {
++      if (sortBy === "severity") {
++        return SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity);
++      }
++      if (sortBy === "tool") {
++        return a.tool_name.localeCompare(b.tool_name);
++      }
++      // newest
++      return new Date(b.created_at) - new Date(a.created_at);
++    });
++
++    return list;
++  }, [findings, activeSeverities, toolFilter, search, sortBy, counts]);
++
+   if (findings.length === 0) {
+     return (
+       <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)" }}>
+@@ -233,15 +316,77 @@ export function FindingsList({ findings, onTriaged }) {
+     );
+   }
+ 
+-  const sorted = [...findings].sort(
+-    (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
+-  );
++  const donutSegments = SEVERITY_ORDER.filter((s) => s !== "unknown" || counts.unknown > 0).map((s) => ({
++    key: s,
++    label: SEVERITY_LABEL[s],
++    value: counts[s],
++    color: s === "unknown" ? "var(--text-muted)" : `var(--sev-${s})`,
++  }));
+ 
+   return (
+-    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
+-      {sorted.map((finding) => (
+-        <FindingRow key={finding.id} finding={finding} onTriaged={onTriaged} />
+-      ))}
++    <div>
++      <div
++        style={{
++          display: "flex",
++          alignItems: "center",
++          justifyContent: "space-between",
++          flexWrap: "wrap",
++          gap: 24,
++          padding: "16px 4px 20px",
++        }}
++      >
++        <Donut segments={donutSegments} />
++
++        <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "flex-end" }}>
++          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
++            {SEVERITY_ORDER.filter((s) => counts[s] > 0).map((s) => (
++              <SeverityChip
++                key={s}
++                severity={s}
++                count={counts[s]}
++                active={activeSeverities.has(s)}
++                onToggle={toggleSeverity}
++              />
++            ))}
++          </div>
++          <div style={{ display: "flex", gap: 8 }}>
++            <input
++              type="text"
++              placeholder="Search evidence…"
++              value={search}
++              onChange={(e) => setSearch(e.target.value)}
++              style={{ ...filterInputStyle, width: 160 }}
++            />
++            <select value={toolFilter} onChange={(e) => setToolFilter(e.target.value)} style={filterInputStyle}>
++              <option value="all">All tools</option>
++              {tools.map((t) => (
++                <option key={t} value={t}>
++                  {t}
++                </option>
++              ))}
++            </select>
++            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={filterInputStyle}>
++              {SORT_OPTIONS.map((o) => (
++                <option key={o.value} value={o.value}>
++                  Sort: {o.label}
++                </option>
++              ))}
++            </select>
++          </div>
++        </div>
++      </div>
++
++      {visible.length === 0 ? (
++        <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)" }}>
++          No findings match these filters.
++        </div>
++      ) : (
++        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
++          {visible.map((finding) => (
++            <FindingRow key={finding.id} finding={finding} onTriaged={onTriaged} />
++          ))}
++        </div>
++      )}
+     </div>
+   );
+ }
+@@ -264,3 +409,13 @@ const selectStyle = {
+   padding: "4px 8px",
+   fontSize: 12,
+ };
++
++const filterInputStyle = {
++  background: "var(--bg-surface-raised)",
++  border: "1px solid var(--border)",
++  borderRadius: "var(--radius)",
++  color: "var(--text-primary)",
++  padding: "6px 10px",
++  fontSize: 12,
++  fontFamily: "var(--font-ui)",
++};
+diff --git a/frontend/src/components/PipelineTracker.jsx b/frontend/src/components/PipelineTracker.jsx
+index 566e46e..476f7ee 100644
+--- a/frontend/src/components/PipelineTracker.jsx
++++ b/frontend/src/components/PipelineTracker.jsx
+@@ -20,7 +20,7 @@ function statusForPhase(phaseRuns, phaseName) {
+ 
+ const STATUS_COLOR = {
+   completed: "var(--status-success)",
+-  in_progress: "var(--accent)",
++  in_progress: "var(--signal)",
+   failed: "var(--status-fail)",
+   needs_attention: "var(--sev-high)",
+   pending: "var(--status-pending)",
+@@ -34,22 +34,53 @@ export function PipelineTracker({ phaseRuns }) {
+         const status = statusForPhase(phaseRuns, phase);
+         const color = STATUS_COLOR[status];
+         const isLast = i === PHASES.length - 1;
++        const isActive = status === "in_progress";
+ 
+         return (
+           <div key={phase} style={{ display: "flex", alignItems: "center", flex: isLast ? "0 0 auto" : 1 }}>
+             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+               <div
+                 style={{
++                  position: "relative",
+                   width: 14,
+                   height: 14,
+-                  borderRadius: "50%",
+-                  background: status === "not_started" ? "transparent" : color,
+-                  border: `2px solid ${color}`,
+-                  boxShadow: status === "in_progress" ? `0 0 0 4px ${color}33` : "none",
+-                  transition: "background 0.2s, box-shadow 0.2s",
++                  display: "flex",
++                  alignItems: "center",
++                  justifyContent: "center",
+                 }}
+-                aria-hidden="true"
+-              />
++              >
++                {isActive && (
++                  // The one deliberately animated moment in the whole app:
++                  // a radar-style sweep on whichever phase is actively
++                  // running right now, in the signal accent reserved
++                  // exclusively for "this is live". Everything else on
++                  // this tracker is a static, disciplined readout.
++                  <span
++                    aria-hidden="true"
++                    style={{
++                      position: "absolute",
++                      inset: -6,
++                      borderRadius: "50%",
++                      border: "1px solid var(--signal)",
++                      borderTopColor: "transparent",
++                      borderRightColor: "transparent",
++                      animation: "signal-sweep 1.4s linear infinite",
++                    }}
++                  />
++                )}
++                <div
++                  style={{
++                    width: 14,
++                    height: 14,
++                    borderRadius: "50%",
++                    background: status === "not_started" ? "transparent" : color,
++                    border: `2px solid ${color}`,
++                    animation: isActive ? "signal-pulse 1.8s ease-out infinite" : "none",
++                    transition: "background 0.2s",
++                  }}
++                  aria-hidden="true"
++                />
++              </div>
+               <span
+                 className="mono"
+                 style={{
+diff --git a/frontend/src/components/charts/Donut.jsx b/frontend/src/components/charts/Donut.jsx
+new file mode 100644
+index 0000000..76994ba
+--- /dev/null
++++ b/frontend/src/components/charts/Donut.jsx
+@@ -0,0 +1,86 @@
++/**
++ * Donut.jsx - a small, dependency-free ring chart.
++ *
++ * Deliberately hand-rolled SVG rather than a charting library: the data
++ * here is always a handful of severity/status buckets, never a real
++ * time series, so a library's axis/tooltip/animation machinery would be
++ * overhead for something this simple to draw by hand with stroke-dasharray.
++ */
++
++const SIZE = 88;
++const STROKE = 12;
++const RADIUS = (SIZE - STROKE) / 2;
++const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
++
++/**
++ * segments: [{ key, label, value, color }, ...] - order determines
++ * draw order (and therefore legend order). Zero-value segments are
++ * skipped from the ring but can still appear in the legend by the
++ * caller if desired.
++ */
++export function Donut({ segments, centerLabel }) {
++  const total = segments.reduce((sum, s) => sum + s.value, 0);
++
++  let offset = 0;
++  const arcs = segments
++    .filter((s) => s.value > 0)
++    .map((s) => {
++      const fraction = total > 0 ? s.value / total : 0;
++      const length = fraction * CIRCUMFERENCE;
++      const arc = (
++        <circle
++          key={s.key}
++          cx={SIZE / 2}
++          cy={SIZE / 2}
++          r={RADIUS}
++          fill="none"
++          stroke={s.color}
++          strokeWidth={STROKE}
++          strokeDasharray={`${length} ${CIRCUMFERENCE - length}`}
++          strokeDashoffset={-offset}
++          transform={`rotate(-90 ${SIZE / 2} ${SIZE / 2})`}
++        />
++      );
++      offset += length;
++      return arc;
++    });
++
++  return (
++    <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
++      <svg width={SIZE} height={SIZE} viewBox={`0 0 ${SIZE} ${SIZE}`} role="img" aria-label="Severity distribution">
++        <circle cx={SIZE / 2} cy={SIZE / 2} r={RADIUS} fill="none" stroke="var(--border)" strokeWidth={STROKE} />
++        {arcs}
++        <text
++          x={SIZE / 2}
++          y={SIZE / 2}
++          textAnchor="middle"
++          dominantBaseline="central"
++          className="mono"
++          fill="var(--text-primary)"
++          fontSize={total > 999 ? 16 : 20}
++          fontWeight={600}
++        >
++          {total}
++        </text>
++      </svg>
++
++      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
++        {segments.map((s) => (
++          <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
++            <span
++              aria-hidden="true"
++              style={{ width: 8, height: 8, borderRadius: 2, background: s.color, flexShrink: 0 }}
++            />
++            <span style={{ color: "var(--text-secondary)", minWidth: 56 }}>{s.label}</span>
++            <span className="mono" style={{ color: "var(--text-primary)", fontWeight: 500 }}>
++              {s.value}
++            </span>
++          </div>
++        ))}
++      </div>
++      {centerLabel && (
++        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{centerLabel}</span>
++      )}
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/ProjectList.jsx b/frontend/src/pages/ProjectList.jsx
+index d28f5bd..7010986 100644
+--- a/frontend/src/pages/ProjectList.jsx
++++ b/frontend/src/pages/ProjectList.jsx
+@@ -1,6 +1,10 @@
+-import { useEffect, useState } from "react";
++import { useEffect, useMemo, useState } from "react";
+ import { Link } from "react-router-dom";
+ import { api } from "../api/client";
++import { Donut } from "../components/charts/Donut";
++
++const STATUS_LABEL = { created: "Created", scanning: "Scanning", completed: "Completed", archived: "Archived" };
++const STATUS_ORDER = ["scanning", "created", "completed", "archived"];
+ 
+ export function ProjectList() {
+   const [projects, setProjects] = useState(null);
+@@ -13,6 +17,15 @@ export function ProjectList() {
+       .catch((err) => setError(err.message));
+   }, []);
+ 
++  const statusCounts = useMemo(() => {
++    if (!projects) return null;
++    const c = Object.fromEntries(STATUS_ORDER.map((s) => [s, 0]));
++    for (const p of projects) {
++      if (p.status in c) c[p.status] += 1;
++    }
++    return c;
++  }, [projects]);
++
+   if (error) {
+     return <p style={{ color: "var(--status-fail)" }}>Couldn't load projects: {error}</p>;
+   }
+@@ -21,10 +34,17 @@ export function ProjectList() {
+     return <p style={{ color: "var(--text-muted)" }}>Loading…</p>;
+   }
+ 
++  const donutSegments = STATUS_ORDER.map((s) => ({
++    key: s,
++    label: STATUS_LABEL[s],
++    value: statusCounts[s],
++    color: `var(--proj-${s})`,
++  }));
++
+   return (
+     <div>
+-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+-        <h1 style={{ fontSize: 20, fontWeight: 600, margin: 0 }}>Projects</h1>
++      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
++        <h1 style={{ fontSize: 22, fontWeight: 600, margin: 0 }}>Projects</h1>
+         <Link to="/new" style={newButtonStyle}>
+           + New project
+         </Link>
+@@ -35,38 +55,52 @@ export function ProjectList() {
+           No projects yet. Start by adding a program's scope.
+         </div>
+       ) : (
+-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+-          {projects.map((p) => (
+-            <Link
+-              key={p.id}
+-              to={`/projects/${p.id}`}
+-              style={{
+-                display: "flex",
+-                justifyContent: "space-between",
+-                alignItems: "center",
+-                padding: "14px 16px",
+-                background: "var(--bg-surface)",
+-                border: "1px solid var(--border)",
+-                borderRadius: "var(--radius-lg)",
+-                textDecoration: "none",
+-                color: "var(--text-primary)",
+-              }}
+-            >
+-              <div>
+-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+-                  <span style={{ fontWeight: 500 }}>{p.name}</span>
+-                  <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+-                    #{p.id}
+-                  </span>
+-                </div>
+-                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+-                  {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
++        <>
++          <div
++            style={{
++              border: "1px solid var(--border)",
++              borderRadius: "var(--radius-lg)",
++              background: "var(--bg-surface)",
++              padding: "18px 20px",
++              marginBottom: 20,
++            }}
++          >
++            <Donut segments={donutSegments} centerLabel="projects by status" />
++          </div>
++
++          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
++            {projects.map((p) => (
++              <Link
++                key={p.id}
++                to={`/projects/${p.id}`}
++                style={{
++                  display: "flex",
++                  justifyContent: "space-between",
++                  alignItems: "center",
++                  padding: "14px 16px",
++                  background: "var(--bg-surface)",
++                  border: "1px solid var(--border)",
++                  borderRadius: "var(--radius-lg)",
++                  textDecoration: "none",
++                  color: "var(--text-primary)",
++                }}
++              >
++                <div>
++                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
++                    <span style={{ fontWeight: 500 }}>{p.name}</span>
++                    <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
++                      #{p.id}
++                    </span>
++                  </div>
++                  <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
++                    {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
++                  </div>
+                 </div>
+-              </div>
+-              <StatusPill status={p.status} />
+-            </Link>
+-          ))}
+-        </div>
++                <StatusPill status={p.status} />
++              </Link>
++            ))}
++          </div>
++        </>
+       )}
+     </div>
+   );
+@@ -79,9 +113,31 @@ function formatDate(isoString) {
+ }
+ 
+ function StatusPill({ status }) {
+-  const label = { created: "Created", scanning: "Scanning", completed: "Completed", archived: "Archived" }[status] || status;
++  const label = STATUS_LABEL[status] || status;
++  const color = status in STATUS_LABEL ? `var(--proj-${status})` : "var(--text-muted)";
++  const isLive = status === "scanning";
+   return (
+-    <span style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>{label}</span>
++    <span
++      className="mono"
++      style={{
++        display: "inline-flex",
++        alignItems: "center",
++        gap: 6,
++        fontSize: 12,
++        color,
++        border: `1px solid ${color}`,
++        borderRadius: 999,
++        padding: "3px 10px",
++      }}
++    >
++      {isLive && (
++        <span
++          aria-hidden="true"
++          style={{ width: 6, height: 6, borderRadius: "50%", background: color, animation: "signal-pulse 1.6s ease-out infinite" }}
++        />
++      )}
++      {label}
++    </span>
+   );
+ }
+ 
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index d42a4eb..825042e 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -12,11 +12,21 @@
+   --text-secondary: #a8b0bb;
+   --text-muted: #6e7681;
+ 
+-  /* Accent (used sparingly: primary actions, active pipeline stage) */
++  /* Accent (used sparingly: primary actions, brand chrome) */
+   --accent: #4fd1c5;
+   --accent-dim: #2a4a47;
+   --on-accent: #0a1f1d;
+ 
++  /* Signal accent: reserved exclusively for "this is live right now" -
++     an active scan, a sweep, a pulsing node. Never used for static UI
++     chrome, so when it appears it actually means something - the one
++     place this app spends its visual boldness. Named for the radar/
++     signal-intelligence vocabulary of the subject (scanning, sweeping,
++     pinging a target), not just "a second bright color". */
++  --signal: #ffb454;
++  --signal-dim: #4a3a1f;
++  --on-signal: #1f1400;
++
+   /* Severity - this is the actual content of the tool, not decoration */
+   --sev-critical: #f85149;
+   --sev-critical-bg: #3d1f1d;
+@@ -29,16 +39,22 @@
+   --sev-info: #6e7681;
+   --sev-info-bg: #2a2d33;
+ 
+-  /* Status */
++  /* Status (project lifecycle - distinct from pipeline phase status) */
+   --status-success: #3fb950;
+   --status-fail: #f85149;
+   --status-pending: #6e7681;
++  --proj-created: #58a6ff;
++  --proj-scanning: #ffb454;
++  --proj-completed: #3fb950;
++  --proj-archived: #6e7681;
+ 
+   /* Layout */
+   --radius: 6px;
+   --radius-lg: 10px;
+ 
+-  /* Type */
++  /* Type: display (headings, big readouts) / ui (body, controls) /
++     mono (data, evidence, anything the tool actually produced) */
++  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+   --font-ui: "Inter", system-ui, sans-serif;
+   --font-mono: "JetBrains Mono", ui-monospace, monospace;
+ }
+@@ -62,6 +78,29 @@ body {
+   font-size: 14px;
+   line-height: 1.5;
+   -webkit-font-smoothing: antialiased;
++  /* A faint fixed grid, like a scope readout - the one atmospheric
++     touch on an otherwise disciplined surface. Barely visible; it's
++     texture, not a pattern anyone should consciously notice. */
++  background-image:
++    linear-gradient(var(--border) 1px, transparent 1px),
++    linear-gradient(90deg, var(--border) 1px, transparent 1px);
++  background-size: 48px 48px;
++  background-attachment: fixed;
++  background-position: -1px -1px;
++  background-color: var(--bg-canvas);
++  position: relative;
++}
++
++body::before {
++  /* Grid opacity kept separate from the grid itself so it can be this
++     faint without fighting CSS specificity on background-image. */
++  content: "";
++  position: fixed;
++  inset: 0;
++  background: inherit;
++  opacity: 0.35;
++  pointer-events: none;
++  z-index: -1;
+ }
+ 
+ a {
+@@ -73,12 +112,41 @@ button {
+   font-family: var(--font-ui);
+ }
+ 
++h1,
++h2,
++h3 {
++  font-family: var(--font-display);
++}
++
+ /* Visible keyboard focus - accessibility floor, not optional */
+ :focus-visible {
+   outline: 2px solid var(--accent);
+   outline-offset: 2px;
+ }
+ 
++@keyframes signal-pulse {
++  0% {
++    box-shadow: 0 0 0 0 var(--signal-dim);
++  }
++  70% {
++    box-shadow: 0 0 0 8px transparent;
++  }
++  100% {
++    box-shadow: 0 0 0 0 transparent;
++  }
++}
++
++@keyframes signal-sweep {
++  0% {
++    transform: rotate(0deg);
++    opacity: 0.9;
++  }
++  100% {
++    transform: rotate(360deg);
++    opacity: 0.9;
++  }
++}
++
+ @media (prefers-reduced-motion: reduce) {
+   *,
+   *::before,
+@@ -92,3 +160,38 @@ code,
+ .mono {
+   font-family: var(--font-mono);
+ }
++
++/* ---------- Filter chips (findings view) ---------- */
++.chip {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  font-family: var(--font-mono);
++  font-size: 12px;
++  font-weight: 500;
++  padding: 4px 10px;
++  border-radius: 999px;
++  border: 1px solid var(--border);
++  background: transparent;
++  cursor: pointer;
++  user-select: none;
++  transition: border-color 0.15s, background 0.15s, opacity 0.15s;
++}
++
++.chip[data-active="false"] {
++  opacity: 0.45;
++}
++
++.chip:hover {
++  border-color: var(--border-strong);
++}
++
++.header-tagline {
++  display: inline;
++}
++
++@media (max-width: 560px) {
++  .header-tagline {
++    display: none;
++  }
++}

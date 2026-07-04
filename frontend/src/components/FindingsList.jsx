@@ -3,10 +3,15 @@
  * with inline actions: triage (AI severity + VRT category), readiness
  * check (pre-submission pitfalls), and outcome logging (the actual
  * learning-loop input once you get a real Bugcrowd/HackerOne result).
+ *
+ * Also owns the filter/sort/search bar and the severity distribution
+ * chart above the list - both computed client-side from the findings
+ * already loaded by ProjectDetail, no extra API calls needed.
  */
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "../api/client";
+import { Donut } from "./charts/Donut";
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"];
 
@@ -18,6 +23,12 @@ const SEVERITY_LABEL = {
   info: "Info",
   unknown: "Unknown",
 };
+
+const SORT_OPTIONS = [
+  { value: "severity", label: "Severity" },
+  { value: "newest", label: "Newest first" },
+  { value: "tool", label: "Tool" },
+];
 
 const OUTCOME_OPTIONS = [
   { value: "accepted", label: "Accepted" },
@@ -224,7 +235,79 @@ function FindingRow({ finding, onTriaged }) {
   );
 }
 
+function SeverityChip({ severity, count, active, onToggle }) {
+  const color = severity === "unknown" ? "var(--text-muted)" : `var(--sev-${severity})`;
+  return (
+    <button
+      className="chip"
+      data-active={active}
+      onClick={() => onToggle(severity)}
+      style={{ color, borderColor: active ? color : "var(--border)" }}
+      type="button"
+    >
+      {SEVERITY_LABEL[severity]}
+      <span className="mono" style={{ color: "var(--text-muted)" }}>
+        {count}
+      </span>
+    </button>
+  );
+}
+
 export function FindingsList({ findings, onTriaged }) {
+  const [activeSeverities, setActiveSeverities] = useState(() => new Set(SEVERITY_ORDER));
+  const [toolFilter, setToolFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("severity");
+
+  const counts = useMemo(() => {
+    const c = Object.fromEntries(SEVERITY_ORDER.map((s) => [s, 0]));
+    for (const f of findings) {
+      const sev = f.severity in c ? f.severity : "unknown";
+      c[sev] += 1;
+    }
+    return c;
+  }, [findings]);
+
+  const tools = useMemo(
+    () => Array.from(new Set(findings.map((f) => f.tool_name))).sort(),
+    [findings]
+  );
+
+  function toggleSeverity(sev) {
+    setActiveSeverities((prev) => {
+      const next = new Set(prev);
+      if (next.has(sev)) next.delete(sev);
+      else next.add(sev);
+      return next;
+    });
+  }
+
+  const visible = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let list = findings.filter((f) => {
+      const sev = f.severity in counts ? f.severity : "unknown";
+      if (!activeSeverities.has(sev)) return false;
+      if (toolFilter !== "all" && f.tool_name !== toolFilter) return false;
+      if (q && !(f.evidence || "").toLowerCase().includes(q) && !(f.vuln_type || "").toLowerCase().includes(q)) {
+        return false;
+      }
+      return true;
+    });
+
+    list = [...list].sort((a, b) => {
+      if (sortBy === "severity") {
+        return SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity);
+      }
+      if (sortBy === "tool") {
+        return a.tool_name.localeCompare(b.tool_name);
+      }
+      // newest
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
+
+    return list;
+  }, [findings, activeSeverities, toolFilter, search, sortBy, counts]);
+
   if (findings.length === 0) {
     return (
       <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)" }}>
@@ -233,15 +316,77 @@ export function FindingsList({ findings, onTriaged }) {
     );
   }
 
-  const sorted = [...findings].sort(
-    (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
-  );
+  const donutSegments = SEVERITY_ORDER.filter((s) => s !== "unknown" || counts.unknown > 0).map((s) => ({
+    key: s,
+    label: SEVERITY_LABEL[s],
+    value: counts[s],
+    color: s === "unknown" ? "var(--text-muted)" : `var(--sev-${s})`,
+  }));
 
   return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
-      {sorted.map((finding) => (
-        <FindingRow key={finding.id} finding={finding} onTriaged={onTriaged} />
-      ))}
+    <div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: 24,
+          padding: "16px 4px 20px",
+        }}
+      >
+        <Donut segments={donutSegments} />
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "flex-end" }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {SEVERITY_ORDER.filter((s) => counts[s] > 0).map((s) => (
+              <SeverityChip
+                key={s}
+                severity={s}
+                count={counts[s]}
+                active={activeSeverities.has(s)}
+                onToggle={toggleSeverity}
+              />
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="text"
+              placeholder="Search evidence…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              style={{ ...filterInputStyle, width: 160 }}
+            />
+            <select value={toolFilter} onChange={(e) => setToolFilter(e.target.value)} style={filterInputStyle}>
+              <option value="all">All tools</option>
+              {tools.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={filterInputStyle}>
+              {SORT_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  Sort: {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {visible.length === 0 ? (
+        <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)" }}>
+          No findings match these filters.
+        </div>
+      ) : (
+        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
+          {visible.map((finding) => (
+            <FindingRow key={finding.id} finding={finding} onTriaged={onTriaged} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -263,4 +408,14 @@ const selectStyle = {
   color: "var(--text-primary)",
   padding: "4px 8px",
   fontSize: 12,
+};
+
+const filterInputStyle = {
+  background: "var(--bg-surface-raised)",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius)",
+  color: "var(--text-primary)",
+  padding: "6px 10px",
+  fontSize: 12,
+  fontFamily: "var(--font-ui)",
 };

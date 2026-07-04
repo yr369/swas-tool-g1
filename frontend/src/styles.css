@@ -12,10 +12,20 @@
   --text-secondary: #a8b0bb;
   --text-muted: #6e7681;
 
-  /* Accent (used sparingly: primary actions, active pipeline stage) */
+  /* Accent (used sparingly: primary actions, brand chrome) */
   --accent: #4fd1c5;
   --accent-dim: #2a4a47;
   --on-accent: #0a1f1d;
+
+  /* Signal accent: reserved exclusively for "this is live right now" -
+     an active scan, a sweep, a pulsing node. Never used for static UI
+     chrome, so when it appears it actually means something - the one
+     place this app spends its visual boldness. Named for the radar/
+     signal-intelligence vocabulary of the subject (scanning, sweeping,
+     pinging a target), not just "a second bright color". */
+  --signal: #ffb454;
+  --signal-dim: #4a3a1f;
+  --on-signal: #1f1400;
 
   /* Severity - this is the actual content of the tool, not decoration */
   --sev-critical: #f85149;
@@ -29,16 +39,22 @@
   --sev-info: #6e7681;
   --sev-info-bg: #2a2d33;
 
-  /* Status */
+  /* Status (project lifecycle - distinct from pipeline phase status) */
   --status-success: #3fb950;
   --status-fail: #f85149;
   --status-pending: #6e7681;
+  --proj-created: #58a6ff;
+  --proj-scanning: #ffb454;
+  --proj-completed: #3fb950;
+  --proj-archived: #6e7681;
 
   /* Layout */
   --radius: 6px;
   --radius-lg: 10px;
 
-  /* Type */
+  /* Type: display (headings, big readouts) / ui (body, controls) /
+     mono (data, evidence, anything the tool actually produced) */
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
   --font-ui: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
@@ -62,6 +78,29 @@ body {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  /* A faint fixed grid, like a scope readout - the one atmospheric
+     touch on an otherwise disciplined surface. Barely visible; it's
+     texture, not a pattern anyone should consciously notice. */
+  background-image:
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-attachment: fixed;
+  background-position: -1px -1px;
+  background-color: var(--bg-canvas);
+  position: relative;
+}
+
+body::before {
+  /* Grid opacity kept separate from the grid itself so it can be this
+     faint without fighting CSS specificity on background-image. */
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: inherit;
+  opacity: 0.35;
+  pointer-events: none;
+  z-index: -1;
 }
 
 a {
@@ -73,10 +112,39 @@ button {
   font-family: var(--font-ui);
 }
 
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+}
+
 /* Visible keyboard focus - accessibility floor, not optional */
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+@keyframes signal-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--signal-dim);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes signal-sweep {
+  0% {
+    transform: rotate(0deg);
+    opacity: 0.9;
+  }
+  100% {
+    transform: rotate(360deg);
+    opacity: 0.9;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -91,4 +159,39 @@ button {
 code,
 .mono {
   font-family: var(--font-mono);
+}
+
+/* ---------- Filter chips (findings view) ---------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s, background 0.15s, opacity 0.15s;
+}
+
+.chip[data-active="false"] {
+  opacity: 0.45;
+}
+
+.chip:hover {
+  border-color: var(--border-strong);
+}
+
+.header-tagline {
+  display: inline;
+}
+
+@media (max-width: 560px) {
+  .header-tagline {
+    display: none;
+  }
 }
