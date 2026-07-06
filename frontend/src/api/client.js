@@ -42,6 +42,12 @@ export const api = {
   listScope: (projectId) => request(`/projects/${projectId}/scope`),
   addScopeTarget: (projectId, target) =>
     request(`/projects/${projectId}/scope`, { method: "POST", body: JSON.stringify(target) }),
+  updateScopeTarget: (projectId, targetId, updates) =>
+    request(`/projects/${projectId}/scope/${targetId}`, { method: "PATCH", body: JSON.stringify(updates) }),
+  deleteScopeTarget: (projectId, targetId) =>
+    request(`/projects/${projectId}/scope/${targetId}`, { method: "DELETE" }),
+  bulkAddScopeTargets: (projectId, payload) =>
+    request(`/projects/${projectId}/scope/bulk`, { method: "POST", body: JSON.stringify(payload) }),
 
   // Scope intake (AI-assisted)
   parseScopeText: (platform, rawText) =>

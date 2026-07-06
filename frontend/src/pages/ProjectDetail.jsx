@@ -4,6 +4,7 @@ import { api } from "../api/client";
 import { PipelineTracker } from "../components/PipelineTracker";
 import { FindingsList } from "../components/FindingsList";
 import { DiffPanel } from "../components/DiffPanel";
+import { ScopeManager } from "../components/ScopeManager";
 
 // Fallback polling interval, used ONLY when the WebSocket isn't
 // connected (never established, or dropped). While the socket is live,
@@ -166,33 +167,7 @@ export function ProjectDetail() {
       </Section>
 
       <Section title="Scope">
-        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
-          {scope.length === 0 ? (
-            <div style={{ padding: 16, color: "var(--text-muted)", fontSize: 13 }}>No targets added yet.</div>
-          ) : (
-            scope.map((s, i) => (
-              <div
-                key={s.id}
-                style={{
-                  display: "flex",
-                  gap: 12,
-                  alignItems: "center",
-                  padding: "10px 14px",
-                  borderBottom: i < scope.length - 1 ? "1px solid var(--border)" : "none",
-                  opacity: s.in_scope ? 1 : 0.5,
-                }}
-              >
-                <span className="mono" style={{ flex: 1, fontSize: 13 }}>
-                  {s.target}
-                </span>
-                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{s.target_type}</span>
-                <span style={{ fontSize: 12, color: s.in_scope ? "var(--status-success)" : "var(--text-muted)" }}>
-                  {s.in_scope ? "In scope" : "Out of scope"}
-                </span>
-              </div>
-            ))
-          )}
-        </div>
+        <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
       </Section>
 
       <Section title="Changes since last scan">

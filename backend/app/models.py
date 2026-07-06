@@ -52,6 +52,36 @@ class ScopeTarget(BaseModel):
     created_at: datetime
 
 
+class ScopeTargetUpdate(BaseModel):
+    """All fields optional - PATCH semantics. Only fields the caller
+    actually sets get touched; everything else on the row is left alone.
+    This is what backs the "edit" action in the Scope section (fixing a
+    typo, changing type, or flipping in_scope) as distinct from the
+    "delete" action, which is guarded separately below."""
+    target: Optional[str] = None
+    target_type: Optional[Literal["website", "api", "mobile", "hardware", "unknown"]] = None
+    in_scope: Optional[bool] = None
+    reward_range: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class BulkScopeTargetsCreate(BaseModel):
+    """One shared target_type/in_scope/reward_range/notes applied to a
+    whole pasted batch - matches how program scope lists are usually
+    copy-pasted (a block of same-type hosts), rather than needing the
+    operator to fill out a form per line."""
+    targets: list[str]
+    target_type: Literal["website", "api", "mobile", "hardware", "unknown"] = "unknown"
+    in_scope: bool = True
+    reward_range: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class BulkScopeTargetsResult(BaseModel):
+    created: list[ScopeTarget]
+    skipped_duplicates: list[str]
+
+
 # ---------- Phase runs (the checkpoint table) ----------
 
 class PhaseRun(BaseModel):

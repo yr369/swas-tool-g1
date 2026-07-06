@@ -28,6 +28,9 @@ from .models import (
     ProjectCreate,
     ScopeTarget,
     ScopeTargetCreate,
+    ScopeTargetUpdate,
+    BulkScopeTargetsCreate,
+    BulkScopeTargetsResult,
     ScopeParseRequest,
     ScopeParsePreview,
     ScopeConfirmRequest,
@@ -181,6 +184,147 @@ async def list_scope_targets(project_id: int):
             project_id,
         )
     return [dict(row) for row in rows]
+
+
+@app.patch("/api/projects/{project_id}/scope/{target_id}", response_model=ScopeTarget)
+async def update_scope_target(project_id: int, target_id: int, payload: ScopeTargetUpdate):
+    """
+    Edits a scope target in place - fixing a typo'd hostname, changing
+    its type, or flipping in_scope. Only the fields actually present in
+    the request body are touched (PATCH semantics), so a partial update
+    like {"in_scope": false} doesn't accidentally clobber the target
+    string or notes.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id FROM scope_targets WHERE id = $1 AND project_id = $2",
+            target_id, project_id,
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Scope target not found")
+
+        updates = payload.model_dump(exclude_unset=True)
+        if not updates:
+            row = await conn.fetchrow(
+                """
+                SELECT id, project_id, target, target_type, in_scope, reward_range, notes, created_at
+                FROM scope_targets WHERE id = $1
+                """,
+                target_id,
+            )
+            return dict(row)
+
+        # Field names here come from ScopeTargetUpdate's fixed set of
+        # attributes, never from arbitrary user input, so building the
+        # SET clause from these keys carries no injection risk - the
+        # VALUES are still fully parameterized.
+        set_clauses = []
+        params = []
+        for key, value in updates.items():
+            params.append(value)
+            set_clauses.append(f"{key} = ${len(params)}")
+        params.append(target_id)
+
+        row = await conn.fetchrow(
+            f"""
+            UPDATE scope_targets
+            SET {", ".join(set_clauses)}
+            WHERE id = ${len(params)}
+            RETURNING id, project_id, target, target_type, in_scope, reward_range, notes, created_at
+            """,
+            *params,
+        )
+    return dict(row)
+
+
+@app.delete("/api/projects/{project_id}/scope/{target_id}")
+async def delete_scope_target(project_id: int, target_id: int):
+    """
+    Removes a scope target - but only if it has no findings attached.
+    scope_targets cascades to findings on delete, so removing a target
+    that's already been scanned would silently wipe out real findings
+    data along with it. For a target with history, flip in_scope to
+    false instead (via PATCH) - that keeps the record and its findings
+    while excluding it from future scans.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT id FROM scope_targets WHERE id = $1 AND project_id = $2",
+            target_id, project_id,
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Scope target not found")
+
+        finding_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM findings WHERE target_id = $1", target_id
+        )
+        if finding_count > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This target has {finding_count} finding(s) attached - deleting it would "
+                    f"delete those findings too. Set it out of scope instead if you want to "
+                    f"exclude it from future scans without losing existing results."
+                ),
+            )
+
+        await conn.execute("DELETE FROM scope_targets WHERE id = $1", target_id)
+    return {"deleted": True, "id": target_id}
+
+
+@app.post("/api/projects/{project_id}/scope/bulk", response_model=BulkScopeTargetsResult)
+async def bulk_add_scope_targets(project_id: int, payload: BulkScopeTargetsCreate):
+    """
+    Adds many targets at once from a pasted list - the common case when
+    copying a program's scope table straight from Bugcrowd/HackerOne.
+    All targets in the batch share the same type/in_scope/reward_range/
+    notes; blank lines are dropped, and anything already in this
+    project's scope (exact string match) is skipped rather than
+    duplicated, with the skipped list returned so the operator can see
+    what didn't get re-added.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project_exists = await conn.fetchval("SELECT 1 FROM projects WHERE id = $1", project_id)
+        if not project_exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        existing_rows = await conn.fetch(
+            "SELECT target FROM scope_targets WHERE project_id = $1", project_id
+        )
+        existing_targets = {row["target"] for row in existing_rows}
+
+        cleaned: list[str] = []
+        seen_in_batch = set()
+        for raw in payload.targets:
+            t = raw.strip()
+            if not t or t in seen_in_batch:
+                continue
+            seen_in_batch.add(t)
+            cleaned.append(t)
+
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="No valid targets found in the pasted list")
+
+        skipped = [t for t in cleaned if t in existing_targets]
+        to_insert = [t for t in cleaned if t not in existing_targets]
+
+        created = []
+        for t in to_insert:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO scope_targets
+                    (project_id, target, target_type, in_scope, reward_range, notes)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, project_id, target, target_type, in_scope, reward_range, notes, created_at
+                """,
+                project_id, t, payload.target_type, payload.in_scope, payload.reward_range, payload.notes,
+            )
+            created.append(dict(row))
+
+    return {"created": created, "skipped_duplicates": skipped}
 
 
 # ---------- Scope intake (AI-assisted parsing) ----------
