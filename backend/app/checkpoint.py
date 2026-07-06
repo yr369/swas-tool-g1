@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 
 import asyncpg
 
+from . import ws_manager
+
 logger = logging.getLogger("swas.checkpoint")
 
 # Phases that don't improve by being retried blindly forever - cap retries
@@ -44,16 +46,23 @@ async def create_pending_run(
         target_id,
         phase_name,
     )
+    await ws_manager.manager.broadcast(
+        project_id,
+        {"type": "phase_update", "phase_run_id": row["id"], "target_id": target_id,
+         "phase_name": phase_name, "status": "pending"},
+    )
     return row["id"]
 
 
 @asynccontextmanager
-async def run_phase(conn: asyncpg.Connection, phase_run_id: int):
+async def run_phase(
+    conn: asyncpg.Connection, phase_run_id: int, project_id: int, target_id: int, phase_name: str
+):
     """
     A context manager that wraps the ACTUAL scanning work for one phase,
     on one target. Use it like this:
 
-        async with run_phase(conn, phase_run_id):
+        async with run_phase(conn, phase_run_id, project_id, target_id, phase_name):
             result = await run_subfinder(target)
             ...
 
@@ -67,6 +76,9 @@ async def run_phase(conn: asyncpg.Connection, phase_run_id: int):
         marked 'failed', and the exception is then re-raised so the
         caller (the pipeline orchestrator) knows this phase didn't
         succeed and can decide whether to retry or move on.
+      - Broadcasts every one of these transitions over ws_manager, so any
+        browser tab watching this project's page gets the update the
+        instant it happens rather than waiting for its next poll.
 
     This is the single place that implements "never silently lose a
     failure" - every phase, no matter what tool it's running, gets this
@@ -80,6 +92,11 @@ async def run_phase(conn: asyncpg.Connection, phase_run_id: int):
         """,
         phase_run_id,
         datetime.now(timezone.utc),
+    )
+    await ws_manager.manager.broadcast(
+        project_id,
+        {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
+         "phase_name": phase_name, "status": "in_progress"},
     )
 
     try:
@@ -102,6 +119,11 @@ async def run_phase(conn: asyncpg.Connection, phase_run_id: int):
             datetime.now(timezone.utc),
             str(exc)[:2000],  # cap length so one giant error can't bloat the row
         )
+        await ws_manager.manager.broadcast(
+            project_id,
+            {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
+             "phase_name": phase_name, "status": "failed"},
+        )
         # Re-raise so the orchestrator (pipeline.py) knows this failed and
         # can apply retry/skip logic. We never swallow the error here.
         raise
@@ -115,16 +137,26 @@ async def run_phase(conn: asyncpg.Connection, phase_run_id: int):
             phase_run_id,
             datetime.now(timezone.utc),
         )
+        await ws_manager.manager.broadcast(
+            project_id,
+            {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
+             "phase_name": phase_name, "status": "completed"},
+        )
 
 
 async def mark_needs_attention(
-    conn: asyncpg.Connection, phase_run_id: int, reason: str
+    conn: asyncpg.Connection, phase_run_id: int, reason: str,
+    project_id: int | None = None, target_id: int | None = None, phase_name: str | None = None,
 ) -> None:
     """
     Used when a phase has failed and already used up its retries. Instead
     of trying again and again, we flag it for a human to look at and move
     the pipeline on to the next target - this is what stops one broken
     target from blocking the whole queue.
+
+    project_id/target_id/phase_name are optional so the startup recovery
+    path (recover_interrupted_runs, which doesn't have live browser tabs
+    watching anyway) doesn't need to look them up just to call this.
     """
     await conn.execute(
         """
@@ -135,6 +167,12 @@ async def mark_needs_attention(
         phase_run_id,
         reason[:2000],
     )
+    if project_id is not None:
+        await ws_manager.manager.broadcast(
+            project_id,
+            {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
+             "phase_name": phase_name, "status": "needs_attention"},
+        )
 
 
 # Phases listed here so this module doesn't need to import pipeline.py

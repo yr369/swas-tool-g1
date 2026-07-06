@@ -39,7 +39,7 @@ const OUTCOME_OPTIONS = [
   { value: "no_response", label: "No response yet" },
 ];
 
-function SeverityBadge({ severity }) {
+export function SeverityBadge({ severity }) {
   const sev = severity in SEVERITY_LABEL ? severity : "unknown";
   const color = sev === "unknown" ? "var(--text-muted)" : `var(--sev-${sev})`;
   const bg = sev === "unknown" ? "var(--bg-surface-raised)" : `var(--sev-${sev}-bg)`;

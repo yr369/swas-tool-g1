@@ -11,16 +11,18 @@ This is what actually runs when the backend container starts. It:
      targets, list findings, and trigger/monitor a scan
 """
 
-import asyncio
+import csv
+import io
 import logging
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import os
 
-from . import checkpoint, database, pipeline, readiness, scope_parser, triage, vrt
+from . import checkpoint, database, pipeline, readiness, scope_parser, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -30,11 +32,13 @@ from .models import (
     ScopeParsePreview,
     ScopeConfirmRequest,
     Finding,
+    FindingWithProject,
     PhaseRun,
     OutcomeLogRequest,
     OutcomeRecord,
     SignatureStats,
     ReadinessResponse,
+    DiffResponse,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -531,6 +535,15 @@ async def start_scan(project_id: int, background_tasks: BackgroundTasks):
             "UPDATE projects SET status = 'scanning' WHERE id = $1", project_id
         )
 
+        # Bookmark "a scan started right now" - the diff endpoint buckets
+        # findings by comparing their created_at against consecutive
+        # scan_runs.started_at values, so this single INSERT is all that's
+        # needed to make run-to-run diffing work, no changes to the
+        # findings-insert call sites in pipeline.py required.
+        await conn.execute(
+            "INSERT INTO scan_runs (project_id) VALUES ($1)", project_id
+        )
+
     for target_row in targets:
         background_tasks.add_task(
             pipeline.run_target_pipeline,
@@ -599,3 +612,196 @@ async def get_finding_readiness(finding_id: int):
         "ready": result.ready,
         "checks": [{"name": c.name, "passed": c.passed, "detail": c.detail} for c in result.checks],
     }
+
+
+# ---------- Run-to-run diff ----------
+
+@app.get("/api/projects/{project_id}/diff", response_model=DiffResponse)
+async def diff_latest_scans(project_id: int):
+    """
+    Compares the two most recent scans for this project: what's newly
+    showing up, and what's no longer showing up (fixed, taken down, or
+    just not detected this time - the tool can't tell you which, but it
+    can tell you it's worth a second look either way).
+
+    Identity for matching is (target_id, tool_name, vuln_type) - NOT the
+    full row, since evidence text can shift slightly between runs (a
+    cert expiry date, a response timestamp) without it being a genuinely
+    different finding.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project_exists = await conn.fetchval("SELECT 1 FROM projects WHERE id = $1", project_id)
+        if not project_exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        runs = await conn.fetch(
+            "SELECT id, project_id, started_at FROM scan_runs WHERE project_id = $1 ORDER BY started_at DESC LIMIT 2",
+            project_id,
+        )
+        if len(runs) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Need at least 2 scans on this project to diff - run a scan again once you have a baseline.",
+            )
+
+        latest_run, baseline_run = runs[0], runs[1]
+
+        latest_findings = await conn.fetch(
+            """
+            SELECT id, target_id, tool_name, vuln_type, severity, evidence
+            FROM findings
+            WHERE project_id = $1 AND created_at >= $2
+            """,
+            project_id, latest_run["started_at"],
+        )
+        baseline_findings = await conn.fetch(
+            """
+            SELECT id, target_id, tool_name, vuln_type, severity, evidence
+            FROM findings
+            WHERE project_id = $1 AND created_at >= $2 AND created_at < $3
+            """,
+            project_id, baseline_run["started_at"], latest_run["started_at"],
+        )
+
+    def identity(row):
+        return (row["target_id"], row["tool_name"], row["vuln_type"])
+
+    baseline_by_identity = {identity(r): r for r in baseline_findings}
+    latest_by_identity = {identity(r): r for r in latest_findings}
+
+    new_findings = [dict(r) for k, r in latest_by_identity.items() if k not in baseline_by_identity]
+    resolved_findings = [dict(r) for k, r in baseline_by_identity.items() if k not in latest_by_identity]
+    unchanged_count = len(set(baseline_by_identity) & set(latest_by_identity))
+
+    return {
+        "project_id": project_id,
+        "baseline_run": dict(baseline_run),
+        "latest_run": dict(latest_run),
+        "new_findings": new_findings,
+        "resolved_findings": resolved_findings,
+        "unchanged_count": unchanged_count,
+    }
+
+
+# ---------- CSV export ----------
+
+@app.get("/api/projects/{project_id}/findings/export")
+async def export_findings_csv(project_id: int):
+    """
+    Exports every finding for this project as CSV - meant for pasting
+    into a submission draft or archiving outside the tool, not as a
+    replacement for the readiness checklist.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow("SELECT name FROM projects WHERE id = $1", project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        rows = await conn.fetch(
+            """
+            SELECT f.id, st.target, f.tool_name, f.vuln_type, f.severity, f.status, f.evidence, f.created_at
+            FROM findings f
+            JOIN scope_targets st ON st.id = f.target_id
+            WHERE f.project_id = $1
+            ORDER BY
+                CASE f.severity
+                    WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                    WHEN 'low' THEN 3 WHEN 'info' THEN 4 ELSE 5
+                END,
+                f.created_at DESC
+            """,
+            project_id,
+        )
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["id", "target", "tool", "vuln_type", "severity", "status", "evidence", "created_at"])
+    for row in rows:
+        writer.writerow([
+            row["id"], row["target"], row["tool_name"], row["vuln_type"],
+            row["severity"], row["status"], (row["evidence"] or "").replace("\n", " "), row["created_at"],
+        ])
+    buffer.seek(0)
+
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in project["name"])
+    filename = f"swas_findings_{safe_name}_{project_id}.csv"
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------- Cross-project findings dashboard ----------
+
+@app.get("/api/findings", response_model=List[FindingWithProject])
+async def list_all_findings(
+    severity: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 500,
+):
+    """
+    Findings across EVERY project, for the cross-project dashboard - the
+    per-project view (GET /api/projects/{id}/findings) stays as-is for
+    the project detail page. Filters are all optional and combine with
+    AND. `q` does a simple substring search over evidence and vuln_type.
+    """
+    pool = database.get_pool()
+    conditions = []
+    params: list = []
+
+    if severity:
+        params.append(severity)
+        conditions.append(f"f.severity = ${len(params)}")
+    if tool_name:
+        params.append(tool_name)
+        conditions.append(f"f.tool_name = ${len(params)}")
+    if q:
+        params.append(f"%{q}%")
+        conditions.append(f"(f.evidence ILIKE ${len(params)} OR f.vuln_type ILIKE ${len(params)})")
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(min(limit, 2000))  # hard ceiling regardless of what's requested
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT f.id, f.project_id, f.target_id, f.tool_name, f.vuln_type, f.severity,
+                   f.evidence, f.raw_output_path, f.status, f.created_at,
+                   p.name AS project_name, p.platform AS project_platform
+            FROM findings f
+            JOIN projects p ON p.id = f.project_id
+            {where_clause}
+            ORDER BY f.created_at DESC
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+    return [dict(row) for row in rows]
+
+
+# ---------- Live scan progress (WebSocket) ----------
+
+@app.websocket("/ws/projects/{project_id}")
+async def project_progress_socket(websocket: WebSocket, project_id: int):
+    """
+    Pushes phase status changes for this project the instant checkpoint.py
+    records them, instead of making the frontend wait for its next poll.
+    This is purely additive - ProjectDetail.jsx keeps its 5s polling as a
+    fallback, so a dropped or never-established connection here just
+    means slightly-delayed updates, never lost ones.
+    """
+    await ws_manager.manager.connect(project_id, websocket)
+    try:
+        while True:
+            # We don't expect the frontend to send anything meaningful -
+            # this just blocks until the client disconnects, which is
+            # what actually triggers cleanup below.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_manager.manager.disconnect(project_id, websocket)

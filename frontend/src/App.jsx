@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import { ProjectList } from "./pages/ProjectList";
 import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
+import { Dashboard } from "./pages/Dashboard";
 
 export function App() {
   return (
@@ -16,29 +17,34 @@ export function App() {
             justifyContent: "space-between",
           }}
         >
-          <Link to="/" style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-primary)" }}>
-            <span
-              aria-hidden="true"
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: "50%",
-                background: "var(--signal)",
-                animation: "signal-pulse 2.2s ease-out infinite",
-              }}
-            />
-            <span
-              className="mono"
-              style={{
-                fontFamily: "var(--font-display)",
-                fontWeight: 600,
-                fontSize: 16,
-                letterSpacing: "0.02em",
-              }}
-            >
-              SWAS
-            </span>
-          </Link>
+          <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
+            <Link to="/" style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-primary)" }}>
+              <span
+                aria-hidden="true"
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  background: "var(--signal)",
+                  animation: "signal-pulse 2.2s ease-out infinite",
+                }}
+              />
+              <span
+                className="mono"
+                style={{
+                  fontFamily: "var(--font-display)",
+                  fontWeight: 600,
+                  fontSize: 16,
+                  letterSpacing: "0.02em",
+                }}
+              >
+                SWAS
+              </span>
+            </Link>
+            <Link to="/dashboard" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+              Dashboard
+            </Link>
+          </div>
           <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
             SECURITY WEB AUTOMATION SYSTEM
           </span>
@@ -47,6 +53,7 @@ export function App() {
         <main style={{ flex: 1, padding: "32px 24px", maxWidth: 880, width: "100%", margin: "0 auto" }}>
           <Routes>
             <Route path="/" element={<ProjectList />} />
+            <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/new" element={<NewProject />} />
             <Route path="/projects/:id" element={<ProjectDetail />} />
           </Routes>

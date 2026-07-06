@@ -170,3 +170,41 @@ class ReadinessResponse(BaseModel):
     checks: list[ReadinessCheckResult]
 
 
+# ---------- Scan history / run-to-run diff ----------
+
+class ScanRun(BaseModel):
+    id: int
+    project_id: int
+    started_at: datetime
+
+
+class DiffFinding(BaseModel):
+    """A finding identity used for diffing - deliberately NOT the full
+    Finding model. Two findings are "the same" for diff purposes if they
+    share (target_id, tool_name, vuln_type), even if the exact evidence
+    text differs slightly between runs (e.g. a cert expiry date moving
+    forward by a day is still 'the same finding', not a new one)."""
+    id: int
+    target_id: int
+    tool_name: str
+    vuln_type: str
+    severity: Literal["info", "low", "medium", "high", "critical", "unknown"]
+    evidence: Optional[str]
+
+
+class DiffResponse(BaseModel):
+    project_id: int
+    baseline_run: ScanRun
+    latest_run: ScanRun
+    new_findings: list[DiffFinding]
+    resolved_findings: list[DiffFinding]
+    unchanged_count: int
+
+
+# ---------- Cross-project findings (dashboard) ----------
+
+class FindingWithProject(Finding):
+    project_name: str
+    project_platform: Literal["bugcrowd", "hackerone"]
+
+

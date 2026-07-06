@@ -11,6 +11,13 @@
 		reverse_proxy backend:8000
 	}
 
+	# Live scan progress over WebSocket - also the backend. Caddy's
+	# reverse_proxy handles the WebSocket upgrade automatically, no extra
+	# directive needed for that part.
+	handle /ws/* {
+		reverse_proxy backend:8000
+	}
+
 	# Everything else goes to the frontend
 	handle {
 		reverse_proxy frontend:80

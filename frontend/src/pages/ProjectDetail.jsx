@@ -3,11 +3,11 @@ import { useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { PipelineTracker } from "../components/PipelineTracker";
 import { FindingsList } from "../components/FindingsList";
+import { DiffPanel } from "../components/DiffPanel";
 
-// While a scan is running, poll for updates. This interval is deliberately
-// not aggressive - the backend's phases genuinely take minutes (we saw
-// nuclei alone take ~4 min in real testing), so there's no benefit to
-// polling faster than this.
+// Fallback polling interval, used ONLY when the WebSocket isn't
+// connected (never established, or dropped). While the socket is live,
+// updates arrive instantly and this interval doesn't fire at all.
 const POLL_INTERVAL_MS = 5000;
 
 export function ProjectDetail() {
@@ -19,7 +19,9 @@ export function ProjectDetail() {
   const [scanStarting, setScanStarting] = useState(false);
   const [triagingAll, setTriagingAll] = useState(false);
   const [error, setError] = useState(null);
+  const [liveConnected, setLiveConnected] = useState(false);
   const pollRef = useRef(null);
+  const wsRef = useRef(null);
 
   const loadAll = useCallback(async () => {
     try {
@@ -42,15 +44,47 @@ export function ProjectDetail() {
     loadAll();
   }, [loadAll]);
 
-  // Poll only while something looks like it's actively running - no point
-  // hammering the API once everything's settled into a final state.
+  // Live updates: open a WebSocket for this project and just re-fetch
+  // phase-runs (and findings, since a completed 'scan' phase means new
+  // findings likely landed) whenever a phase_update message arrives.
+  // We re-fetch rather than trying to patch state from the message
+  // itself - simpler, and it's cheap since these are small payloads.
+  useEffect(() => {
+    let cancelled = false;
+    const ws = new WebSocket(api.progressSocketUrl(id));
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (!cancelled) setLiveConnected(true);
+    };
+    ws.onmessage = () => {
+      if (!cancelled) loadAll();
+    };
+    ws.onclose = () => {
+      if (!cancelled) setLiveConnected(false);
+    };
+    ws.onerror = () => {
+      // onclose fires right after this too - nothing extra to do here,
+      // just avoid an unhandled-error console spam on repeated retries.
+    };
+
+    return () => {
+      cancelled = true;
+      ws.close();
+    };
+  }, [id, loadAll]);
+
+  // Fallback polling: only runs while something looks actively in
+  // progress AND the WebSocket isn't currently connected. Once the
+  // socket connects, this interval is skipped entirely - the socket is
+  // strictly faster and cheaper.
   useEffect(() => {
     const isActive = phaseRuns.some((r) => r.status === "in_progress" || r.status === "pending");
-    if (isActive) {
+    if (isActive && !liveConnected) {
       pollRef.current = setInterval(loadAll, POLL_INTERVAL_MS);
       return () => clearInterval(pollRef.current);
     }
-  }, [phaseRuns, loadAll]);
+  }, [phaseRuns, liveConnected, loadAll]);
 
   async function handleStartScan() {
     setScanStarting(true);
@@ -97,14 +131,34 @@ export function ProjectDetail() {
         </p>
       </div>
 
-      <Section title="Pipeline">
+      <Section
+        title="Pipeline"
+        aside={
+          <span
+            className="mono"
+            style={{ fontSize: 11, color: liveConnected ? "var(--signal)" : "var(--text-muted)", display: "flex", alignItems: "center", gap: 6 }}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: liveConnected ? "var(--signal)" : "var(--text-muted)",
+                animation: liveConnected ? "signal-pulse 1.8s ease-out infinite" : "none",
+              }}
+            />
+            {liveConnected ? "LIVE" : "POLLING"}
+          </span>
+        }
+      >
         <PipelineTracker phaseRuns={phaseRuns} />
-        <div style={{ marginTop: 20 }}>
+        <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12 }}>
           <button onClick={handleStartScan} disabled={scanStarting || inScopeCount === 0} style={primaryButtonStyle}>
             {scanStarting ? "Starting…" : "Start scan"}
           </button>
           {inScopeCount === 0 && (
-            <span style={{ marginLeft: 12, fontSize: 13, color: "var(--text-muted)" }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>
               Add an in-scope target before scanning.
             </span>
           )}
@@ -141,7 +195,20 @@ export function ProjectDetail() {
         </div>
       </Section>
 
-      <Section title="Findings">
+      <Section title="Changes since last scan">
+        <DiffPanel projectId={id} />
+      </Section>
+
+      <Section
+        title="Findings"
+        aside={
+          findings.length > 0 && (
+            <a href={api.exportFindingsUrl(id)} style={{ fontSize: 12, color: "var(--accent)" }}>
+              Export CSV
+            </a>
+          )
+        }
+      >
         {findings.length > 0 && (
           <div style={{ marginBottom: 12 }}>
             <button onClick={handleTriageAll} disabled={triagingAll} style={secondaryButtonStyle}>
@@ -157,12 +224,15 @@ export function ProjectDetail() {
   );
 }
 
-function Section({ title, children }) {
+function Section({ title, aside, children }) {
   return (
     <div style={{ marginBottom: 32 }}>
-      <h2 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-secondary)", margin: "0 0 12px", textTransform: "uppercase", letterSpacing: "0.04em" }}>
-        {title}
-      </h2>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-secondary)", margin: 0, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+          {title}
+        </h2>
+        {aside}
+      </div>
       {children}
     </div>
   );

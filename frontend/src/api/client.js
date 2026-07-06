@@ -56,8 +56,29 @@ export const api = {
   startScan: (projectId) => request(`/projects/${projectId}/scan`, { method: "POST" }),
   listPhaseRuns: (projectId) => request(`/projects/${projectId}/phase-runs`),
 
+  // Live scan progress - returns a plain WebSocket URL (not JSON), for
+  // components to open themselves via `new WebSocket(...)`. Derives ws://
+  // vs wss:// from the page's own protocol so it works the same behind
+  // plain HTTP (current OCI setup) or HTTPS (once a domain is added).
+  progressSocketUrl: (projectId) => {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/ws/projects/${projectId}`;
+  },
+
   // Findings
   listFindings: (projectId) => request(`/projects/${projectId}/findings`),
+  listAllFindings: (filters = {}) => {
+    const params = new URLSearchParams();
+    if (filters.severity) params.set("severity", filters.severity);
+    if (filters.tool_name) params.set("tool_name", filters.tool_name);
+    if (filters.q) params.set("q", filters.q);
+    const qs = params.toString();
+    return request(`/findings${qs ? `?${qs}` : ""}`);
+  },
+  exportFindingsUrl: (projectId) => `${BASE}/projects/${projectId}/findings/export`,
+
+  // Run-to-run diff
+  getDiff: (projectId) => request(`/projects/${projectId}/diff`),
 
   // Triage
   triageFinding: (findingId) => request(`/findings/${findingId}/triage`, { method: "POST" }),

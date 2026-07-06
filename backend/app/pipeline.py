@@ -137,7 +137,7 @@ async def _run_phase_with_retry(
             )
 
             try:
-                async with checkpoint.run_phase(conn, phase_run_id):
+                async with checkpoint.run_phase(conn, phase_run_id, project_id, target_id, phase_name):
                     await _execute_phase(
                         conn, project_id, target_id, phase_name, target,
                         discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
@@ -152,6 +152,9 @@ async def _run_phase_with_retry(
                         conn,
                         phase_run_id,
                         f"Failed after {attempt} attempt(s), giving up on this phase",
+                        project_id=project_id,
+                        target_id=target_id,
+                        phase_name=phase_name,
                     )
                     return False
                 logger.info(
