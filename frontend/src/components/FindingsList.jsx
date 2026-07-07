@@ -129,7 +129,7 @@ function OutcomeLogger({ finding, signature, onLogged }) {
   );
 }
 
-function FindingRow({ finding, onTriaged }) {
+function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
   const [expanded, setExpanded] = useState(false);
   const [triaging, setTriaging] = useState(false);
   const [triageResult, setTriageResult] = useState(null);
@@ -167,11 +167,18 @@ function FindingRow({ finding, onTriaged }) {
   const signature = triageResult?.signature || `${finding.tool_name}:${finding.vuln_type}:website`;
 
   return (
-    <div style={{ borderBottom: "1px solid var(--border)" }}>
+    <div style={{ borderBottom: "1px solid var(--border)", opacity: finding.status === "dismissed" ? 0.5 : 1 }}>
       <div
         style={{ display: "flex", gap: 16, padding: "12px 16px", alignItems: "flex-start", cursor: "pointer" }}
         onClick={() => setExpanded((e) => !e)}
       >
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => onToggleSelect(finding.id)}
+          onClick={(e) => e.stopPropagation()}
+          style={{ marginTop: 2 }}
+        />
         <div style={{ minWidth: 76 }}>
           <SeverityBadge severity={finding.severity} />
         </div>
@@ -194,6 +201,11 @@ function FindingRow({ finding, onTriaged }) {
             {finding.evidence}
           </pre>
         </div>
+        {finding.status !== "new" && (
+          <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+            {finding.status}
+          </span>
+        )}
       </div>
 
       {expanded && (
@@ -258,6 +270,8 @@ export function FindingsList({ findings, onTriaged }) {
   const [toolFilter, setToolFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("severity");
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkUpdating, setBulkUpdating] = useState(false);
 
   const counts = useMemo(() => {
     const c = Object.fromEntries(SEVERITY_ORDER.map((s) => [s, 0]));
@@ -280,6 +294,28 @@ export function FindingsList({ findings, onTriaged }) {
       else next.add(sev);
       return next;
     });
+  }
+
+  function toggleSelect(id) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function handleBulkStatus(status) {
+    setBulkUpdating(true);
+    try {
+      await api.bulkUpdateFindingStatus([...selected], status);
+      setSelected(new Set());
+      onTriaged?.();
+    } catch (err) {
+      alert(err.message); // eslint-disable-line no-alert -- simple enough not to need a toast system
+    } finally {
+      setBulkUpdating(false);
+    }
   }
 
   const visible = useMemo(() => {
@@ -376,6 +412,39 @@ export function FindingsList({ findings, onTriaged }) {
         </div>
       </div>
 
+      {selected.size > 0 && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "8px 12px",
+            marginBottom: 10,
+            background: "var(--bg-surface-raised)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius)",
+          }}
+        >
+          <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>{selected.size} selected</span>
+          <button onClick={() => handleBulkStatus("reviewed")} disabled={bulkUpdating} style={smallButtonStyle}>
+            Mark reviewed
+          </button>
+          <button onClick={() => handleBulkStatus("submitted")} disabled={bulkUpdating} style={smallButtonStyle}>
+            Mark submitted
+          </button>
+          <button
+            onClick={() => handleBulkStatus("dismissed")}
+            disabled={bulkUpdating}
+            style={{ ...smallButtonStyle, color: "var(--text-muted)" }}
+          >
+            Dismiss
+          </button>
+          <button onClick={() => setSelected(new Set())} style={{ ...smallButtonStyle, marginLeft: "auto" }}>
+            Clear
+          </button>
+        </div>
+      )}
+
       {visible.length === 0 ? (
         <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)" }}>
           No findings match these filters.
@@ -383,7 +452,13 @@ export function FindingsList({ findings, onTriaged }) {
       ) : (
         <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
           {visible.map((finding) => (
-            <FindingRow key={finding.id} finding={finding} onTriaged={onTriaged} />
+            <FindingRow
+              key={finding.id}
+              finding={finding}
+              onTriaged={onTriaged}
+              selected={selected.has(finding.id)}
+              onToggleSelect={toggleSelect}
+            />
           ))}
         </div>
       )}

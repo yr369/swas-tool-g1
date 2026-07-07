@@ -31,6 +31,27 @@ class Project(BaseModel):
     created_at: datetime
 
 
+class ProjectBulkActionRequest(BaseModel):
+    project_ids: list[int]
+    action: Literal["archive", "delete"]
+
+
+class ProjectBulkBlocked(BaseModel):
+    """Why a project was skipped during a bulk delete - always because
+    it has findings attached, since projects.id cascades to findings on
+    delete and we don't want a bulk selection accidentally wiping out
+    real scan results."""
+    project_id: int
+    name: str
+    reason: str
+
+
+class ProjectBulkActionResult(BaseModel):
+    action: Literal["archive", "delete"]
+    succeeded: list[int]
+    blocked: list[ProjectBulkBlocked]
+
+
 # ---------- Scope targets ----------
 
 class ScopeTargetCreate(BaseModel):
@@ -110,6 +131,16 @@ class Finding(BaseModel):
     raw_output_path: Optional[str]
     status: Literal["new", "reviewed", "submitted", "dismissed"]
     created_at: datetime
+
+
+class FindingBulkStatusRequest(BaseModel):
+    finding_ids: list[int]
+    status: Literal["new", "reviewed", "submitted", "dismissed"]
+
+
+class FindingBulkStatusResult(BaseModel):
+    status: Literal["new", "reviewed", "submitted", "dismissed"]
+    updated: list[int]
 
 
 # ---------- Scope parsing (AI-assisted intake) ----------

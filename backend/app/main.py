@@ -26,6 +26,8 @@ from . import checkpoint, database, pipeline, readiness, scope_parser, triage, v
 from .models import (
     Project,
     ProjectCreate,
+    ProjectBulkActionRequest,
+    ProjectBulkActionResult,
     ScopeTarget,
     ScopeTargetCreate,
     ScopeTargetUpdate,
@@ -36,6 +38,8 @@ from .models import (
     ScopeConfirmRequest,
     Finding,
     FindingWithProject,
+    FindingBulkStatusRequest,
+    FindingBulkStatusResult,
     PhaseRun,
     OutcomeLogRequest,
     OutcomeRecord,
@@ -135,6 +139,58 @@ async def get_project(project_id: int):
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return dict(row)
+
+
+@app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
+async def bulk_project_action(payload: ProjectBulkActionRequest):
+    """
+    Archives or deletes several projects at once from the project list -
+    meant for cleaning up test/duplicate projects without clicking into
+    each one individually.
+
+    Archive is always safe (just flips status, keeps everything).
+    Delete is guarded the same way scope-target delete is guarded:
+    projects cascade to scope_targets/findings/phase_runs/scan_runs on
+    delete, so any project with at least one finding is skipped rather
+    than silently destroyed - it shows up in "blocked" instead, with the
+    finding count, so a bulk click can't accidentally erase real results.
+    Nonexistent project ids are silently ignored (already gone is fine).
+    """
+    pool = database.get_pool()
+    succeeded: list[int] = []
+    blocked: list[dict] = []
+
+    async with pool.acquire() as conn:
+        for project_id in payload.project_ids:
+            project = await conn.fetchrow(
+                "SELECT id, name FROM projects WHERE id = $1", project_id
+            )
+            if project is None:
+                continue
+
+            if payload.action == "archive":
+                await conn.execute(
+                    "UPDATE projects SET status = 'archived' WHERE id = $1", project_id
+                )
+                succeeded.append(project_id)
+                continue
+
+            # action == "delete"
+            finding_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM findings WHERE project_id = $1", project_id
+            )
+            if finding_count > 0:
+                blocked.append({
+                    "project_id": project_id,
+                    "name": project["name"],
+                    "reason": f"{finding_count} finding(s) attached",
+                })
+                continue
+
+            await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
+            succeeded.append(project_id)
+
+    return {"action": payload.action, "succeeded": succeeded, "blocked": blocked}
 
 
 # ---------- Scope targets ----------
@@ -454,6 +510,36 @@ async def list_findings(project_id: int):
             project_id,
         )
     return [dict(row) for row in rows]
+
+
+@app.patch("/api/findings/bulk", response_model=FindingBulkStatusResult)
+async def bulk_update_finding_status(payload: FindingBulkStatusRequest):
+    """
+    Sets the status field (new/reviewed/submitted/dismissed) on many
+    findings at once - the operator's own workflow tracking, separate
+    from severity/triage. Lets you select a batch of low-value findings
+    (e.g. a run of near-identical info-level results) and mark them
+    dismissed in one action instead of opening each one individually.
+    Ids that don't exist are silently skipped; the response lists which
+    ids were actually updated.
+    """
+    if not payload.finding_ids:
+        raise HTTPException(status_code=400, detail="No finding ids provided")
+
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE findings
+            SET status = $1
+            WHERE id = ANY($2::int[])
+            RETURNING id
+            """,
+            payload.status,
+            payload.finding_ids,
+        )
+    updated = [row["id"] for row in rows]
+    return {"status": payload.status, "updated": updated}
 
 
 @app.post("/api/findings/{finding_id}/triage")

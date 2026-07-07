@@ -37,6 +37,8 @@ export const api = {
   getProject: (id) => request(`/projects/${id}`),
   createProject: (name, platform) =>
     request("/projects", { method: "POST", body: JSON.stringify({ name, platform }) }),
+  bulkProjectAction: (projectIds, action) =>
+    request("/projects/bulk-action", { method: "POST", body: JSON.stringify({ project_ids: projectIds, action }) }),
 
   // Scope
   listScope: (projectId) => request(`/projects/${projectId}/scope`),
@@ -82,6 +84,8 @@ export const api = {
     return request(`/findings${qs ? `?${qs}` : ""}`);
   },
   exportFindingsUrl: (projectId) => `${BASE}/projects/${projectId}/findings/export`,
+  bulkUpdateFindingStatus: (findingIds, status) =>
+    request("/findings/bulk", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
 
   // Run-to-run diff
   getDiff: (projectId) => request(`/projects/${projectId}/diff`),

@@ -1,0 +1,670 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index a800657..7651ef5 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -26,6 +26,8 @@ from . import checkpoint, database, pipeline, readiness, scope_parser, triage, v
+ from .models import (
+     Project,
+     ProjectCreate,
++    ProjectBulkActionRequest,
++    ProjectBulkActionResult,
+     ScopeTarget,
+     ScopeTargetCreate,
+     ScopeTargetUpdate,
+@@ -36,6 +38,8 @@ from .models import (
+     ScopeConfirmRequest,
+     Finding,
+     FindingWithProject,
++    FindingBulkStatusRequest,
++    FindingBulkStatusResult,
+     PhaseRun,
+     OutcomeLogRequest,
+     OutcomeRecord,
+@@ -137,6 +141,58 @@ async def get_project(project_id: int):
+     return dict(row)
+ 
+ 
++@app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
++async def bulk_project_action(payload: ProjectBulkActionRequest):
++    """
++    Archives or deletes several projects at once from the project list -
++    meant for cleaning up test/duplicate projects without clicking into
++    each one individually.
++
++    Archive is always safe (just flips status, keeps everything).
++    Delete is guarded the same way scope-target delete is guarded:
++    projects cascade to scope_targets/findings/phase_runs/scan_runs on
++    delete, so any project with at least one finding is skipped rather
++    than silently destroyed - it shows up in "blocked" instead, with the
++    finding count, so a bulk click can't accidentally erase real results.
++    Nonexistent project ids are silently ignored (already gone is fine).
++    """
++    pool = database.get_pool()
++    succeeded: list[int] = []
++    blocked: list[dict] = []
++
++    async with pool.acquire() as conn:
++        for project_id in payload.project_ids:
++            project = await conn.fetchrow(
++                "SELECT id, name FROM projects WHERE id = $1", project_id
++            )
++            if project is None:
++                continue
++
++            if payload.action == "archive":
++                await conn.execute(
++                    "UPDATE projects SET status = 'archived' WHERE id = $1", project_id
++                )
++                succeeded.append(project_id)
++                continue
++
++            # action == "delete"
++            finding_count = await conn.fetchval(
++                "SELECT COUNT(*) FROM findings WHERE project_id = $1", project_id
++            )
++            if finding_count > 0:
++                blocked.append({
++                    "project_id": project_id,
++                    "name": project["name"],
++                    "reason": f"{finding_count} finding(s) attached",
++                })
++                continue
++
++            await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
++            succeeded.append(project_id)
++
++    return {"action": payload.action, "succeeded": succeeded, "blocked": blocked}
++
++
+ # ---------- Scope targets ----------
+ 
+ @app.post("/api/projects/{project_id}/scope", response_model=ScopeTarget)
+@@ -456,6 +512,36 @@ async def list_findings(project_id: int):
+     return [dict(row) for row in rows]
+ 
+ 
++@app.patch("/api/findings/bulk", response_model=FindingBulkStatusResult)
++async def bulk_update_finding_status(payload: FindingBulkStatusRequest):
++    """
++    Sets the status field (new/reviewed/submitted/dismissed) on many
++    findings at once - the operator's own workflow tracking, separate
++    from severity/triage. Lets you select a batch of low-value findings
++    (e.g. a run of near-identical info-level results) and mark them
++    dismissed in one action instead of opening each one individually.
++    Ids that don't exist are silently skipped; the response lists which
++    ids were actually updated.
++    """
++    if not payload.finding_ids:
++        raise HTTPException(status_code=400, detail="No finding ids provided")
++
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        rows = await conn.fetch(
++            """
++            UPDATE findings
++            SET status = $1
++            WHERE id = ANY($2::int[])
++            RETURNING id
++            """,
++            payload.status,
++            payload.finding_ids,
++        )
++    updated = [row["id"] for row in rows]
++    return {"status": payload.status, "updated": updated}
++
++
+ @app.post("/api/findings/{finding_id}/triage")
+ async def triage_one_finding(finding_id: int):
+     """
+diff --git a/backend/app/models.py b/backend/app/models.py
+index b070cdf..84abadf 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -31,6 +31,27 @@ class Project(BaseModel):
+     created_at: datetime
+ 
+ 
++class ProjectBulkActionRequest(BaseModel):
++    project_ids: list[int]
++    action: Literal["archive", "delete"]
++
++
++class ProjectBulkBlocked(BaseModel):
++    """Why a project was skipped during a bulk delete - always because
++    it has findings attached, since projects.id cascades to findings on
++    delete and we don't want a bulk selection accidentally wiping out
++    real scan results."""
++    project_id: int
++    name: str
++    reason: str
++
++
++class ProjectBulkActionResult(BaseModel):
++    action: Literal["archive", "delete"]
++    succeeded: list[int]
++    blocked: list[ProjectBulkBlocked]
++
++
+ # ---------- Scope targets ----------
+ 
+ class ScopeTargetCreate(BaseModel):
+@@ -112,6 +133,16 @@ class Finding(BaseModel):
+     created_at: datetime
+ 
+ 
++class FindingBulkStatusRequest(BaseModel):
++    finding_ids: list[int]
++    status: Literal["new", "reviewed", "submitted", "dismissed"]
++
++
++class FindingBulkStatusResult(BaseModel):
++    status: Literal["new", "reviewed", "submitted", "dismissed"]
++    updated: list[int]
++
++
+ # ---------- Scope parsing (AI-assisted intake) ----------
+ 
+ class ScopeParseRequest(BaseModel):
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index f293fdb..987f805 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -3,6 +3,7 @@ import { ProjectList } from "./pages/ProjectList";
+ import { NewProject } from "./pages/NewProject";
+ import { ProjectDetail } from "./pages/ProjectDetail";
+ import { Dashboard } from "./pages/Dashboard";
++import { SignatureStats } from "./pages/SignatureStats";
+ 
+ export function App() {
+   return (
+@@ -44,6 +45,9 @@ export function App() {
+             <Link to="/dashboard" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+               Dashboard
+             </Link>
++            <Link to="/signatures" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
++              Signature Stats
++            </Link>
+           </div>
+           <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
+             SECURITY WEB AUTOMATION SYSTEM
+@@ -54,6 +58,7 @@ export function App() {
+           <Routes>
+             <Route path="/" element={<ProjectList />} />
+             <Route path="/dashboard" element={<Dashboard />} />
++            <Route path="/signatures" element={<SignatureStats />} />
+             <Route path="/new" element={<NewProject />} />
+             <Route path="/projects/:id" element={<ProjectDetail />} />
+           </Routes>
+diff --git a/frontend/src/api/client.js b/frontend/src/api/client.js
+index fc00325..964a8b5 100644
+--- a/frontend/src/api/client.js
++++ b/frontend/src/api/client.js
+@@ -37,6 +37,8 @@ export const api = {
+   getProject: (id) => request(`/projects/${id}`),
+   createProject: (name, platform) =>
+     request("/projects", { method: "POST", body: JSON.stringify({ name, platform }) }),
++  bulkProjectAction: (projectIds, action) =>
++    request("/projects/bulk-action", { method: "POST", body: JSON.stringify({ project_ids: projectIds, action }) }),
+ 
+   // Scope
+   listScope: (projectId) => request(`/projects/${projectId}/scope`),
+@@ -82,6 +84,8 @@ export const api = {
+     return request(`/findings${qs ? `?${qs}` : ""}`);
+   },
+   exportFindingsUrl: (projectId) => `${BASE}/projects/${projectId}/findings/export`,
++  bulkUpdateFindingStatus: (findingIds, status) =>
++    request("/findings/bulk", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
+ 
+   // Run-to-run diff
+   getDiff: (projectId) => request(`/projects/${projectId}/diff`),
+diff --git a/frontend/src/components/FindingsList.jsx b/frontend/src/components/FindingsList.jsx
+index c060100..b443ceb 100644
+--- a/frontend/src/components/FindingsList.jsx
++++ b/frontend/src/components/FindingsList.jsx
+@@ -129,7 +129,7 @@ function OutcomeLogger({ finding, signature, onLogged }) {
+   );
+ }
+ 
+-function FindingRow({ finding, onTriaged }) {
++function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
+   const [expanded, setExpanded] = useState(false);
+   const [triaging, setTriaging] = useState(false);
+   const [triageResult, setTriageResult] = useState(null);
+@@ -167,11 +167,18 @@ function FindingRow({ finding, onTriaged }) {
+   const signature = triageResult?.signature || `${finding.tool_name}:${finding.vuln_type}:website`;
+ 
+   return (
+-    <div style={{ borderBottom: "1px solid var(--border)" }}>
++    <div style={{ borderBottom: "1px solid var(--border)", opacity: finding.status === "dismissed" ? 0.5 : 1 }}>
+       <div
+         style={{ display: "flex", gap: 16, padding: "12px 16px", alignItems: "flex-start", cursor: "pointer" }}
+         onClick={() => setExpanded((e) => !e)}
+       >
++        <input
++          type="checkbox"
++          checked={selected}
++          onChange={() => onToggleSelect(finding.id)}
++          onClick={(e) => e.stopPropagation()}
++          style={{ marginTop: 2 }}
++        />
+         <div style={{ minWidth: 76 }}>
+           <SeverityBadge severity={finding.severity} />
+         </div>
+@@ -194,6 +201,11 @@ function FindingRow({ finding, onTriaged }) {
+             {finding.evidence}
+           </pre>
+         </div>
++        {finding.status !== "new" && (
++          <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>
++            {finding.status}
++          </span>
++        )}
+       </div>
+ 
+       {expanded && (
+@@ -258,6 +270,8 @@ export function FindingsList({ findings, onTriaged }) {
+   const [toolFilter, setToolFilter] = useState("all");
+   const [search, setSearch] = useState("");
+   const [sortBy, setSortBy] = useState("severity");
++  const [selected, setSelected] = useState(() => new Set());
++  const [bulkUpdating, setBulkUpdating] = useState(false);
+ 
+   const counts = useMemo(() => {
+     const c = Object.fromEntries(SEVERITY_ORDER.map((s) => [s, 0]));
+@@ -282,6 +296,28 @@ export function FindingsList({ findings, onTriaged }) {
+     });
+   }
+ 
++  function toggleSelect(id) {
++    setSelected((prev) => {
++      const next = new Set(prev);
++      if (next.has(id)) next.delete(id);
++      else next.add(id);
++      return next;
++    });
++  }
++
++  async function handleBulkStatus(status) {
++    setBulkUpdating(true);
++    try {
++      await api.bulkUpdateFindingStatus([...selected], status);
++      setSelected(new Set());
++      onTriaged?.();
++    } catch (err) {
++      alert(err.message); // eslint-disable-line no-alert -- simple enough not to need a toast system
++    } finally {
++      setBulkUpdating(false);
++    }
++  }
++
+   const visible = useMemo(() => {
+     const q = search.trim().toLowerCase();
+     let list = findings.filter((f) => {
+@@ -376,6 +412,39 @@ export function FindingsList({ findings, onTriaged }) {
+         </div>
+       </div>
+ 
++      {selected.size > 0 && (
++        <div
++          style={{
++            display: "flex",
++            alignItems: "center",
++            gap: 10,
++            padding: "8px 12px",
++            marginBottom: 10,
++            background: "var(--bg-surface-raised)",
++            border: "1px solid var(--border)",
++            borderRadius: "var(--radius)",
++          }}
++        >
++          <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>{selected.size} selected</span>
++          <button onClick={() => handleBulkStatus("reviewed")} disabled={bulkUpdating} style={smallButtonStyle}>
++            Mark reviewed
++          </button>
++          <button onClick={() => handleBulkStatus("submitted")} disabled={bulkUpdating} style={smallButtonStyle}>
++            Mark submitted
++          </button>
++          <button
++            onClick={() => handleBulkStatus("dismissed")}
++            disabled={bulkUpdating}
++            style={{ ...smallButtonStyle, color: "var(--text-muted)" }}
++          >
++            Dismiss
++          </button>
++          <button onClick={() => setSelected(new Set())} style={{ ...smallButtonStyle, marginLeft: "auto" }}>
++            Clear
++          </button>
++        </div>
++      )}
++
+       {visible.length === 0 ? (
+         <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)" }}>
+           No findings match these filters.
+@@ -383,7 +452,13 @@ export function FindingsList({ findings, onTriaged }) {
+       ) : (
+         <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
+           {visible.map((finding) => (
+-            <FindingRow key={finding.id} finding={finding} onTriaged={onTriaged} />
++            <FindingRow
++              key={finding.id}
++              finding={finding}
++              onTriaged={onTriaged}
++              selected={selected.has(finding.id)}
++              onToggleSelect={toggleSelect}
++            />
+           ))}
+         </div>
+       )}
+diff --git a/frontend/src/pages/ProjectList.jsx b/frontend/src/pages/ProjectList.jsx
+index 7010986..d6aea45 100644
+--- a/frontend/src/pages/ProjectList.jsx
++++ b/frontend/src/pages/ProjectList.jsx
+@@ -9,12 +9,24 @@ const STATUS_ORDER = ["scanning", "created", "completed", "archived"];
+ export function ProjectList() {
+   const [projects, setProjects] = useState(null);
+   const [error, setError] = useState(null);
++  const [selected, setSelected] = useState(() => new Set());
++  const [bulkRunning, setBulkRunning] = useState(false);
++  const [bulkResult, setBulkResult] = useState(null);
+ 
+-  useEffect(() => {
+-    api
++  function load() {
++    return api
+       .listProjects()
+-      .then(setProjects)
++      .then((data) => {
++        setProjects(data);
++        // Drop selections for projects that no longer exist (e.g. after
++        // a bulk delete) rather than leaving stale ids checked.
++        setSelected((prev) => new Set([...prev].filter((id) => data.some((p) => p.id === id))));
++      })
+       .catch((err) => setError(err.message));
++  }
++
++  useEffect(() => {
++    load();
+   }, []);
+ 
+   const statusCounts = useMemo(() => {
+@@ -26,6 +38,40 @@ export function ProjectList() {
+     return c;
+   }, [projects]);
+ 
++  function toggleOne(id) {
++    setSelected((prev) => {
++      const next = new Set(prev);
++      if (next.has(id)) next.delete(id);
++      else next.add(id);
++      return next;
++    });
++  }
++
++  function toggleAll() {
++    setSelected((prev) => (prev.size === projects.length ? new Set() : new Set(projects.map((p) => p.id))));
++  }
++
++  async function handleBulkAction(action) {
++    if (action === "delete") {
++      const confirmed = window.confirm( // eslint-disable-line no-alert -- plain confirm is fine for a solo-operator internal tool
++        `Delete ${selected.size} project${selected.size === 1 ? "" : "s"}? Projects with findings attached will be skipped, not deleted.`
++      );
++      if (!confirmed) return;
++    }
++    setBulkRunning(true);
++    setBulkResult(null);
++    try {
++      const result = await api.bulkProjectAction([...selected], action);
++      setBulkResult(result);
++      setSelected(new Set());
++      await load();
++    } catch (err) {
++      setError(err.message);
++    } finally {
++      setBulkRunning(false);
++    }
++  }
++
+   if (error) {
+     return <p style={{ color: "var(--status-fail)" }}>Couldn't load projects: {error}</p>;
+   }
+@@ -68,36 +114,98 @@ export function ProjectList() {
+             <Donut segments={donutSegments} centerLabel="projects by status" />
+           </div>
+ 
++          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
++            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
++              <input
++                type="checkbox"
++                checked={selected.size === projects.length}
++                onChange={toggleAll}
++                ref={(el) => {
++                  if (el) el.indeterminate = selected.size > 0 && selected.size < projects.length;
++                }}
++              />
++              Select all
++            </label>
++
++            {selected.size > 0 && (
++              <>
++                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{selected.size} selected</span>
++                <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
++                  {bulkRunning ? "…" : "Archive selected"}
++                </button>
++                <button
++                  onClick={() => handleBulkAction("delete")}
++                  disabled={bulkRunning}
++                  style={{ ...secondaryButtonStyle, color: "var(--status-fail)" }}
++                >
++                  {bulkRunning ? "…" : "Delete selected"}
++                </button>
++              </>
++            )}
++          </div>
++
++          {bulkResult && (
++            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
++              {bulkResult.action === "archive" ? (
++                <span style={{ color: "var(--status-success)" }}>Archived {bulkResult.succeeded.length}.</span>
++              ) : (
++                <span style={{ color: "var(--status-success)" }}>Deleted {bulkResult.succeeded.length}.</span>
++              )}
++              {bulkResult.blocked.length > 0 && (
++                <div style={{ color: "var(--sev-medium)", marginTop: 4 }}>
++                  Skipped {bulkResult.blocked.length} (has findings - set to archived instead if you want it out of the active list):{" "}
++                  {bulkResult.blocked.map((b) => `${b.name} (${b.reason})`).join(", ")}
++                </div>
++              )}
++            </div>
++          )}
++
+           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+             {projects.map((p) => (
+-              <Link
++              <div
+                 key={p.id}
+-                to={`/projects/${p.id}`}
+                 style={{
+                   display: "flex",
+-                  justifyContent: "space-between",
+                   alignItems: "center",
++                  gap: 12,
+                   padding: "14px 16px",
+                   background: "var(--bg-surface)",
+                   border: "1px solid var(--border)",
+                   borderRadius: "var(--radius-lg)",
+-                  textDecoration: "none",
+-                  color: "var(--text-primary)",
+                 }}
+               >
+-                <div>
+-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+-                    <span style={{ fontWeight: 500 }}>{p.name}</span>
+-                    <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+-                      #{p.id}
+-                    </span>
++                <input
++                  type="checkbox"
++                  checked={selected.has(p.id)}
++                  onChange={() => toggleOne(p.id)}
++                  onClick={(e) => e.stopPropagation()}
++                />
++                <Link
++                  to={`/projects/${p.id}`}
++                  style={{
++                    flex: 1,
++                    display: "flex",
++                    justifyContent: "space-between",
++                    alignItems: "center",
++                    textDecoration: "none",
++                    color: "var(--text-primary)",
++                    minWidth: 0,
++                  }}
++                >
++                  <div style={{ minWidth: 0 }}>
++                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
++                      <span style={{ fontWeight: 500 }}>{p.name}</span>
++                      <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
++                        #{p.id}
++                      </span>
++                    </div>
++                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
++                      {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
++                    </div>
+                   </div>
+-                  <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+-                    {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
+-                  </div>
+-                </div>
+-                <StatusPill status={p.status} />
+-              </Link>
++                  <StatusPill status={p.status} />
++                </Link>
++              </div>
+             ))}
+           </div>
+         </>
+@@ -151,3 +259,13 @@ const newButtonStyle = {
+   fontWeight: 500,
+   textDecoration: "none",
+ };
++
++const secondaryButtonStyle = {
++  background: "transparent",
++  color: "var(--text-secondary)",
++  border: "1px solid var(--border)",
++  borderRadius: "var(--radius)",
++  padding: "5px 12px",
++  fontSize: 12,
++  cursor: "pointer",
++};
+diff --git a/frontend/src/pages/SignatureStats.jsx b/frontend/src/pages/SignatureStats.jsx
+new file mode 100644
+index 0000000..495c5de
+--- /dev/null
++++ b/frontend/src/pages/SignatureStats.jsx
+@@ -0,0 +1,104 @@
++/**
++ * SignatureStats.jsx - "which kinds of findings actually get accepted?"
++ *
++ * A signature is roughly (tool, vuln_type) - this surfaces the same
++ * outcome history that triage.py already looks up before scoring a new
++ * finding, so the operator can see the pattern directly instead of only
++ * having it baked invisibly into AI reasoning text.
++ */
++
++import { useEffect, useState } from "react";
++import { api } from "../api/client";
++
++const OUTCOME_COLUMNS = [
++  { key: "accepted", label: "Accepted", color: "var(--status-success)" },
++  { key: "duplicate", label: "Duplicate", color: "var(--sev-low)" },
++  { key: "rejected", label: "Rejected", color: "var(--status-fail)" },
++  { key: "informative", label: "Informative", color: "var(--text-muted)" },
++  { key: "not_applicable", label: "N/A", color: "var(--text-muted)" },
++  { key: "no_response", label: "No response", color: "var(--text-muted)" },
++];
++
++export function SignatureStats() {
++  const [stats, setStats] = useState(null);
++  const [error, setError] = useState(null);
++
++  useEffect(() => {
++    api
++      .getSignatureStats()
++      .then(setStats)
++      .catch((err) => setError(err.message));
++  }, []);
++
++  if (error) {
++    return <p style={{ color: "var(--status-fail)" }}>Couldn't load signature stats: {error}</p>;
++  }
++
++  if (stats === null) {
++    return <p style={{ color: "var(--text-muted)" }}>Loading…</p>;
++  }
++
++  return (
++    <div>
++      <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 4px" }}>Signature Stats</h1>
++      <p style={{ color: "var(--text-muted)", fontSize: 13, margin: "0 0 24px" }}>
++        Real outcomes logged per (tool + vuln type) signature - the same history triage checks before scoring a new finding.
++      </p>
++
++      {stats.length === 0 ? (
++        <div style={{ padding: "48px 16px", textAlign: "center", color: "var(--text-muted)" }}>
++          No outcomes logged yet. Log a real outcome on a finding to start building this history.
++        </div>
++      ) : (
++        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
++          {stats.map((s, i) => (
++            <SignatureRow key={s.signature} stat={s} isLast={i === stats.length - 1} />
++          ))}
++        </div>
++      )}
++    </div>
++  );
++}
++
++function SignatureRow({ stat, isLast }) {
++  const acceptanceRate = stat.total > 0 ? Math.round((stat.accepted / stat.total) * 100) : 0;
++
++  return (
++    <div style={{ padding: "12px 16px", borderBottom: isLast ? "none" : "1px solid var(--border)" }}>
++      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
++        <span className="mono" style={{ fontSize: 13, fontWeight: 500 }}>
++          {stat.signature}
++        </span>
++        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
++          {stat.total} logged · <span style={{ color: acceptanceRate >= 50 ? "var(--status-success)" : "var(--text-secondary)" }}>{acceptanceRate}% accepted</span>
++        </span>
++      </div>
++
++      {/* Proportional stacked bar - same visual language as severity
++          donuts elsewhere, just linear since there's a natural order
++          (accepted is "good", rejected is "bad") that a ring would lose. */}
++      <div style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", background: "var(--bg-surface-raised)", marginBottom: 8 }}>
++        {OUTCOME_COLUMNS.map((col) => {
++          const value = stat[col.key] || 0;
++          if (value === 0 || stat.total === 0) return null;
++          return (
++            <span
++              key={col.key}
++              style={{ width: `${(value / stat.total) * 100}%`, background: col.color }}
++              title={`${col.label}: ${value}`}
++            />
++          );
++        })}
++      </div>
++
++      <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
++        {OUTCOME_COLUMNS.map((col) => (
++          <span key={col.key} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "var(--text-muted)" }}>
++            <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: 2, background: col.color }} />
++            {col.label} <span className="mono">{stat[col.key] || 0}</span>
++          </span>
++        ))}
++      </div>
++    </div>
++  );
++}

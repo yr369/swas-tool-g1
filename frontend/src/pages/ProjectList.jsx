@@ -9,12 +9,24 @@ const STATUS_ORDER = ["scanning", "created", "completed", "archived"];
 export function ProjectList() {
   const [projects, setProjects] = useState(null);
   const [error, setError] = useState(null);
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkRunning, setBulkRunning] = useState(false);
+  const [bulkResult, setBulkResult] = useState(null);
+
+  function load() {
+    return api
+      .listProjects()
+      .then((data) => {
+        setProjects(data);
+        // Drop selections for projects that no longer exist (e.g. after
+        // a bulk delete) rather than leaving stale ids checked.
+        setSelected((prev) => new Set([...prev].filter((id) => data.some((p) => p.id === id))));
+      })
+      .catch((err) => setError(err.message));
+  }
 
   useEffect(() => {
-    api
-      .listProjects()
-      .then(setProjects)
-      .catch((err) => setError(err.message));
+    load();
   }, []);
 
   const statusCounts = useMemo(() => {
@@ -25,6 +37,40 @@ export function ProjectList() {
     }
     return c;
   }, [projects]);
+
+  function toggleOne(id) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected((prev) => (prev.size === projects.length ? new Set() : new Set(projects.map((p) => p.id))));
+  }
+
+  async function handleBulkAction(action) {
+    if (action === "delete") {
+      const confirmed = window.confirm( // eslint-disable-line no-alert -- plain confirm is fine for a solo-operator internal tool
+        `Delete ${selected.size} project${selected.size === 1 ? "" : "s"}? Projects with findings attached will be skipped, not deleted.`
+      );
+      if (!confirmed) return;
+    }
+    setBulkRunning(true);
+    setBulkResult(null);
+    try {
+      const result = await api.bulkProjectAction([...selected], action);
+      setBulkResult(result);
+      setSelected(new Set());
+      await load();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBulkRunning(false);
+    }
+  }
 
   if (error) {
     return <p style={{ color: "var(--status-fail)" }}>Couldn't load projects: {error}</p>;
@@ -68,36 +114,98 @@ export function ProjectList() {
             <Donut segments={donutSegments} centerLabel="projects by status" />
           </div>
 
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+              <input
+                type="checkbox"
+                checked={selected.size === projects.length}
+                onChange={toggleAll}
+                ref={(el) => {
+                  if (el) el.indeterminate = selected.size > 0 && selected.size < projects.length;
+                }}
+              />
+              Select all
+            </label>
+
+            {selected.size > 0 && (
+              <>
+                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{selected.size} selected</span>
+                <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
+                  {bulkRunning ? "…" : "Archive selected"}
+                </button>
+                <button
+                  onClick={() => handleBulkAction("delete")}
+                  disabled={bulkRunning}
+                  style={{ ...secondaryButtonStyle, color: "var(--status-fail)" }}
+                >
+                  {bulkRunning ? "…" : "Delete selected"}
+                </button>
+              </>
+            )}
+          </div>
+
+          {bulkResult && (
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
+              {bulkResult.action === "archive" ? (
+                <span style={{ color: "var(--status-success)" }}>Archived {bulkResult.succeeded.length}.</span>
+              ) : (
+                <span style={{ color: "var(--status-success)" }}>Deleted {bulkResult.succeeded.length}.</span>
+              )}
+              {bulkResult.blocked.length > 0 && (
+                <div style={{ color: "var(--sev-medium)", marginTop: 4 }}>
+                  Skipped {bulkResult.blocked.length} (has findings - set to archived instead if you want it out of the active list):{" "}
+                  {bulkResult.blocked.map((b) => `${b.name} (${b.reason})`).join(", ")}
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {projects.map((p) => (
-              <Link
+              <div
                 key={p.id}
-                to={`/projects/${p.id}`}
                 style={{
                   display: "flex",
-                  justifyContent: "space-between",
                   alignItems: "center",
+                  gap: 12,
                   padding: "14px 16px",
                   background: "var(--bg-surface)",
                   border: "1px solid var(--border)",
                   borderRadius: "var(--radius-lg)",
-                  textDecoration: "none",
-                  color: "var(--text-primary)",
                 }}
               >
-                <div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ fontWeight: 500 }}>{p.name}</span>
-                    <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                      #{p.id}
-                    </span>
+                <input
+                  type="checkbox"
+                  checked={selected.has(p.id)}
+                  onChange={() => toggleOne(p.id)}
+                  onClick={(e) => e.stopPropagation()}
+                />
+                <Link
+                  to={`/projects/${p.id}`}
+                  style={{
+                    flex: 1,
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    textDecoration: "none",
+                    color: "var(--text-primary)",
+                    minWidth: 0,
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontWeight: 500 }}>{p.name}</span>
+                      <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                        #{p.id}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                      {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
+                    </div>
                   </div>
-                  <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-                    {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
-                  </div>
-                </div>
-                <StatusPill status={p.status} />
-              </Link>
+                  <StatusPill status={p.status} />
+                </Link>
+              </div>
             ))}
           </div>
         </>
@@ -150,4 +258,14 @@ const newButtonStyle = {
   fontSize: 14,
   fontWeight: 500,
   textDecoration: "none",
+};
+
+const secondaryButtonStyle = {
+  background: "transparent",
+  color: "var(--text-secondary)",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius)",
+  padding: "5px 12px",
+  fontSize: 12,
+  cursor: "pointer",
 };

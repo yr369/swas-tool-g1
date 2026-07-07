@@ -3,6 +3,7 @@ import { ProjectList } from "./pages/ProjectList";
 import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Dashboard } from "./pages/Dashboard";
+import { SignatureStats } from "./pages/SignatureStats";
 
 export function App() {
   return (
@@ -44,6 +45,9 @@ export function App() {
             <Link to="/dashboard" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
               Dashboard
             </Link>
+            <Link to="/signatures" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+              Signature Stats
+            </Link>
           </div>
           <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
             SECURITY WEB AUTOMATION SYSTEM
@@ -54,6 +58,7 @@ export function App() {
           <Routes>
             <Route path="/" element={<ProjectList />} />
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/signatures" element={<SignatureStats />} />
             <Route path="/new" element={<NewProject />} />
             <Route path="/projects/:id" element={<ProjectDetail />} />
           </Routes>
