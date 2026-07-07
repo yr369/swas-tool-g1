@@ -62,6 +62,8 @@ export const api = {
 
   // Pipeline
   startScan: (projectId) => request(`/projects/${projectId}/scan`, { method: "POST" }),
+  setSchedule: (projectId, intervalHours) =>
+    request(`/projects/${projectId}/schedule`, { method: "PUT", body: JSON.stringify({ interval_hours: intervalHours }) }),
   listPhaseRuns: (projectId) => request(`/projects/${projectId}/phase-runs`),
 
   // Live scan progress - returns a plain WebSocket URL (not JSON), for
@@ -84,6 +86,7 @@ export const api = {
     return request(`/findings${qs ? `?${qs}` : ""}`);
   },
   exportFindingsUrl: (projectId) => `${BASE}/projects/${projectId}/findings/export`,
+  reportUrl: (projectId) => `${BASE}/projects/${projectId}/report.md`,
   bulkUpdateFindingStatus: (findingIds, status) =>
     request("/findings/bulk", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
 

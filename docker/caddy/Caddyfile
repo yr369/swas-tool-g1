@@ -6,6 +6,21 @@
 # get you a free HTTPS certificate - no extra config needed for that part.
 
 :80 {
+	# Password-gates EVERYTHING below - the UI, the API, and the
+	# WebSocket - since this directive sits at the top of the site block
+	# rather than inside any single `handle`. Without this, anyone who
+	# finds this server's IP can browse your projects/findings and even
+	# trigger scans against arbitrary targets with zero authentication.
+	#
+	# SWAS_AUTH_USER/SWAS_AUTH_HASH come from .env (see .env.example for
+	# how to generate the hash) - Caddy substitutes {$VAR} from the
+	# environment docker-compose passes into this container. If these
+	# are blank, Caddy will refuse to start - that's intentional, not a
+	# bug, since a blank username/hash would mean "no real password".
+	basic_auth {
+		{$SWAS_AUTH_USER} {$SWAS_AUTH_HASH}
+	}
+
 	# API requests go to the backend
 	handle /api/* {
 		reverse_proxy backend:8000
@@ -13,7 +28,9 @@
 
 	# Live scan progress over WebSocket - also the backend. Caddy's
 	# reverse_proxy handles the WebSocket upgrade automatically, no extra
-	# directive needed for that part.
+	# directive needed for that part. Basic auth above still applies here
+	# too - browsers attach their cached credentials to the WS handshake
+	# request automatically once you've logged in once.
 	handle /ws/* {
 		reverse_proxy backend:8000
 	}

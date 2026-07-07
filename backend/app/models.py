@@ -28,7 +28,15 @@ class Project(BaseModel):
     name: str
     platform: Literal["bugcrowd", "hackerone"]
     status: Literal["created", "scanning", "completed", "archived"]
+    scan_interval_hours: Optional[int] = None
+    next_scheduled_scan_at: Optional[datetime] = None
     created_at: datetime
+
+
+class ScheduleUpdateRequest(BaseModel):
+    """interval_hours=None disables the recurring schedule for this
+    project - it goes back to manual-only scanning."""
+    interval_hours: Optional[int] = None
 
 
 class ProjectBulkActionRequest(BaseModel):

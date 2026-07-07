@@ -11,13 +11,15 @@ This is what actually runs when the backend container starts. It:
      targets, list findings, and trigger/monitor a scan
 """
 
+import asyncio
 import csv
 import io
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import os
@@ -28,6 +30,7 @@ from .models import (
     ProjectCreate,
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
+    ScheduleUpdateRequest,
     ScopeTarget,
     ScopeTargetCreate,
     ScopeTargetUpdate,
@@ -52,6 +55,124 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("swas.main")
 
 
+async def _trigger_scan_for_project(project_id: int) -> dict:
+    """
+    Core scan-kickoff logic: validates the project has in-scope targets
+    and isn't denylisted, marks it 'scanning', bookmarks a scan_runs row,
+    and schedules the actual per-target pipeline work.
+
+    Shared by two callers: the manual POST /scan endpoint below, and the
+    scheduled-scan loop (_run_due_scheduled_scans). Raises HTTPException
+    on problems - the manual endpoint lets that propagate as a normal API
+    error, while the scheduler loop catches it and just logs + moves on,
+    so a single misconfigured project (e.g. someone cleared its scope)
+    can't take down the whole scheduling loop.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        targets = await conn.fetch(
+            "SELECT id, target FROM scope_targets WHERE project_id = $1 AND in_scope = true",
+            project_id,
+        )
+
+        if not targets:
+            raise HTTPException(
+                status_code=400,
+                detail="No in-scope targets found for this project - add scope first",
+            )
+
+        denylist_raw = os.environ.get("DENYLIST_DOMAINS", "")
+        denylist = [d.strip().lower() for d in denylist_raw.split(",") if d.strip()]
+        if denylist:
+            blocked = [t for t in targets if any(d in t["target"].lower() for d in denylist)]
+            if blocked:
+                blocked_names = ", ".join(t["target"] for t in blocked)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Refusing to scan: {blocked_names} matches DENYLIST_DOMAINS. "
+                        f"These are explicitly excluded even if marked in-scope - "
+                        f"remove them from scope or check your program's exclusion list."
+                    ),
+                )
+
+        await conn.execute(
+            "UPDATE projects SET status = 'scanning' WHERE id = $1", project_id
+        )
+        await conn.execute(
+            "INSERT INTO scan_runs (project_id) VALUES ($1)", project_id
+        )
+
+    for target_row in targets:
+        asyncio.create_task(
+            pipeline.run_target_pipeline(pool, project_id, target_row["id"], target_row["target"])
+        )
+
+    return {
+        "message": f"Scan started for {len(targets)} target(s)",
+        "target_count": len(targets),
+    }
+
+
+async def _run_due_scheduled_scans() -> None:
+    """One pass of the scheduler: find every project whose recurring
+    schedule is due, kick each one off, and push its next-run time
+    forward regardless of whether the kickoff succeeded - a project
+    that's misconfigured (e.g. its scope got cleared) shouldn't be
+    retried every 60 seconds forever, just tried again next interval."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        due = await conn.fetch(
+            """
+            SELECT id, scan_interval_hours FROM projects
+            WHERE scan_interval_hours IS NOT NULL
+              AND next_scheduled_scan_at IS NOT NULL
+              AND next_scheduled_scan_at <= now()
+              AND status != 'scanning'
+            """
+        )
+
+    for row in due:
+        project_id = row["id"]
+        try:
+            await _trigger_scan_for_project(project_id)
+            logger.info("scheduler: kicked off scheduled scan for project %s", project_id)
+        except HTTPException as exc:
+            logger.warning("scheduler: skipped project %s (%s)", project_id, exc.detail)
+        except Exception:
+            logger.exception("scheduler: unexpected error kicking off project %s", project_id)
+        finally:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE projects
+                    SET next_scheduled_scan_at = now() + make_interval(hours => scan_interval_hours)
+                    WHERE id = $1
+                    """,
+                    project_id,
+                )
+
+
+async def _scheduler_loop() -> None:
+    """Runs for the lifetime of the app, checking for due scheduled
+    scans once a minute. 60s is frequent enough that a schedule set to
+    'every 6 hours' fires within a minute of its target time, without
+    hammering the database - this is a single-process, in-memory loop,
+    matching the same single-container assumption ws_manager.py already
+    documents (no --workers flag in the Dockerfile CMD)."""
+    logger.info("scan scheduler loop started (checks every 60s)")
+    while True:
+        try:
+            await _run_due_scheduled_scans()
+        except Exception:
+            logger.exception("scheduler loop iteration failed - will retry in 60s")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Runs once when the app starts up
@@ -71,8 +192,11 @@ async def lifespan(app: FastAPI):
             recovered_count,
         )
 
+    scheduler_task = asyncio.create_task(_scheduler_loop())
+
     yield
     # Runs once when the app shuts down (e.g. container stopping)
+    scheduler_task.cancel()
     await database.disconnect_db()
 
 
@@ -110,7 +234,7 @@ async def create_project(payload: ProjectCreate):
             """
             INSERT INTO projects (name, platform)
             VALUES ($1, $2)
-            RETURNING id, name, platform, status, created_at
+            RETURNING id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at
             """,
             payload.name,
             payload.platform,
@@ -123,7 +247,7 @@ async def list_projects():
     pool = database.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, platform, status, created_at FROM projects ORDER BY created_at DESC"
+            "SELECT id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at FROM projects ORDER BY created_at DESC"
         )
     return [dict(row) for row in rows]
 
@@ -133,7 +257,7 @@ async def get_project(project_id: int):
     pool = database.get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, name, platform, status, created_at FROM projects WHERE id = $1",
+            "SELECT id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at FROM projects WHERE id = $1",
             project_id,
         )
     if row is None:
@@ -452,7 +576,7 @@ async def confirm_scope(payload: ScopeConfirmRequest):
         async with conn.transaction():
             if payload.project_id is not None:
                 project_row = await conn.fetchrow(
-                    "SELECT id, name, platform, status, created_at FROM projects WHERE id = $1",
+                    "SELECT id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at FROM projects WHERE id = $1",
                     payload.project_id,
                 )
                 if project_row is None:
@@ -467,7 +591,7 @@ async def confirm_scope(payload: ScopeConfirmRequest):
                     """
                     INSERT INTO projects (name, platform)
                     VALUES ($1, $2)
-                    RETURNING id, name, platform, status, created_at
+                    RETURNING id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at
                     """,
                     payload.project_name,
                     payload.platform,
@@ -711,7 +835,7 @@ async def get_signature_stats(signature: str = None):
 # ---------- Scanning pipeline ----------
 
 @app.post("/api/projects/{project_id}/scan")
-async def start_scan(project_id: int, background_tasks: BackgroundTasks):
+async def start_scan(project_id: int):
     """
     Kicks off scanning for every in-scope target in this project. Runs in
     the background - this endpoint returns immediately rather than
@@ -720,73 +844,62 @@ async def start_scan(project_id: int, background_tasks: BackgroundTasks):
 
     Phase 1 keeps this simple: every in-scope target starts its pipeline
     concurrently (no queue/concurrency cap yet - that's a later phase).
+
+    The actual kickoff logic lives in _trigger_scan_for_project(), shared
+    with the scheduled-scan background loop so both paths behave
+    identically - this endpoint is now just the HTTP-triggered entry
+    point into that shared logic.
     """
+    return await _trigger_scan_for_project(project_id)
+
+
+@app.put("/api/projects/{project_id}/schedule", response_model=Project)
+async def set_project_schedule(project_id: int, payload: ScheduleUpdateRequest):
+    """
+    Sets or clears a recurring scan schedule for this project.
+    interval_hours=None (or omitted) disables it and goes back to
+    manual-only scanning. Setting an interval computes the first
+    next_scheduled_scan_at as now() + interval - the scheduler loop
+    (_run_due_scheduled_scans, checked every 60s) picks it up from there.
+    """
+    if payload.interval_hours is not None and payload.interval_hours < 1:
+        raise HTTPException(status_code=400, detail="interval_hours must be at least 1")
+
     pool = database.get_pool()
     async with pool.acquire() as conn:
         project = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        targets = await conn.fetch(
-            "SELECT id, target FROM scope_targets WHERE project_id = $1 AND in_scope = true",
-            project_id,
-        )
-
-        if not targets:
-            raise HTTPException(
-                status_code=400,
-                detail="No in-scope targets found for this project - add scope first",
+        if payload.interval_hours is None:
+            await conn.execute(
+                """
+                UPDATE projects
+                SET scan_interval_hours = NULL, next_scheduled_scan_at = NULL
+                WHERE id = $1
+                """,
+                project_id,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE projects
+                SET scan_interval_hours = $2,
+                    next_scheduled_scan_at = now() + make_interval(hours => $2)
+                WHERE id = $1
+                """,
+                project_id,
+                payload.interval_hours,
             )
 
-        # Hard denylist, defense-in-depth beyond the in_scope flag: some
-        # programs explicitly exclude specific domains even though they
-        # might look related (e.g. JustEatTakeaway's program explicitly
-        # excludes *.leadfamly.com and *.playable.com despite being
-        # owned-adjacent). If a target was accidentally marked in_scope
-        # during intake (operator error, or a future scope-parsing bug),
-        # this is the second layer that stops it from actually being
-        # scanned. Configured via DENYLIST_DOMAINS in .env, comma-separated.
-        denylist_raw = os.environ.get("DENYLIST_DOMAINS", "")
-        denylist = [d.strip().lower() for d in denylist_raw.split(",") if d.strip()]
-        if denylist:
-            blocked = [t for t in targets if any(d in t["target"].lower() for d in denylist)]
-            if blocked:
-                blocked_names = ", ".join(t["target"] for t in blocked)
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Refusing to scan: {blocked_names} matches DENYLIST_DOMAINS. "
-                        f"These are explicitly excluded even if marked in-scope - "
-                        f"remove them from scope or check your program's exclusion list."
-                    ),
-                )
-
-        await conn.execute(
-            "UPDATE projects SET status = 'scanning' WHERE id = $1", project_id
-        )
-
-        # Bookmark "a scan started right now" - the diff endpoint buckets
-        # findings by comparing their created_at against consecutive
-        # scan_runs.started_at values, so this single INSERT is all that's
-        # needed to make run-to-run diffing work, no changes to the
-        # findings-insert call sites in pipeline.py required.
-        await conn.execute(
-            "INSERT INTO scan_runs (project_id) VALUES ($1)", project_id
-        )
-
-    for target_row in targets:
-        background_tasks.add_task(
-            pipeline.run_target_pipeline,
-            pool,
+        row = await conn.fetchrow(
+            """
+            SELECT id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at
+            FROM projects WHERE id = $1
+            """,
             project_id,
-            target_row["id"],
-            target_row["target"],
         )
-
-    return {
-        "message": f"Scan started for {len(targets)} target(s)",
-        "target_count": len(targets),
-    }
+    return dict(row)
 
 
 @app.get("/api/projects/{project_id}/phase-runs", response_model=List[PhaseRun])
@@ -960,6 +1073,107 @@ async def export_findings_csv(project_id: int):
     return StreamingResponse(
         iter([buffer.getvalue()]),
         media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------- Markdown report ----------
+
+_SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"]
+
+
+@app.get("/api/projects/{project_id}/report.md")
+async def generate_markdown_report(project_id: int):
+    """
+    A submission-ready Markdown report: scope table, then findings
+    grouped by severity with evidence in code blocks. Markdown rather
+    than PDF deliberately - most Bugcrowd/HackerOne submission forms and
+    note fields render Markdown directly, and it avoids adding a PDF-
+    rendering dependency (weasyprint/wkhtmltopdf) to the Docker image
+    just for this. Paste-and-go for a report body, or open in any editor.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow(
+            "SELECT name, platform, created_at FROM projects WHERE id = $1", project_id
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        scope_rows = await conn.fetch(
+            """
+            SELECT target, target_type, in_scope
+            FROM scope_targets WHERE project_id = $1
+            ORDER BY created_at ASC
+            """,
+            project_id,
+        )
+        finding_rows = await conn.fetch(
+            """
+            SELECT f.severity, f.tool_name, f.vuln_type, f.evidence, f.status, st.target
+            FROM findings f
+            JOIN scope_targets st ON st.id = f.target_id
+            WHERE f.project_id = $1
+            ORDER BY
+                CASE f.severity
+                    WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                    WHEN 'low' THEN 3 WHEN 'info' THEN 4 ELSE 5
+                END,
+                f.created_at DESC
+            """,
+            project_id,
+        )
+
+    lines: list[str] = []
+    lines.append(f"# {project['name']} - Security Assessment Report")
+    lines.append("")
+    lines.append(f"**Platform:** {project['platform'].title()}  ")
+    lines.append(f"**Report generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  ")
+    lines.append(f"**Project created:** {project['created_at'].strftime('%Y-%m-%d')}")
+    lines.append("")
+
+    lines.append("## Scope")
+    lines.append("")
+    if not scope_rows:
+        lines.append("_No scope targets recorded._")
+    else:
+        lines.append("| Target | Type | In Scope |")
+        lines.append("|---|---|---|")
+        for s in scope_rows:
+            lines.append(f"| {s['target']} | {s['target_type']} | {'Yes' if s['in_scope'] else 'No'} |")
+    lines.append("")
+
+    lines.append("## Findings")
+    lines.append("")
+    if not finding_rows:
+        lines.append("_No findings recorded for this project._")
+    else:
+        by_severity: dict[str, list] = {}
+        for f in finding_rows:
+            sev = f["severity"] if f["severity"] in _SEVERITY_ORDER else "unknown"
+            by_severity.setdefault(sev, []).append(f)
+
+        for sev in _SEVERITY_ORDER:
+            rows_for_sev = by_severity.get(sev)
+            if not rows_for_sev:
+                continue
+            lines.append(f"### {sev.title()} ({len(rows_for_sev)})")
+            lines.append("")
+            for f in rows_for_sev:
+                lines.append(f"- **{f['target']}** — `{f['tool_name']}` / {f['vuln_type']} _{f['status']}_")
+                if f["evidence"]:
+                    # Indent so it renders as a nested code block under
+                    # the bullet, rather than breaking out to top level.
+                    evidence_indented = f["evidence"].strip().replace("\n", "\n  ")
+                    lines.append(f"  ```\n  {evidence_indented}\n  ```")
+            lines.append("")
+
+    content = "\n".join(lines)
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in project["name"])
+    filename = f"swas_report_{safe_name}_{project_id}.md"
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/markdown",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 

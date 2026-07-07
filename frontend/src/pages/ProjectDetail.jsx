@@ -19,6 +19,7 @@ export function ProjectDetail() {
   const [findings, setFindings] = useState([]);
   const [scanStarting, setScanStarting] = useState(false);
   const [triagingAll, setTriagingAll] = useState(false);
+  const [schedulingBusy, setSchedulingBusy] = useState(false);
   const [error, setError] = useState(null);
   const [liveConnected, setLiveConnected] = useState(false);
   const pollRef = useRef(null);
@@ -100,6 +101,19 @@ export function ProjectDetail() {
     }
   }
 
+  async function handleScheduleChange(intervalHours) {
+    setSchedulingBusy(true);
+    setError(null);
+    try {
+      await api.setSchedule(id, intervalHours);
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSchedulingBusy(false);
+    }
+  }
+
   async function handleTriageAll() {
     setTriagingAll(true);
     setError(null);
@@ -154,7 +168,7 @@ export function ProjectDetail() {
         }
       >
         <PipelineTracker phaseRuns={phaseRuns} />
-        <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <button onClick={handleStartScan} disabled={scanStarting || inScopeCount === 0} style={primaryButtonStyle}>
             {scanStarting ? "Starting…" : "Start scan"}
           </button>
@@ -163,6 +177,26 @@ export function ProjectDetail() {
               Add an in-scope target before scanning.
             </span>
           )}
+
+          <span style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+            <label style={{ fontSize: 12, color: "var(--text-muted)" }}>Recurring:</label>
+            <select
+              value={project.scan_interval_hours ?? ""}
+              onChange={(e) => handleScheduleChange(e.target.value ? Number(e.target.value) : null)}
+              disabled={schedulingBusy}
+              style={scheduleSelectStyle}
+            >
+              <option value="">Off</option>
+              <option value="6">Every 6 hours</option>
+              <option value="24">Daily</option>
+              <option value="168">Weekly</option>
+            </select>
+            {project.next_scheduled_scan_at && (
+              <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                next {formatDate(project.next_scheduled_scan_at)}
+              </span>
+            )}
+          </span>
         </div>
       </Section>
 
@@ -178,9 +212,14 @@ export function ProjectDetail() {
         title="Findings"
         aside={
           findings.length > 0 && (
-            <a href={api.exportFindingsUrl(id)} style={{ fontSize: 12, color: "var(--accent)" }}>
-              Export CSV
-            </a>
+            <span style={{ display: "flex", gap: 12 }}>
+              <a href={api.reportUrl(id)} style={{ fontSize: 12, color: "var(--accent)" }}>
+                Download report (.md)
+              </a>
+              <a href={api.exportFindingsUrl(id)} style={{ fontSize: 12, color: "var(--accent)" }}>
+                Export CSV
+              </a>
+            </span>
           )
         }
       >
@@ -232,6 +271,16 @@ const secondaryButtonStyle = {
   padding: "8px 16px",
   fontSize: 14,
   cursor: "pointer",
+};
+
+const scheduleSelectStyle = {
+  background: "var(--bg-surface-raised)",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius)",
+  color: "var(--text-primary)",
+  padding: "5px 8px",
+  fontSize: 12,
+  fontFamily: "var(--font-ui)",
 };
 
 function formatDate(isoString) {
