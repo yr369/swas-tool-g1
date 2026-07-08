@@ -33,6 +33,9 @@ from . import checkpoint, detective, fp_filter, tools
 # subdomains" is still not free, so Phase 1 keeps a conservative ceiling.
 _TAKEOVER_CHECK_CAP = 15
 _SENSITIVE_URL_CHECK_CAP = 15
+_SQLI_TIMING_CHECK_CAP = 8      # each test costs a deliberate multi-second delay - keep tight
+_SOURCE_MAP_CHECK_CAP = 10
+_OPEN_REDIRECT_CHECK_CAP = 15
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -371,6 +374,13 @@ async def _phase_scan(
         if cache_result is not None:
             await _save_detective_finding(conn, project_id, target_id, cache_result)
 
+        # CSP weakness check is recon-only by design - see detective.py's
+        # module docstring and check_csp_weakness's own docstring for why
+        # this deliberately never becomes a findings-table row.
+        csp_note = await detective.check_csp_weakness(host)
+        if csp_note is not None:
+            logger.info("detective: CSP recon note: %s", csp_note)
+
     # Detective check: sensitive file entropy. Runs against discovered
     # historical URLs (gau/waybackurls output) that look like JS bundles,
     # config files, or backups - capped, since this involves an actual
@@ -389,6 +399,63 @@ async def _phase_scan(
     for res in entropy_results:
         if isinstance(res, Exception):
             logger.debug("entropy check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: leaked source maps. Only worth trying against
+    # discovered URLs that look like JS bundles.
+    js_candidates = [url for url in discovered_urls if url.lower().split("?")[0].endswith(".js")][
+        :_SOURCE_MAP_CHECK_CAP
+    ]
+    logger.info("detective: running source map check against %d JS bundle URL(s)", len(js_candidates))
+    source_map_results = await asyncio.gather(
+        *(detective.check_source_map_leak(url) for url in js_candidates),
+        return_exceptions=True,
+    )
+    for res in source_map_results:
+        if isinstance(res, Exception):
+            logger.debug("source map check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: open redirect. check_open_redirect() itself only
+    # acts when a query param name looks redirect-related, so we just
+    # need to feed it every URL with a query string and let it decide -
+    # filtering here again would just duplicate that logic.
+    redirect_candidates = [url for url in discovered_urls if "=" in url][:_OPEN_REDIRECT_CHECK_CAP]
+    logger.info(
+        "detective: running open redirect check against %d candidate URL(s)", len(redirect_candidates)
+    )
+    redirect_results = await asyncio.gather(
+        *(detective.check_open_redirect(url) for url in redirect_candidates),
+        return_exceptions=True,
+    )
+    for res in redirect_results:
+        if isinstance(res, Exception):
+            logger.debug("open redirect check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: blind SQL injection via timing. The most
+    # expensive check here (each real hit costs several deliberate
+    # seconds of wait), so it only runs against URLs that already have
+    # query parameters worth injecting into, and is capped tighter than
+    # the others (_SQLI_TIMING_CHECK_CAP).
+    param_candidates = [url for url in discovered_urls if "=" in url][:_SQLI_TIMING_CHECK_CAP]
+    logger.info(
+        "detective: running blind SQLi timing check against %d parameterized URL(s)",
+        len(param_candidates),
+    )
+    sqli_results = await asyncio.gather(
+        *(detective.check_blind_sqli_timing(url) for url in param_candidates),
+        return_exceptions=True,
+    )
+    for res in sqli_results:
+        if isinstance(res, Exception):
+            logger.debug("blind SQLi timing check raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding(conn, project_id, target_id, res)
