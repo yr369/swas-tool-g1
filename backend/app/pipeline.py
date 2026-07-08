@@ -230,6 +230,7 @@ async def _phase_recon(
     # the highest payout-to-effort ratios in bug bounty, so it runs here
     # unconditionally rather than being gated behind a later phase.
     candidates = discovered_subdomains[:_TAKEOVER_CHECK_CAP]
+    logger.info("detective: running takeover check against %d candidate(s)", len(candidates))
     takeover_results = await asyncio.gather(
         *(detective.check_subdomain_takeover(host) for host in candidates),
         return_exceptions=True,
@@ -377,6 +378,10 @@ async def _phase_scan(
     sensitive_candidates = [
         url for url in discovered_urls if detective._SENSITIVE_FILE_HINTS.search(url)
     ][:_SENSITIVE_URL_CHECK_CAP]
+    logger.info(
+        "detective: running entropy check against %d sensitive-looking URL(s) out of %d discovered",
+        len(sensitive_candidates), len(discovered_urls),
+    )
     entropy_results = await asyncio.gather(
         *(detective.check_file_entropy(url) for url in sensitive_candidates),
         return_exceptions=True,

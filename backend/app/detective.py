@@ -77,6 +77,7 @@ async def check_subdomain_takeover(hostname: str) -> dict | None:
     """
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            logger.info("detective: checking subdomain takeover for %s", hostname)
             dns_resp = await client.get(
                 "https://cloudflare-dns.com/dns-query",
                 params={"name": hostname, "type": "CNAME"},
@@ -111,7 +112,7 @@ async def check_subdomain_takeover(hostname: str) -> dict | None:
                             ),
                         }
     except (httpx.HTTPError, ValueError) as exc:
-        logger.debug("takeover check failed for %s: %s", hostname, exc)
+        logger.info("detective: takeover check failed for %s: %s", hostname, exc)
     return None
 
 
@@ -133,11 +134,12 @@ async def check_cors_misconfig(url: str) -> dict | None:
     actually pay for.
     """
     fake_origin = "https://evil-cors-probe.example.com"
+    logger.info("detective: checking CORS misconfig for %s", url)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
             resp = await client.get(url, headers={"Origin": fake_origin})
     except httpx.HTTPError as exc:
-        logger.debug("CORS check failed for %s: %s", url, exc)
+        logger.info("detective: CORS check failed for %s: %s", url, exc)
         return None
 
     allow_origin = resp.headers.get("access-control-allow-origin", "")
@@ -185,6 +187,7 @@ async def check_cache_deception(url: str) -> dict | None:
         return None
 
     probe_url = url.rstrip("/") + "/nonexistent-swas-probe.css"
+    logger.info("detective: checking cache deception for %s", probe_url)
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
@@ -223,7 +226,7 @@ async def check_cache_deception(url: str) -> dict | None:
                     ),
                 }
     except httpx.HTTPError as exc:
-        logger.debug("cache deception check failed for %s: %s", url, exc)
+        logger.info("detective: cache deception check failed for %s: %s", url, exc)
     return None
 
 
@@ -266,11 +269,12 @@ async def check_file_entropy(url: str) -> dict | None:
     if not _SENSITIVE_FILE_HINTS.search(url):
         return None
 
+    logger.info("detective: checking file entropy for %s", url)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
             resp = await client.get(url)
     except httpx.HTTPError as exc:
-        logger.debug("entropy check fetch failed for %s: %s", url, exc)
+        logger.info("detective: entropy check fetch failed for %s: %s", url, exc)
         return None
 
     if resp.status_code != 200 or not resp.text:
