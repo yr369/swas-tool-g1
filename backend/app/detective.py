@@ -70,6 +70,55 @@ _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # secret list. Kept short and high-confidence on purpose: a shorter list
 # of well-known, reliably-fingerprinted services beats a huge list that
 # generates noisy false positives.
+_MAX_REASONABLE_URL_LENGTH = 500
+
+
+def _extract_hostname(candidate: str) -> str | None:
+    """
+    Normalizes a takeover-check candidate into a bare hostname, or
+    returns None if it's not something a CNAME lookup makes sense for.
+    Scope-import data is often messy - HackerOne/Bugcrowd scope lists
+    routinely include app-store links, raw numeric app IDs, or
+    malformed concatenated URLs scraped by gau/waybackurls. This exists
+    so those get skipped quietly instead of wasting a DNS lookup (and
+    cluttering logs) on something that was never a hostname to begin
+    with.
+    """
+    candidate = candidate.strip()
+    if not candidate or len(candidate) > _MAX_REASONABLE_URL_LENGTH:
+        return None
+    if candidate.count("://") > 1:
+        return None  # classic sign of a scraper gluing multiple URLs together
+
+    host = urlparse(candidate).netloc if "://" in candidate else candidate.split("/")[0]
+    host = host.split(":")[0].split("@")[-1]  # strip port and any userinfo@ prefix
+
+    if not host or "." not in host:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9.\-]+", host):
+        return None
+    return host.lower()
+
+
+def _looks_like_sane_url(url: str) -> bool:
+    """
+    Basic sanity gate for the URL-based checks (SQLi timing, open
+    redirect, source maps). Rejects the same categories of scraper junk
+    as _extract_hostname, plus an overall length cap - a single blind
+    SQLi timing test costs several deliberate seconds, so it's worth a
+    cheap check up front rather than burning that time on garbage input.
+    """
+    url = url.strip()
+    if not url or len(url) > _MAX_REASONABLE_URL_LENGTH:
+        return False
+    if url.count("://") > 1:
+        return False
+    parsed = urlparse(url)
+    if not parsed.netloc or "." not in parsed.netloc:
+        return False
+    return True
+
+
 _TAKEOVER_FINGERPRINTS: list[tuple[str, str, str]] = [
     # (cname substring, response substring that proves it's unclaimed, service name)
     ("s3.amazonaws.com", "NoSuchBucket", "AWS S3"),
@@ -104,6 +153,10 @@ async def check_subdomain_takeover(hostname: str) -> dict | None:
     hijackable (which is the overwhelmingly common case - this should
     stay quiet unless it's confident).
     """
+    hostname = _extract_hostname(hostname)
+    if hostname is None:
+        return None  # not a real hostname - scope-import junk, skip quietly
+
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
             logger.info("detective: checking subdomain takeover for %s", hostname)

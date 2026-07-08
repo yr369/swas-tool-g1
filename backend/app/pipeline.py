@@ -381,12 +381,18 @@ async def _phase_scan(
         if csp_note is not None:
             logger.info("detective: CSP recon note: %s", csp_note)
 
+    # Pre-filter discovered_urls once for all the URL-based checks below.
+    # gau/waybackurls output is often messy - malformed concatenated URLs,
+    # scope-import junk, etc. - and the SQLi timing check especially
+    # shouldn't burn several deliberate seconds on garbage input.
+    sane_discovered_urls = [u for u in discovered_urls if detective._looks_like_sane_url(u)]
+
     # Detective check: sensitive file entropy. Runs against discovered
     # historical URLs (gau/waybackurls output) that look like JS bundles,
     # config files, or backups - capped, since this involves an actual
     # file download per candidate URL rather than a header-only check.
     sensitive_candidates = [
-        url for url in discovered_urls if detective._SENSITIVE_FILE_HINTS.search(url)
+        url for url in sane_discovered_urls if detective._SENSITIVE_FILE_HINTS.search(url)
     ][:_SENSITIVE_URL_CHECK_CAP]
     logger.info(
         "detective: running entropy check against %d sensitive-looking URL(s) out of %d discovered",
@@ -405,9 +411,9 @@ async def _phase_scan(
 
     # Detective check: leaked source maps. Only worth trying against
     # discovered URLs that look like JS bundles.
-    js_candidates = [url for url in discovered_urls if url.lower().split("?")[0].endswith(".js")][
-        :_SOURCE_MAP_CHECK_CAP
-    ]
+    js_candidates = [
+        url for url in sane_discovered_urls if url.lower().split("?")[0].endswith(".js")
+    ][:_SOURCE_MAP_CHECK_CAP]
     logger.info("detective: running source map check against %d JS bundle URL(s)", len(js_candidates))
     source_map_results = await asyncio.gather(
         *(detective.check_source_map_leak(url) for url in js_candidates),
@@ -424,7 +430,9 @@ async def _phase_scan(
     # acts when a query param name looks redirect-related, so we just
     # need to feed it every URL with a query string and let it decide -
     # filtering here again would just duplicate that logic.
-    redirect_candidates = [url for url in discovered_urls if "=" in url][:_OPEN_REDIRECT_CHECK_CAP]
+    redirect_candidates = [url for url in sane_discovered_urls if "=" in url][
+        :_OPEN_REDIRECT_CHECK_CAP
+    ]
     logger.info(
         "detective: running open redirect check against %d candidate URL(s)", len(redirect_candidates)
     )
@@ -444,7 +452,7 @@ async def _phase_scan(
     # seconds of wait), so it only runs against URLs that already have
     # query parameters worth injecting into, and is capped tighter than
     # the others (_SQLI_TIMING_CHECK_CAP).
-    param_candidates = [url for url in discovered_urls if "=" in url][:_SQLI_TIMING_CHECK_CAP]
+    param_candidates = [url for url in sane_discovered_urls if "=" in url][:_SQLI_TIMING_CHECK_CAP]
     logger.info(
         "detective: running blind SQLi timing check against %d parameterized URL(s)",
         len(param_candidates),
