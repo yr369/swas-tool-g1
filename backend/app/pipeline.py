@@ -381,6 +381,20 @@ async def _phase_scan(
         if csp_note is not None:
             logger.info("detective: CSP recon note: %s", csp_note)
 
+        # Batch 3 per-host checks: GraphQL introspection, exposed
+        # container control APIs, exposed .git directory.
+        graphql_result = await detective.check_graphql_introspection(host)
+        if graphql_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, graphql_result)
+
+        container_api_result = await detective.check_exposed_container_api(host)
+        if container_api_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, container_api_result)
+
+        git_result = await detective.check_git_exposure(host)
+        if git_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, git_result)
+
     # Pre-filter discovered_urls once for all the URL-based checks below.
     # gau/waybackurls output is often messy - malformed concatenated URLs,
     # scope-import junk, etc. - and the SQLi timing check especially
@@ -422,6 +436,22 @@ async def _phase_scan(
     for res in source_map_results:
         if isinstance(res, Exception):
             logger.debug("source map check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: exposed Firebase database. Reuses the same
+    # js_candidates list gathered for the source map check above - both
+    # checks are "download this JS bundle and inspect it" operations, no
+    # reason to build the candidate list twice.
+    logger.info("detective: running Firebase exposure check against %d JS bundle URL(s)", len(js_candidates))
+    firebase_results = await asyncio.gather(
+        *(detective.check_firebase_exposure(url) for url in js_candidates),
+        return_exceptions=True,
+    )
+    for res in firebase_results:
+        if isinstance(res, Exception):
+            logger.debug("firebase exposure check raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding(conn, project_id, target_id, res)

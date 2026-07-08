@@ -28,6 +28,20 @@ Batch 2:
      know where to point manual/dalfox XSS testing effort - never to
      report CSP looseness by itself.
 
+Batch 3:
+  9. GraphQL introspection mapper (finds exposed GraphQL endpoints and
+     pulls their full schema - types, fields, mutations - which often
+     reveals internal/admin functionality never meant to be public)
+ 10. Exposed Firebase database (JS bundles frequently hardcode a
+     Firebase project's databaseURL; if that DB allows anonymous reads,
+     the entire dataset is public)
+ 11. Exposed Docker/Kubernetes control API (an unauthenticated Docker
+     daemon or kubelet API on its default port hands over full container
+     control)
+ 12. Exposed .git directory (if a deployed app's .git folder is publicly
+     served, HEAD/config confirm it - full source reconstruction from
+     this is a bigger follow-up task, not automated in this batch)
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -639,4 +653,226 @@ async def check_csp_weakness(url: str) -> str | None:
     weak = [d for d in directives if _WEAK_CSP_PATTERN.search(d)]
     if weak:
         return f"{url}: weak CSP directive(s): {'; '.join(weak[:3])}"
+    return None
+
+
+# ---------------------------------------------------------------------
+# 9. GraphQL introspection mapper
+# ---------------------------------------------------------------------
+_GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql", "/graphql/console"]
+_INTROSPECTION_QUERY = {
+    "query": "{__schema{queryType{name} mutationType{name} types{name kind fields{name}}}}"
+}
+
+
+async def check_graphql_introspection(host: str) -> dict | None:
+    """
+    Tries a short list of common GraphQL endpoint paths under `host`. If
+    introspection is enabled (the server just answers a __schema query
+    with no auth), pulls back the full type/field list - this routinely
+    surfaces mutation names and internal fields that were never meant to
+    be discoverable, which is genuinely useful attack-surface mapping
+    even though the introspection response itself is the finding here
+    rather than a direct exploit.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            for path in _GRAPHQL_PATHS:
+                url = base + path
+                logger.info("detective: checking GraphQL introspection for %s", url)
+                try:
+                    resp = await client.post(url, json=_INTROSPECTION_QUERY)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+
+                schema = (data.get("data") or {}).get("__schema")
+                if not schema or not schema.get("types"):
+                    continue
+
+                type_names = [t["name"] for t in schema["types"] if t.get("name")][:10]
+                mutation_type = (schema.get("mutationType") or {}).get("name")
+                return {
+                    "vuln_type": "graphql_introspection_exposed",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{url} allows unauthenticated GraphQL introspection - "
+                        f"{len(schema['types'])} types exposed, including: "
+                        f"{', '.join(type_names)}"
+                        + (f". Mutation root: {mutation_type}" if mutation_type else "")
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: GraphQL introspection check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 10. Exposed Firebase database
+# ---------------------------------------------------------------------
+_FIREBASE_URL_PATTERN = re.compile(
+    r"https?://([a-z0-9\-]+)\.firebaseio\.com", re.IGNORECASE
+)
+
+
+async def check_firebase_exposure(js_url: str) -> dict | None:
+    """
+    Downloads a JS bundle looking for a hardcoded Firebase databaseURL
+    (a routine finding - Firebase config is client-side by design). The
+    actual check is whether that database allows anonymous reads: if
+    appending /.json to the databaseURL returns real data instead of
+    `null` or a permission-denied error, the whole dataset is public.
+    """
+    if not js_url.lower().split("?")[0].endswith(".js"):
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+            resp = await client.get(js_url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: firebase check fetch failed for %s: %s", js_url, exc)
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    matches = set(_FIREBASE_URL_PATTERN.findall(resp.text))
+    if not matches:
+        return None
+
+    logger.info(
+        "detective: checking Firebase exposure for %d project(s) found in %s",
+        len(matches), js_url,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            for project in list(matches)[:2]:
+                db_url = f"https://{project}.firebaseio.com/.json"
+                try:
+                    db_resp = await client.get(db_url)
+                except httpx.HTTPError:
+                    continue
+                body = db_resp.text.strip()
+                if db_resp.status_code == 200 and body and body != "null":
+                    preview = body[:200].replace("\n", " ")
+                    return {
+                        "vuln_type": "exposed_firebase_database",
+                        "severity": "critical",
+                        "evidence": (
+                            f"Firebase project '{project}' (found in {js_url}) allows "
+                            f"anonymous reads at {db_url}. Data preview: {preview}..."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: firebase DB check failed: %s", exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 11. Exposed Docker/Kubernetes control API
+# ---------------------------------------------------------------------
+# (port, kind, path) - default ports for each service's unauthenticated
+# API. A short connect timeout matters a lot here: most hosts simply
+# don't have these ports open, and we don't want that (expected, common)
+# case to slow down the pipeline while it waits on a dead connection.
+_CONTAINER_API_TARGETS = [
+    (2375, "docker", "/version", "http"),
+    (2376, "docker", "/version", "https"),
+    (10250, "kubelet", "/pods", "https"),
+    (10255, "kubelet", "/pods", "http"),
+]
+_CONTAINER_PROBE_TIMEOUT = httpx.Timeout(4.0, connect=2.5)
+
+
+async def check_exposed_container_api(host: str) -> dict | None:
+    """
+    Probes the default Docker daemon and Kubernetes kubelet ports for
+    an unauthenticated control API. A live match here is about as
+    critical as findings get - full container/pod control with zero
+    auth - so this is intentionally conservative: it only fires on a
+    response shape that's essentially impossible to get by accident
+    (ApiVersion field for Docker, items array for kubelet).
+    """
+    hostname = _extract_hostname(host)
+    if hostname is None:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, verify=False) as client:
+            for port, kind, path, scheme in _CONTAINER_API_TARGETS:
+                url = f"{scheme}://{hostname}:{port}{path}"
+                try:
+                    resp = await client.get(url)
+                except httpx.HTTPError:
+                    continue  # port closed/filtered/refused - the overwhelmingly common case
+
+                if resp.status_code != 200:
+                    continue
+
+                if kind == "docker" and '"ApiVersion"' in resp.text:
+                    return {
+                        "vuln_type": "exposed_docker_api",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{url} responds with a live Docker daemon API version string - "
+                            f"unauthenticated Docker control endpoint exposed."
+                        ),
+                    }
+                if kind == "kubelet" and '"items"' in resp.text:
+                    return {
+                        "vuln_type": "exposed_kubelet_api",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{url} responds with a live pod listing - "
+                            f"unauthenticated kubelet API exposed."
+                        ),
+                    }
+    except Exception as exc:  # noqa: BLE001 - this check touches raw sockets on
+        # arbitrary ports across many hosts; a narrow except here would miss
+        # legitimate low-level connection failures that httpx doesn't always
+        # wrap as httpx.HTTPError (e.g. some TLS/socket edge cases)
+        logger.info("detective: container API check failed for %s: %s", hostname, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 12. Exposed .git directory
+# ---------------------------------------------------------------------
+
+async def check_git_exposure(host: str) -> dict | None:
+    """
+    Checks whether `host` publicly serves its .git/HEAD file - the
+    single most reliable, lowest-cost signal that a deployed app's full
+    .git directory (and with it, complete source history) is exposed.
+    Full source reconstruction from an exposed .git directory (walking
+    the object store, rebuilding the tree) is a meaningfully bigger task
+    than this single check - this function only confirms exposure exists
+    so you know where reconstruction effort is worth spending.
+    """
+    url = host.rstrip("/") + "/.git/HEAD"
+    logger.info("detective: checking git exposure for %s", url)
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: git exposure check failed for %s: %s", url, exc)
+        return None
+
+    body = resp.text.strip()
+    if resp.status_code == 200 and body.startswith("ref:"):
+        return {
+            "vuln_type": "exposed_git_directory",
+            "severity": "high",
+            "evidence": (
+                f"{url} is publicly accessible and returns a valid git HEAD reference "
+                f"({body[:100]}) - the full .git directory (source history, and "
+                f"potentially hardcoded secrets in old commits) is exposed."
+            ),
+        }
     return None
