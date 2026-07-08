@@ -17,7 +17,6 @@ phases is NOT in this file yet - this is the straightforward version
 that proves the foundation works.
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -25,14 +24,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, tools
-
-# Caps on how many hosts/urls each detective check runs against per
-# target, mirroring the existing live_hosts[:10] pattern elsewhere in
-# this file - these are cheap checks, but "cheap x thousands of
-# subdomains" is still not free, so Phase 1 keeps a conservative ceiling.
-_TAKEOVER_CHECK_CAP = 15
-_SENSITIVE_URL_CHECK_CAP = 15
+from . import checkpoint, fp_filter, tools
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -191,7 +183,7 @@ async def _execute_phase(
     logging, and recording that.
     """
     if phase_name == "recon":
-        await _phase_recon(conn, project_id, target_id, target, discovered_subdomains)
+        await _phase_recon(target, discovered_subdomains)
 
     elif phase_name == "probe":
         await _phase_probe(target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
@@ -209,13 +201,7 @@ async def _execute_phase(
         raise ValueError(f"Unknown phase: {phase_name}")
 
 
-async def _phase_recon(
-    conn: asyncpg.Connection,
-    project_id: int,
-    target_id: int,
-    target: str,
-    discovered_subdomains: list[str],
-) -> None:
+async def _phase_recon(target: str, discovered_subdomains: list[str]) -> None:
     """Subdomain enumeration, then check which ones are actually alive."""
     result = await tools.run_subfinder(target)
     if not result.success:
@@ -224,22 +210,6 @@ async def _phase_recon(
     found = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     discovered_subdomains.extend(found or [target])  # fall back to the target itself
     logger.info("recon: found %d subdomains for %s", len(discovered_subdomains), target)
-
-    # Detective check: subdomain takeover via CNAME fingerprinting. Cheap
-    # (one DoH lookup + one conditional HTTP fetch per host) and among
-    # the highest payout-to-effort ratios in bug bounty, so it runs here
-    # unconditionally rather than being gated behind a later phase.
-    candidates = discovered_subdomains[:_TAKEOVER_CHECK_CAP]
-    takeover_results = await asyncio.gather(
-        *(detective.check_subdomain_takeover(host) for host in candidates),
-        return_exceptions=True,
-    )
-    for res in takeover_results:
-        if isinstance(res, Exception):
-            logger.debug("takeover check raised: %s", res)
-            continue
-        if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
 
 
 async def _phase_probe(
@@ -358,35 +328,6 @@ async def _phase_scan(
             sqlmap_result = await tools.run_sqlmap(host)
             if tools.looks_like_real_output(sqlmap_result):
                 await _save_finding(conn, project_id, target_id, "sqlmap", sqlmap_result.stdout)
-
-        # Detective checks: CORS misconfiguration and web cache deception.
-        # Both are pure-Python, no-new-binary checks (see detective.py) -
-        # they run per live host alongside the existing tool-based scans.
-        cors_result = await detective.check_cors_misconfig(host)
-        if cors_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cors_result)
-
-        cache_result = await detective.check_cache_deception(host)
-        if cache_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cache_result)
-
-    # Detective check: sensitive file entropy. Runs against discovered
-    # historical URLs (gau/waybackurls output) that look like JS bundles,
-    # config files, or backups - capped, since this involves an actual
-    # file download per candidate URL rather than a header-only check.
-    sensitive_candidates = [
-        url for url in discovered_urls if detective._SENSITIVE_FILE_HINTS.search(url)
-    ][:_SENSITIVE_URL_CHECK_CAP]
-    entropy_results = await asyncio.gather(
-        *(detective.check_file_entropy(url) for url in sensitive_candidates),
-        return_exceptions=True,
-    )
-    for res in entropy_results:
-        if isinstance(res, Exception):
-            logger.debug("entropy check raised: %s", res)
-            continue
-        if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
 
 
 # A hostname like "aem-prod.example.com" or a tech-stack detection
@@ -524,35 +465,6 @@ async def _save_finding(
         tool_name,
         tool_name,  # Phase 1: vuln_type defaults to the tool name until triage exists
         cleaned_output[:5000],  # cap stored evidence length
-    )
-
-
-async def _save_detective_finding(
-    conn: asyncpg.Connection, project_id: int, target_id: int, result: dict
-) -> None:
-    """
-    Saves a finding produced by detective.py's checks (subdomain takeover,
-    CORS misconfig, cache deception, entropy). Unlike _save_finding /
-    _save_nuclei_findings, these don't go through fp_filter or get
-    stored as 'unknown' severity - each detective check already did its
-    own confirmation logic before returning a result at all, and already
-    knows its own severity/vuln_type, so there's nothing left to filter
-    or triage.
-    """
-    await conn.execute(
-        """
-        INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
-        VALUES ($1, $2, 'detective', $3, $4, $5)
-        """,
-        project_id,
-        target_id,
-        result["vuln_type"],
-        result["severity"],
-        result["evidence"][:5000],
-    )
-    logger.info(
-        "detective: saved %s finding (severity=%s) for target_id=%s",
-        result["vuln_type"], result["severity"], target_id,
     )
 
 
