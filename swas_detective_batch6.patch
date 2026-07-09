@@ -1,0 +1,348 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index c991627..b4e7811 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -74,6 +74,25 @@ Batch 5:
+      connection - a missing Origin check on an authenticated WebSocket
+      lets any website ride a victim's session)
+ 
++Batch 6:
++ 21. Blind NoSQL injection (tests login/search forms with MongoDB-style
++     operator payloads like {"$ne": ""} - no test account needed, since
++     a successful bypass IS the account access)
++ 22. JSON type confusion (mutates a discovered POST JSON body's field
++     types - array/boolean/integer-overflow substitutions - looking for
++     backend parsers that mishandle the unexpected shape; confirmation
++     is HTTP-status/response-shape based, not a login bypass claim)
++ 23. HTTP Parameter Pollution recon (duplicates a query parameter and
++     checks whether the response changes based on which value "wins" -
++     NOT saved as a standalone finding, see check_http_param_pollution's
++     own docstring for why: pollution alone proves a parsing
++     inconsistency exists, not that it bypasses anything, without a
++     privileged session to test against)
++ 24. Apache OptionsBleed (a malformed OPTIONS request can trigger a
++     race condition in vulnerable Apache configs that leaks a fragment
++     of server memory into the Allow header - a known, specific,
++     easily-confirmed CVE-class bug, not a fuzzing guess)
++
+ Every function here is read-only / non-destructive - no writes, no
+ exploitation, just detection. Each returns None when nothing is found, or
+ a dict describing the finding when something is. Callers (pipeline.py)
+@@ -1513,3 +1532,256 @@ async def check_websocket_cswsh(host: str) -> dict | None:
+                 ),
+             }
+     return None
++
++
++# ---------------------------------------------------------------------
++# 21 & 22 share candidate paths and a confirmation pattern: send a
++# baseline request with garbage credentials (expected to fail, no
++# session), then a payload request (NoSQL operator or type-confused
++# value), and only confirm a bypass if the payload response looks
++# authenticated in a way the baseline didn't - a new session cookie
++# AND a success-shaped status where the baseline had neither. Neither
++# check trusts status code alone, since plenty of apps return 200 with
++# an error body.
++# ---------------------------------------------------------------------
++_LOGIN_CANDIDATE_PATHS = ["/api/login", "/login", "/api/auth/login", "/api/session", "/signin", "/api/signin"]
++_LOGIN_FIELD_COMBOS = [("username", "password"), ("email", "password")]
++
++
++async def _check_login_bypass(
++    client: httpx.AsyncClient, url: str, user_field: str, pass_field: str, payload_body: dict
++) -> dict | None:
++    """
++    Shared confirmation logic for both the NoSQL injection and JSON
++    type confusion checks below. Returns a dict with 'baseline_status',
++    'payload_status', and 'bypassed' (bool) - the caller fills in its
++    own vuln_type/evidence wording since the two checks describe
++    different techniques even though the confirmation logic is
++    identical.
++    """
++    baseline_body = {user_field: "swas-probe-nonexistent-user", pass_field: "swas-probe-wrong-password"}
++    try:
++        baseline_resp = await client.post(url, json=baseline_body)
++    except httpx.HTTPError:
++        return None
++    if baseline_resp.status_code == 404:
++        return None  # this path doesn't exist at all on this host
++
++    try:
++        payload_resp = await client.post(url, json=payload_body)
++    except httpx.HTTPError:
++        return None
++
++    baseline_has_cookie = "set-cookie" in baseline_resp.headers
++    payload_has_cookie = "set-cookie" in payload_resp.headers
++    status_improved = (
++        payload_resp.status_code in (200, 201, 302)
++        and baseline_resp.status_code not in (200, 201, 302)
++    )
++    bypassed = payload_has_cookie and not baseline_has_cookie and status_improved
++    return {
++        "baseline_status": baseline_resp.status_code,
++        "payload_status": payload_resp.status_code,
++        "bypassed": bypassed,
++    }
++
++
++# ---------------------------------------------------------------------
++# 21. Blind NoSQL injection
++# ---------------------------------------------------------------------
++
++async def check_blind_nosql_injection(host: str) -> dict | None:
++    """
++    Tries a short list of common login-endpoint paths with a MongoDB-
++    style operator payload ({field: {"$ne": null}}) in place of real
++    credentials. No test account is needed here - a successful bypass
++    IS the account access being demonstrated. See _check_login_bypass
++    for the baseline-comparison logic that avoids false positives from
++    apps that just return 200 for everything.
++    """
++    base = host.rstrip("/")
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
++            for path in _LOGIN_CANDIDATE_PATHS:
++                url = base + path
++                for user_field, pass_field in _LOGIN_FIELD_COMBOS:
++                    logger.info("detective: checking blind NoSQL injection for %s", url)
++                    payload_body = {user_field: {"$ne": None}, pass_field: {"$ne": None}}
++                    result = await _check_login_bypass(client, url, user_field, pass_field, payload_body)
++                    if result is None:
++                        continue
++                    if result["bypassed"]:
++                        return {
++                            "vuln_type": "blind_nosql_injection",
++                            "severity": "critical",
++                            "evidence": (
++                                f"{url}: garbage credentials returned HTTP {result['baseline_status']} "
++                                f"with no session cookie, but the NoSQL operator payload "
++                                f"{{'{user_field}': {{'$ne': null}}, '{pass_field}': {{'$ne': null}}}} "
++                                f"returned HTTP {result['payload_status']} WITH a session cookie set - "
++                                f"authentication bypass via NoSQL operator injection."
++                            ),
++                        }
++    except httpx.HTTPError as exc:
++        logger.info("detective: blind NoSQL injection check failed for %s: %s", host, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 22. JSON type confusion
++# ---------------------------------------------------------------------
++_TYPE_CONFUSION_VARIANTS: list[tuple[str, object]] = [
++    ("array_pollution", ["swas-probe-1", "swas-probe-2"]),
++    ("boolean_substitution", True),
++    ("integer_overflow", 99999999999),
++]
++
++
++async def check_json_type_confusion(host: str) -> dict | None:
++    """
++    Same candidate paths and confirmation logic as the NoSQL check, but
++    the payload substitutes the credential field's TYPE instead of its
++    value - an array, a bare boolean, or an oversized integer where the
++    backend expects a string. Some JSON parsers (particularly loosely-
++    typed ORMs) silently coerce or short-circuit on an unexpected type
++    instead of rejecting it, which can skip a string-comparison auth
++    check entirely.
++    """
++    base = host.rstrip("/")
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
++            for path in _LOGIN_CANDIDATE_PATHS:
++                url = base + path
++                for user_field, pass_field in _LOGIN_FIELD_COMBOS:
++                    for variant_name, variant_value in _TYPE_CONFUSION_VARIANTS:
++                        logger.info(
++                            "detective: checking JSON type confusion (%s) for %s", variant_name, url
++                        )
++                        payload_body = {user_field: variant_value, pass_field: variant_value}
++                        result = await _check_login_bypass(client, url, user_field, pass_field, payload_body)
++                        if result is None:
++                            continue
++                        if result["bypassed"]:
++                            return {
++                                "vuln_type": "json_type_confusion",
++                                "severity": "critical",
++                                "evidence": (
++                                    f"{url}: garbage credentials returned HTTP {result['baseline_status']} "
++                                    f"with no session cookie, but substituting field types "
++                                    f"('{variant_name}': {user_field}={variant_value!r}) returned HTTP "
++                                    f"{result['payload_status']} WITH a session cookie set - the backend "
++                                    f"appears to mishandle an unexpected JSON type on the auth check."
++                                ),
++                            }
++    except httpx.HTTPError as exc:
++        logger.info("detective: JSON type confusion check failed for %s: %s", host, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 23. HTTP Parameter Pollution (recon-only - see module docstring)
++# ---------------------------------------------------------------------
++
++async def check_http_param_pollution(url: str) -> str | None:
++    """
++    Duplicates the first query parameter on `url` with a second, clearly
++    different value, and compares the response to a clean baseline
++    request. A status or meaningfully-sized body difference means the
++    frontend/backend (or two backend layers, e.g. a CDN and the origin)
++    parse duplicate parameters differently - a real signal worth
++    pointing manual testing at. Returns a plain string (or None), NOT a
++    findings dict: parameter pollution proves a parsing inconsistency
++    exists, not that anything is actually bypassable. Confirming a real
++    admin-bypass via HPP needs a privileged session to compare against,
++    which this project doesn't have test accounts for yet - filing this
++    as a standalone finding today would be reporting a parsing quirk,
++    not a vulnerability.
++    """
++    parsed = urlparse(url)
++    query_params = parse_qs(parsed.query)
++    if not query_params:
++        return None
++
++    param = next(iter(query_params))
++    polluted_query = f"{parsed.query}&{param}=swas-hpp-probe-2"
++    polluted_url = urlunparse(parsed._replace(query=polluted_query))
++
++    logger.info("detective: checking HTTP parameter pollution for %s", url)
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
++            baseline = await client.get(url)
++            polluted = await client.get(polluted_url)
++    except httpx.HTTPError:
++        return None
++
++    status_changed = baseline.status_code != polluted.status_code
++    len_baseline, len_polluted = len(baseline.text), len(polluted.text)
++    body_changed = len_baseline > 0 and abs(len_polluted - len_baseline) / len_baseline > 0.05
++
++    if status_changed or body_changed:
++        return (
++            f"{url}: duplicating param '{param}' changed server behavior "
++            f"(status {baseline.status_code}->{polluted.status_code}, body length "
++            f"{len_baseline}->{len_polluted}) - possible backend/frontend parsing "
++            f"mismatch, worth manual testing with a privileged session for admin-bypass impact"
++        )
++    return None
++
++
++# ---------------------------------------------------------------------
++# 24. Apache OptionsBleed (CVE-2017-9798)
++# ---------------------------------------------------------------------
++_OPTIONSBLEED_PROBE_COUNT = 6
++_STANDARD_HTTP_METHODS = {
++    "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
++}
++
++
++async def check_apache_optionsbleed(host: str) -> dict | None:
++    """
++    CVE-2017-9798: a specific Apache memory-disclosure bug where a
++    misconfigured 'Limit' directive across multiple .htaccess/vhost
++    configs causes a freed/uninitialized pointer to leak into the Allow
++    header of OPTIONS responses. Detected the same way the original
++    disclosure did: send several OPTIONS requests to the same path and
++    check whether the Allow header value varies AND contains tokens
++    outside the standard HTTP method vocabulary - header reordering
++    alone is normal and not a signal, so both conditions are required.
++    """
++    url = host.rstrip("/") + "/"
++    logger.info("detective: checking Apache OptionsBleed for %s", url)
++    allow_headers: set[str] = set()
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
++            for _ in range(_OPTIONSBLEED_PROBE_COUNT):
++                try:
++                    resp = await client.request("OPTIONS", url)
++                except httpx.HTTPError:
++                    return None
++                allow = resp.headers.get("allow")
++                if allow:
++                    allow_headers.add(allow)
++    except httpx.HTTPError as exc:
++        logger.info("detective: OptionsBleed check failed for %s: %s", url, exc)
++        return None
++
++    if len(allow_headers) <= 1:
++        return None  # consistent Allow header - no variance, no signal
++
++    suspicious = any(
++        {t.strip() for t in header_value.split(",")} - _STANDARD_HTTP_METHODS
++        for header_value in allow_headers
++    )
++    if not suspicious:
++        return None
++
++    return {
++        "vuln_type": "apache_optionsbleed",
++        "severity": "high",
++        "evidence": (
++            f"{url} returned {len(allow_headers)} different Allow header values across "
++            f"{_OPTIONSBLEED_PROBE_COUNT} repeated OPTIONS requests, including non-standard "
++            f"method tokens: {sorted(allow_headers)[:5]}. Consistent with CVE-2017-9798 "
++            f"(Optionsbleed) - an Apache memory disclosure bug."
++        ),
++    }
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index ec53268..0d6671f 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -37,6 +37,7 @@ _SQLI_TIMING_CHECK_CAP = 8      # each test costs a deliberate multi-second dela
+ _SOURCE_MAP_CHECK_CAP = 10
+ _OPEN_REDIRECT_CHECK_CAP = 15
+ _CRLF_CHECK_CAP = 15
++_HPP_CHECK_CAP = 15
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -429,6 +430,22 @@ async def _phase_scan(
+         if cswsh_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, cswsh_result)
+ 
++        # Batch 6 per-host checks: blind NoSQL injection, JSON type
++        # confusion, Apache OptionsBleed. HTTP Parameter Pollution
++        # (recon-only) runs separately below against discovered_urls,
++        # not per-host, since it needs a real query parameter to work with.
++        nosql_bypass_result = await detective.check_blind_nosql_injection(host)
++        if nosql_bypass_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, nosql_bypass_result)
++
++        type_confusion_result = await detective.check_json_type_confusion(host)
++        if type_confusion_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, type_confusion_result)
++
++        optionsbleed_result = await detective.check_apache_optionsbleed(host)
++        if optionsbleed_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, optionsbleed_result)
++
+     # Pre-filter discovered_urls once for all the URL-based checks below.
+     # gau/waybackurls output is often messy - malformed concatenated URLs,
+     # scope-import junk, etc. - and the SQLi timing check especially
+@@ -551,6 +568,25 @@ async def _phase_scan(
+         if res is not None:
+             await _save_detective_finding(conn, project_id, target_id, res)
+ 
++    # Detective check: HTTP Parameter Pollution. Recon-only (see
++    # check_http_param_pollution's own docstring) - logs a note when
++    # duplicate params change server behavior, never files a finding.
++    hpp_candidates = [url for url in sane_discovered_urls if "=" in url][:_HPP_CHECK_CAP]
++    logger.info(
++        "detective: running HTTP parameter pollution check against %d candidate URL(s)",
++        len(hpp_candidates),
++    )
++    hpp_results = await asyncio.gather(
++        *(detective.check_http_param_pollution(url) for url in hpp_candidates),
++        return_exceptions=True,
++    )
++    for res in hpp_results:
++        if isinstance(res, Exception):
++            logger.debug("HTTP parameter pollution check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: HPP recon note: %s", res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a

@@ -1,0 +1,367 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 2ca9802..4227e68 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -42,12 +42,25 @@ Batch 3:
+      served, HEAD/config confirm it - full source reconstruction from
+      this is a bigger follow-up task, not automated in this batch)
+ 
++Batch 4:
++ 13. Exposed Elasticsearch index (default port 9200 with no auth hands
++     over the full index catalog, and from there, the actual documents)
++ 14. Exposed Prometheus/Spring Actuator metrics (these endpoints
++     frequently dump environment variables, connection strings, and
++     internal service maps that were never meant to leave the cluster)
++ 15. Exposed NoSQL database port (MongoDB 27017, CouchDB 5984 answering
++     with no authentication at all)
++ 16. Swagger/OpenAPI doc parser (finds a live API spec, then flags any
++     path whose name suggests admin/internal functionality being
++     described - and thus discoverable - without auth)
++
+ Every function here is read-only / non-destructive - no writes, no
+ exploitation, just detection. Each returns None when nothing is found, or
+ a dict describing the finding when something is. Callers (pipeline.py)
+ decide what to do with that.
+ """
+ 
++import asyncio
+ import logging
+ import math
+ import re
+@@ -876,3 +889,307 @@ async def check_git_exposure(host: str) -> dict | None:
+             ),
+         }
+     return None
++
++
++# ---------------------------------------------------------------------
++# 13. Exposed Elasticsearch index
++# ---------------------------------------------------------------------
++
++async def check_elasticsearch_exposure(host: str) -> dict | None:
++    """
++    Elasticsearch's default config (still common in the wild) binds to
++    0.0.0.0:9200 with zero authentication. _cat/indices?format=json is
++    the single cheapest confirmation - a real Elasticsearch cluster with
++    no auth returns the full index catalog to anyone who asks.
++    """
++    hostname = _extract_hostname(host)
++    if hostname is None:
++        return None
++
++    url = f"http://{hostname}:9200/_cat/indices?format=json"
++    logger.info("detective: checking Elasticsearch exposure for %s", url)
++    try:
++        async with httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, verify=False) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: Elasticsearch check failed for %s: %s", url, exc)
++        return None
++
++    if resp.status_code != 200:
++        return None
++    try:
++        data = resp.json()
++    except ValueError:
++        return None
++
++    if isinstance(data, list) and data and all(isinstance(d, dict) and "index" in d for d in data[:1]):
++        index_names = [d.get("index") for d in data][:10]
++        return {
++            "vuln_type": "exposed_elasticsearch",
++            "severity": "critical",
++            "evidence": (
++                f"{url} returns {len(data)} index name(s) with zero authentication: "
++                f"{', '.join(str(n) for n in index_names)}"
++            ),
++        }
++    return None
++
++
++# ---------------------------------------------------------------------
++# 14. Exposed Prometheus / Spring Actuator metrics
++# ---------------------------------------------------------------------
++_ACTUATOR_PATHS = ["/actuator/env", "/actuator", "/actuator/prometheus", "/metrics"]
++
++
++async def check_actuator_exposure(host: str) -> dict | None:
++    """
++    /actuator/env on an exposed Spring Boot app dumps the entire runtime
++    configuration - property sources, env vars, sometimes connection
++    strings - which is why it's checked first and treated as the more
++    severe case. The other actuator/metrics paths are checked too but
++    scored lower, since a bare metrics dump alone is a weaker finding
++    unless it happens to contain secret-shaped values (reusing the same
++    entropy/keyword detection as check_file_entropy).
++    """
++    base = host.rstrip("/")
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
++            for path in _ACTUATOR_PATHS:
++                url = base + path
++                logger.info("detective: checking actuator/metrics exposure for %s", url)
++                try:
++                    resp = await client.get(url)
++                except httpx.HTTPError:
++                    continue
++                if resp.status_code != 200:
++                    continue
++                body = resp.text
++
++                if path == "/actuator/env" and '"propertySources"' in body:
++                    keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(body))
++                    entropy_hits = {
++                        m.group(1) for m in _TOKEN_PATTERN.finditer(body)
++                        if _shannon_entropy(m.group(2)) > 4.0
++                    }
++                    all_hits = keyword_hits | entropy_hits
++                    severity = "critical" if all_hits else "high"
++                    hits_note = (
++                        f" Includes secret-shaped values: {', '.join(sorted(all_hits)[:5])}."
++                        if all_hits else ""
++                    )
++                    return {
++                        "vuln_type": "exposed_spring_actuator_env",
++                        "severity": severity,
++                        "evidence": (
++                            f"{url} exposes the full Spring Boot runtime environment "
++                            f"(config, property sources) with no authentication.{hits_note}"
++                        ),
++                    }
++
++                if path in ("/actuator", "/actuator/prometheus", "/metrics") and (
++                    '"_links"' in body or body.startswith("# HELP") or body.startswith("# TYPE")
++                ):
++                    return {
++                        "vuln_type": "exposed_actuator_metrics",
++                        "severity": "medium",
++                        "evidence": (
++                            f"{url} exposes application metrics/actuator endpoints with no "
++                            f"authentication - review the raw output manually for anything sensitive."
++                        ),
++                    }
++    except httpx.HTTPError as exc:
++        logger.info("detective: actuator check failed for %s: %s", host, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 15. Exposed NoSQL database port (CouchDB, MongoDB)
++# ---------------------------------------------------------------------
++
++async def _check_couchdb_exposure(hostname: str) -> dict | None:
++    url = f"http://{hostname}:5984/_all_dbs"
++    logger.info("detective: checking CouchDB exposure for %s", url)
++    try:
++        async with httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, verify=False) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError:
++        return None
++    if resp.status_code != 200:
++        return None
++    try:
++        data = resp.json()
++    except ValueError:
++        return None
++    if isinstance(data, list):
++        return {
++            "vuln_type": "exposed_couchdb",
++            "severity": "critical",
++            "evidence": f"{url} returns the full database list with zero authentication: {data[:10]}",
++        }
++    return None
++
++
++def _bson_int32_command(field_name: str) -> bytes:
++    """Hand-encodes a minimal single-field BSON document like
++    {field_name: 1} - just enough BSON to speak MongoDB's wire protocol
++    for one specific command, without pulling in a BSON library."""
++    name_bytes = field_name.encode() + b"\x00"
++    body = b"\x10" + name_bytes + (1).to_bytes(4, "little")
++    doc = body + b"\x00"
++    return (len(doc) + 4).to_bytes(4, "little") + doc
++
++
++def _mongo_op_query(collection: str, bson_doc: bytes) -> bytes:
++    """Wraps a BSON command document in a MongoDB OP_QUERY wire message
++    (opCode 2004) targeting `collection` (e.g. 'admin.$cmd')."""
++    coll_bytes = collection.encode() + b"\x00"
++    body = (
++        (1).to_bytes(4, "little")       # requestID
++        + (0).to_bytes(4, "little")     # responseTo
++        + (2004).to_bytes(4, "little")  # opCode: OP_QUERY
++        + (0).to_bytes(4, "little")     # flags
++        + coll_bytes
++        + (0).to_bytes(4, "little")     # numberToSkip
++        + (1).to_bytes(4, "little", signed=True)  # numberToReturn
++        + bson_doc
++    )
++    return (len(body) + 4).to_bytes(4, "little") + body
++
++
++async def _check_mongodb_exposure(hostname: str) -> dict | None:
++    """
++    Sends a raw, hand-encoded listDatabases command over MongoDB's wire
++    protocol with no credentials. isMaster is deliberately NOT used as
++    the signal here - MongoDB always answers isMaster pre-auth by design
++    (it's part of the driver handshake), so a successful isMaster proves
++    nothing about whether auth is actually required. listDatabases does
++    require auth on a properly configured instance, so a real database
++    list coming back with no error is the actual signal.
++
++    This is a best-effort, defensively-wrapped check: any parsing
++    failure or unexpected response just returns None rather than
++    raising, since a hand-rolled wire-protocol client is inherently more
++    fragile than an HTTP-based check.
++    """
++    port = 27017
++    logger.info("detective: checking MongoDB exposure for %s:%d", hostname, port)
++    try:
++        reader, writer = await asyncio.wait_for(
++            asyncio.open_connection(hostname, port), timeout=3.0
++        )
++    except (OSError, asyncio.TimeoutError):
++        return None
++
++    try:
++        cmd_doc = _bson_int32_command("listDatabases")
++        message = _mongo_op_query("admin.$cmd", cmd_doc)
++        writer.write(message)
++        await writer.drain()
++
++        raw_len = await asyncio.wait_for(reader.readexactly(4), timeout=3.0)
++        total_len = int.from_bytes(raw_len, "little")
++        if total_len <= 4 or total_len > 65536:
++            return None
++        rest = await asyncio.wait_for(reader.readexactly(total_len - 4), timeout=3.0)
++        response = raw_len + rest
++
++        looks_unauthenticated = (
++            b"databases" in response
++            and b"not authorized" not in response
++            and b"requires authentication" not in response
++            and b"errmsg" not in response
++        )
++        if looks_unauthenticated:
++            return {
++                "vuln_type": "exposed_mongodb",
++                "severity": "critical",
++                "evidence": (
++                    f"{hostname}:{port} answers an unauthenticated listDatabases command - "
++                    f"MongoDB instance has no authentication enabled. Verify manually with "
++                    f"'mongosh --host {hostname} --eval \"db.adminCommand({{listDatabases:1}})\"' "
++                    f"before reporting, since this check uses a hand-rolled wire-protocol client."
++                ),
++            }
++    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
++        return None
++    finally:
++        writer.close()
++        try:
++            await writer.wait_closed()
++        except Exception:  # noqa: BLE001 - best-effort cleanup, never let this raise
++            pass
++    return None
++
++
++async def check_nosql_db_exposure(host: str) -> dict | None:
++    """Tries CouchDB (HTTP-based, straightforward) then MongoDB
++    (raw wire-protocol, best-effort) against `host`'s default ports."""
++    hostname = _extract_hostname(host)
++    if hostname is None:
++        return None
++
++    couch_result = await _check_couchdb_exposure(hostname)
++    if couch_result is not None:
++        return couch_result
++    return await _check_mongodb_exposure(hostname)
++
++
++# ---------------------------------------------------------------------
++# 16. Swagger / OpenAPI doc parser
++# ---------------------------------------------------------------------
++_SWAGGER_PATHS = [
++    "/swagger.json", "/openapi.json", "/v2/api-docs", "/v3/api-docs",
++    "/swagger/v1/swagger.json",
++]
++_SENSITIVE_API_PATH_HINTS = re.compile(
++    r"admin|internal|debug|manage|actuator|private|staff|superuser|backdoor",
++    re.IGNORECASE,
++)
++
++
++async def check_swagger_exposure(host: str) -> dict | None:
++    """
++    Probes common Swagger/OpenAPI spec paths. A live spec by itself is
++    routinely low-value/Informative (most programs expect API docs to
++    be somewhat public) - so this only files a finding when the spec
++    itself lists admin/internal-looking paths, meaning the documentation
++    is revealing functionality that arguably shouldn't be discoverable
++    at all, not just documenting an already-public API.
++    """
++    base = host.rstrip("/")
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
++            for path in _SWAGGER_PATHS:
++                url = base + path
++                logger.info("detective: checking Swagger/OpenAPI exposure for %s", url)
++                try:
++                    resp = await client.get(url)
++                except httpx.HTTPError:
++                    continue
++                if resp.status_code != 200:
++                    continue
++                try:
++                    spec = resp.json()
++                except ValueError:
++                    continue
++
++                paths = spec.get("paths") if isinstance(spec, dict) else None
++                if not isinstance(paths, dict) or not paths:
++                    continue
++
++                sensitive_paths = [p for p in paths if _SENSITIVE_API_PATH_HINTS.search(p)][:10]
++                if not sensitive_paths:
++                    continue  # a plain public API spec alone isn't worth filing
++
++                return {
++                    "vuln_type": "exposed_api_documentation",
++                    "severity": "medium",
++                    "evidence": (
++                        f"{url} is a publicly accessible API spec ({len(paths)} total paths) "
++                        f"including admin/internal-looking endpoints with no visible auth "
++                        f"requirement documented: {', '.join(sensitive_paths)}"
++                    ),
++                }
++    except httpx.HTTPError as exc:
++        logger.info("detective: Swagger exposure check failed for %s: %s", host, exc)
++    return None
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index a0a56be..d26d325 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -395,6 +395,24 @@ async def _phase_scan(
+         if git_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, git_result)
+ 
++        # Batch 4 per-host checks: exposed Elasticsearch, Prometheus/
++        # Spring Actuator, NoSQL DB ports, and Swagger/OpenAPI docs.
++        es_result = await detective.check_elasticsearch_exposure(host)
++        if es_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, es_result)
++
++        actuator_result = await detective.check_actuator_exposure(host)
++        if actuator_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, actuator_result)
++
++        nosql_result = await detective.check_nosql_db_exposure(host)
++        if nosql_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, nosql_result)
++
++        swagger_result = await detective.check_swagger_exposure(host)
++        if swagger_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, swagger_result)
++
+     # Pre-filter discovered_urls once for all the URL-based checks below.
+     # gau/waybackurls output is often messy - malformed concatenated URLs,
+     # scope-import junk, etc. - and the SQLi timing check especially
