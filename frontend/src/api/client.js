@@ -21,14 +21,22 @@ async function request(path, options = {}) {
       const body = await res.json();
       detail = body.detail || detail;
     } catch {
-      // response wasn't JSON - keep the generic message
+      try {
+        const text = await res.text();
+        if (text.trim()) detail = text;
+      } catch {
+        // keep fallback detail
+      }
     }
     throw new Error(detail);
   }
 
-  // Some endpoints (like /scan) return a small confirmation object;
-  // all of them return JSON, so this is safe across the board.
-  return res.json();
+  // Handle empty bodies (e.g. 204/205 responses) without throwing.
+  if (res.status === 204 || res.status === 205) return null;
+
+  const raw = await res.text();
+  if (!raw.trim()) return null;
+  return JSON.parse(raw);
 }
 
 export const api = {
