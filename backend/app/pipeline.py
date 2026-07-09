@@ -395,6 +395,24 @@ async def _phase_scan(
         if git_result is not None:
             await _save_detective_finding(conn, project_id, target_id, git_result)
 
+        # Batch 4 per-host checks: exposed Elasticsearch, Prometheus/
+        # Spring Actuator, NoSQL DB ports, and Swagger/OpenAPI docs.
+        es_result = await detective.check_elasticsearch_exposure(host)
+        if es_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, es_result)
+
+        actuator_result = await detective.check_actuator_exposure(host)
+        if actuator_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, actuator_result)
+
+        nosql_result = await detective.check_nosql_db_exposure(host)
+        if nosql_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, nosql_result)
+
+        swagger_result = await detective.check_swagger_exposure(host)
+        if swagger_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, swagger_result)
+
     # Pre-filter discovered_urls once for all the URL-based checks below.
     # gau/waybackurls output is often messy - malformed concatenated URLs,
     # scope-import junk, etc. - and the SQLi timing check especially
