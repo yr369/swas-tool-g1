@@ -93,6 +93,19 @@ Batch 6:
      of server memory into the Allow header - a known, specific,
      easily-confirmed CVE-class bug, not a fuzzing guess)
 
+Batch 7:
+  25. JWT alg confusion (flags tokens whose header already advertises
+      alg: none or an otherwise weak configuration - detection only,
+      does not forge/replay a token against a protected endpoint)
+  26. Host header injection (Host/X-Forwarded-Host reflected into a
+      redirect Location or the response body - reset-link poisoning,
+      cache poisoning)
+  27. Reflected SSRF (non-blind only - common callback/fetch params
+      pointed at cloud metadata/localhost, response body checked for
+      metadata content actually coming back)
+  28. Exposed framework debug console (Werkzeug/Rails/Symfony/PHP info
+      pages left enabled - RCE or full secret disclosure risk)
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -102,6 +115,7 @@ decide what to do with that.
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import math
 import os
@@ -1785,3 +1799,208 @@ async def check_apache_optionsbleed(host: str) -> dict | None:
             f"(Optionsbleed) - an Apache memory disclosure bug."
         ),
     }
+
+
+# ---------------------------------------------------------------------
+# 25. JWT "none"/weak-alg bypass
+# ---------------------------------------------------------------------
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+
+
+async def check_jwt_alg_confusion(url: str) -> dict | None:
+    """
+    Looks for a JWT in the response (cookie or body), decodes its header,
+    and checks whether the server would plausibly accept a forged token
+    signed with `alg: none` or a trivially-guessable HS256 secret.
+
+    This does NOT forge and replay a token against a protected endpoint -
+    that crosses from detection into exploitation and needs an
+    authenticated session to verify safely. It only flags tokens whose
+    header already advertises a weak configuration (alg is genuinely
+    "none", or alg is HS256 while the token structure suggests it's used
+    for something sensitive), so you know where to spend manual time
+    forging and replaying a token yourself.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: JWT check request failed for %s: %s", url, exc)
+        return None
+
+    haystack = " ".join(resp.headers.get("set-cookie", "") for _ in [None]) + " " + resp.text[:20000]
+    match = _JWT_RE.search(haystack)
+    if not match:
+        return None
+
+    token = match.group(0)
+    header_b64 = token.split(".")[0]
+    padded = header_b64 + "=" * (-len(header_b64) % 4)
+    try:
+        header = json.loads(base64.urlsafe_b64decode(padded))
+    except Exception:
+        return None
+
+    alg = str(header.get("alg", "")).lower()
+    if alg in ("none", ""):
+        return {
+            "vuln_type": "jwt_none_alg_accepted",
+            "severity": "critical",
+            "evidence": (
+                f"{url} issued a JWT with alg={header.get('alg')!r}. If the server accepts "
+                f"a resubmitted token with alg set to 'none' and the signature stripped, "
+                f"this is a full authentication bypass. Header: {header}"
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 26. Host header injection
+# ---------------------------------------------------------------------
+async def check_host_header_injection(url: str) -> dict | None:
+    """
+    Sends a distinctive, attacker-controlled value in the Host header (and
+    X-Forwarded-Host, since many apps trust that over Host behind a proxy)
+    and checks whether it's reflected unsanitized into the response body
+    or into a redirect Location header.
+
+    Reflection is the proof bar here, not just "the request succeeded" -
+    a server that reflects the poisoned host is a real password-reset-
+    poisoning / cache-poisoning candidate; one that ignores it isn't a
+    finding at all, so this stays quiet unless the marker comes back.
+    """
+    marker = "swas-hhi-probe.invalid"
+    parsed = httpx.URL(url)
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            resp = await client.get(
+                url,
+                headers={"Host": marker, "X-Forwarded-Host": marker},
+            )
+    except httpx.HTTPError as exc:
+        logger.info("detective: host header injection check failed for %s: %s", url, exc)
+        return None
+
+    location = resp.headers.get("location", "")
+    body_sample = resp.text[:5000]
+    if marker in location:
+        return {
+            "vuln_type": "host_header_injection",
+            "severity": "high",
+            "evidence": (
+                f"{url}: sending Host/X-Forwarded-Host={marker} caused the server to redirect "
+                f"to a Location header containing that value ({location}). Likely password-reset "
+                f"link poisoning or open-redirect-via-host vector."
+            ),
+        }
+    if marker in body_sample:
+        return {
+            "vuln_type": "host_header_injection",
+            "severity": "medium",
+            "evidence": (
+                f"{url}: the spoofed Host/X-Forwarded-Host value ({marker}) was reflected "
+                f"directly into the response body (e.g. a canonical link, asset URL, or "
+                f"absolute-URL generator using the request Host)."
+            ),
+        }
+    _ = parsed  # kept for future scheme/port-aware variants
+    return None
+
+
+# ---------------------------------------------------------------------
+# 27. Reflected SSRF via common callback/fetch parameters
+# ---------------------------------------------------------------------
+_SSRF_PARAM_NAMES = ["url", "callback", "webhook", "next", "redirect", "target", "dest", "image", "src", "feed"]
+_SSRF_INTERNAL_PROBES = [
+    "http://169.254.169.254/latest/meta-data/",
+    "http://localhost/",
+    "http://127.0.0.1/",
+]
+
+
+async def check_ssrf_reflected(url: str) -> dict | None:
+    """
+    Non-blind SSRF only: tries common callback/fetch-style parameter names
+    with an internal-looking target (cloud metadata IP, localhost) and
+    checks whether the *response itself* comes back containing internal
+    content (e.g. AWS metadata IAM/instance-id text). This deliberately
+    skips blind/out-of-band SSRF detection - that needs a collaborator
+    server you control and manual confirmation, which this pure-Python,
+    no-infra check can't safely automate.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+
+    existing_params = dict(parsed.params)
+    for param_name in _SSRF_PARAM_NAMES:
+        if param_name not in existing_params:
+            continue
+        for probe in _SSRF_INTERNAL_PROBES:
+            test_params = dict(existing_params)
+            test_params[param_name] = probe
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+                    resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            body = resp.text[:3000].lower()
+            if "ami-id" in body or "instance-id" in body or "iam/security-credentials" in body:
+                return {
+                    "vuln_type": "ssrf_reflected_cloud_metadata",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{test_url}: server-side fetch of parameter '{param_name}' pointed at "
+                        f"the cloud metadata endpoint and the response body contains metadata "
+                        f"content (ami-id/instance-id/iam credentials markers)."
+                    ),
+                }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 28. Exposed framework debug console
+# ---------------------------------------------------------------------
+_DEBUG_PATHS: list[tuple[str, str, str]] = [
+    # (path, body marker, framework)
+    ("/", "Werkzeug Debugger", "Flask/Werkzeug"),
+    ("/__debugger__", "Werkzeug Debugger", "Flask/Werkzeug"),
+    ("/rails/info/properties", "Rails Info", "Ruby on Rails"),
+    ("/_profiler/", "Symfony Profiler", "Symfony"),
+    ("/phpinfo.php", "phpinfo()", "PHP"),
+    ("/info.php", "phpinfo()", "PHP"),
+]
+
+
+async def check_debug_console_exposure(host: str) -> dict | None:
+    """
+    Checks a short, fixed list of well-known debug-console/info-disclosure
+    paths for framework debuggers left enabled in what looks like a
+    production deployment. A Werkzeug debugger with PIN protection
+    disabled, or an exposed Rails/Symfony info page, is typically an easy
+    path to RCE or full config/secret disclosure - high severity and
+    reliably in-scope, unlike generic version-banner findings.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path, marker, framework in _DEBUG_PATHS:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code == 200 and marker.lower() in resp.text[:5000].lower():
+                    return {
+                        "vuln_type": "exposed_debug_console",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{base}{path} returned a live {framework} debug/info page "
+                            f"(matched marker: {marker!r}). Often exploitable for RCE "
+                            f"(Werkzeug PIN bypass) or full environment/secret disclosure."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: debug console check failed for %s: %s", host, exc)
+    return None

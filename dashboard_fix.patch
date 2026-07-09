@@ -1,0 +1,22 @@
+--- a/frontend/src/pages/Dashboard.jsx	2026-07-09 23:26:48.006994623 +0000
++++ b/frontend/src/pages/Dashboard.jsx	2026-07-09 23:26:48.008268796 +0000
+@@ -20,6 +20,7 @@
+ 
+   useEffect(() => {
+     setFindings(null);
++    setError(null);
+     const filters = {};
+     if (severity !== "all") filters.severity = severity;
+     if (search.trim()) filters.q = search.trim();
+@@ -29,7 +30,10 @@
+     const handle = setTimeout(() => {
+       api
+         .listAllFindings(filters)
+-        .then(setFindings)
++        .then((data) => {
++          setError(null);
++          setFindings(data);
++        })
+         .catch((err) => setError(err.message));
+     }, search ? 300 : 0);
+ 

@@ -20,6 +20,7 @@ export function Dashboard() {
 
   useEffect(() => {
     setFindings(null);
+    setError(null);
     const filters = {};
     if (severity !== "all") filters.severity = severity;
     if (search.trim()) filters.q = search.trim();
@@ -29,7 +30,10 @@ export function Dashboard() {
     const handle = setTimeout(() => {
       api
         .listAllFindings(filters)
-        .then(setFindings)
+        .then((data) => {
+          setError(null);
+          setFindings(data);
+        })
         .catch((err) => setError(err.message));
     }, search ? 300 : 0);
 
