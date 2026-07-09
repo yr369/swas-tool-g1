@@ -36,6 +36,7 @@ _SENSITIVE_URL_CHECK_CAP = 15
 _SQLI_TIMING_CHECK_CAP = 8      # each test costs a deliberate multi-second delay - keep tight
 _SOURCE_MAP_CHECK_CAP = 10
 _OPEN_REDIRECT_CHECK_CAP = 15
+_CRLF_CHECK_CAP = 15
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -413,6 +414,21 @@ async def _phase_scan(
         if swagger_result is not None:
             await _save_detective_finding(conn, project_id, target_id, swagger_result)
 
+        # Batch 5 per-host checks: WAF fingerprint (recon-only, same
+        # pattern as CSP - never saved as a finding), exposed heapdump,
+        # WebSocket CSWSH.
+        waf_note = await detective.check_waf_fingerprint(host)
+        if waf_note is not None:
+            logger.info("detective: WAF recon note: %s", waf_note)
+
+        heapdump_result = await detective.check_heapdump_exposure(host)
+        if heapdump_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, heapdump_result)
+
+        cswsh_result = await detective.check_websocket_cswsh(host)
+        if cswsh_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, cswsh_result)
+
     # Pre-filter discovered_urls once for all the URL-based checks below.
     # gau/waybackurls output is often messy - malformed concatenated URLs,
     # scope-import junk, etc. - and the SQLi timing check especially
@@ -512,6 +528,25 @@ async def _phase_scan(
     for res in sqli_results:
         if isinstance(res, Exception):
             logger.debug("blind SQLi timing check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: CRLF injection / HTTP response splitting. Same
+    # candidate source as open redirect - any URL with a query string is
+    # worth trying, check_crlf_injection() itself only confirms real
+    # header injection, not just a URL that happens to contain "=".
+    crlf_candidates = [url for url in sane_discovered_urls if "=" in url][:_CRLF_CHECK_CAP]
+    logger.info(
+        "detective: running CRLF injection check against %d candidate URL(s)", len(crlf_candidates)
+    )
+    crlf_results = await asyncio.gather(
+        *(detective.check_crlf_injection(url) for url in crlf_candidates),
+        return_exceptions=True,
+    )
+    for res in crlf_results:
+        if isinstance(res, Exception):
+            logger.debug("CRLF injection check raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding(conn, project_id, target_id, res)

@@ -54,6 +54,26 @@ Batch 4:
      path whose name suggests admin/internal functionality being
      described - and thus discoverable - without auth)
 
+Batch 5:
+ 17. WAF/honeypot fingerprinting - NOT saved as a finding (like the CSP
+     check). Detects Cloudflare/Akamai/Imperva-style block-page
+     signatures so other checks in the same run can tell "the WAF
+     blocked us" apart from "the target actually responded that way" -
+     without this, a WAF block page can get misread as a real result by
+     checks further down the pipeline.
+ 18. Exposed heapdump (parses a leaked JVM/app heapdump for credential
+     and token strings using the same entropy/keyword detection as the
+     Actuator and file-entropy checks)
+ 19. CRLF / HTTP response-splitting (injects a carriage-return-newline
+     sequence into a redirect-like parameter and checks whether it lands
+     in the raw response headers - only reported when it demonstrates
+     actual header injection, e.g. a forged Set-Cookie, not just an
+     unencoded newline being reflected in a body)
+ 20. WebSocket hijacking / CSWSH (opens a WebSocket handshake with an
+     arbitrary Origin header and checks whether the server accepts the
+     connection - a missing Origin check on an authenticated WebSocket
+     lets any website ride a victim's session)
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -61,9 +81,13 @@ decide what to do with that.
 """
 
 import asyncio
+import base64
+import hashlib
 import logging
 import math
+import os
 import re
+import ssl
 import time
 from collections import Counter
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -1192,4 +1216,300 @@ async def check_swagger_exposure(host: str) -> dict | None:
                 }
     except httpx.HTTPError as exc:
         logger.info("detective: Swagger exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 17. WAF/honeypot fingerprinting (recon-only - see module docstring)
+# ---------------------------------------------------------------------
+_WAF_SIGNATURES: dict[str, list[str]] = {
+    "cloudflare": ["cf-ray", "__cfduid", "cloudflare"],
+    "akamai": ["akamai", "ak_bmsc"],
+    "imperva": ["incap_ses", "visid_incap", "x-iinfo"],
+    "sucuri": ["x-sucuri-id", "sucuri"],
+}
+
+
+async def check_waf_fingerprint(host: str) -> str | None:
+    """
+    Identifies common WAF/CDN signatures in response headers and a small
+    body sample. Returns a plain string (or None), NOT a findings dict -
+    same reasoning as check_csp_weakness: which WAF fronts a target is
+    not itself a vulnerability, it's context. Concretely, it exists so a
+    human (or a future check) can tell "this odd response is just the
+    WAF's block page" apart from "the application actually behaved this
+    way" - without it, WAF block pages risk getting misread as real
+    findings by less careful heuristics.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+            resp = await client.get(host)
+    except httpx.HTTPError:
+        return None
+
+    header_blob = " ".join(f"{k}:{v}" for k, v in resp.headers.items()).lower()
+    body_sample = resp.text[:2000].lower()
+    for waf_name, signatures in _WAF_SIGNATURES.items():
+        if any(sig in header_blob or sig in body_sample for sig in signatures):
+            return f"{host}: WAF/CDN detected - {waf_name}"
+    return None
+
+
+# ---------------------------------------------------------------------
+# 18. Exposed heapdump
+# ---------------------------------------------------------------------
+_HEAPDUMP_PATHS = ["/actuator/heapdump", "/heapdump", "/heapdump.json"]
+# Heapdumps can be multi-gigabyte files. We only need enough of the
+# start to catch secret-shaped strings without pulling the whole thing -
+# Java stores strings inline in the heap, so plaintext credentials near
+# the start are common when they exist at all. This is a real coverage
+# tradeoff (secrets further into the dump will be missed), not a
+# complete secret scan.
+_HEAPDUMP_MAX_BYTES = 500_000
+
+
+async def check_heapdump_exposure(host: str) -> dict | None:
+    """
+    Checks common heapdump paths and, if one is publicly served, samples
+    the first _HEAPDUMP_MAX_BYTES bytes and reuses the same secret
+    keyword/entropy detection as check_actuator_exposure. Only reports
+    when actual secret-shaped values are found in that sample - a bare
+    "heapdump file exists" without visible secrets in the sampled portion
+    isn't reported here (consistent with how check_source_map_leak and
+    check_swagger_exposure are calibrated elsewhere in this file).
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+            for path in _HEAPDUMP_PATHS:
+                url = base + path
+                logger.info("detective: checking heapdump exposure for %s", url)
+                chunk = b""
+                try:
+                    async with client.stream("GET", url) as resp:
+                        if resp.status_code != 200:
+                            continue
+                        async for data in resp.aiter_bytes():
+                            chunk += data
+                            if len(chunk) >= _HEAPDUMP_MAX_BYTES:
+                                break
+                except httpx.HTTPError:
+                    continue
+
+                if len(chunk) < 1000:
+                    continue  # too small to be a real heapdump - likely a 404/error page
+
+                # Heapdumps are binary, but Java stores strings as
+                # contiguous readable runs - lenient latin-1 decode lets
+                # the existing regex-based detectors work against it.
+                text_sample = chunk.decode("latin-1", errors="ignore")
+                keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(text_sample))
+                entropy_hits = {
+                    m.group(1) for m in _TOKEN_PATTERN.finditer(text_sample)
+                    if _shannon_entropy(m.group(2)) > 4.0
+                }
+                all_hits = keyword_hits | entropy_hits
+                if not all_hits:
+                    continue
+
+                return {
+                    "vuln_type": "exposed_heapdump",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{url} serves a heapdump file. Secret-shaped values found in the "
+                        f"first {len(chunk)} bytes sampled: {', '.join(sorted(all_hits)[:5])}. "
+                        f"Note: only a small prefix of the file was analyzed - the full dump "
+                        f"likely contains more."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: heapdump check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 19. CRLF / HTTP response-splitting
+# ---------------------------------------------------------------------
+_CRLF_MARKER = "swas_crlf_probe"
+_CRLF_PAYLOAD = f"test%0d%0aSet-Cookie:%20{_CRLF_MARKER}=1"
+
+
+def _inject_raw_query_param(url: str, param: str, raw_value: str) -> str:
+    """
+    Like _replace_query_param, but inserts `raw_value` into the query
+    string verbatim instead of running it through urlencode(). This
+    matters specifically for CRLF payloads: urlencode() would re-encode
+    our already-percent-encoded %0d%0a into %250d%250a, which never
+    reaches the server as an actual CR/LF once it decodes the URL - the
+    payload would just silently stop working.
+    """
+    parsed = urlparse(url)
+    parts = parsed.query.split("&") if parsed.query else []
+    new_parts, replaced = [], False
+    for part in parts:
+        key = part.split("=", 1)[0]
+        if key == param:
+            new_parts.append(f"{param}={raw_value}")
+            replaced = True
+        else:
+            new_parts.append(part)
+    if not replaced:
+        new_parts.append(f"{param}={raw_value}")
+    return urlunparse(parsed._replace(query="&".join(new_parts)))
+
+
+async def check_crlf_injection(url: str) -> dict | None:
+    """
+    Injects a CRLF sequence + a marker Set-Cookie into each of the
+    first 2 query parameters on `url`. The only thing that counts as
+    confirmation is the marker actually showing up in the RAW response
+    headers httpx parsed back out - meaning the server split our input
+    into a real second header line, not just reflected a literal
+    newline character somewhere in the response body (which has no
+    security impact and isn't CRLF injection).
+    """
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    if not query_params:
+        return None
+
+    param_names = list(query_params.keys())[:2]
+    logger.info("detective: checking CRLF injection for %s", url)
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
+            for param in param_names:
+                mutated = _inject_raw_query_param(url, param, _CRLF_PAYLOAD)
+                try:
+                    resp = await client.get(mutated)
+                except httpx.HTTPError:
+                    continue
+
+                injected = any(_CRLF_MARKER in v for v in resp.headers.values())
+                if injected:
+                    return {
+                        "vuln_type": "crlf_injection",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{url} param '{param}': injecting a CRLF sequence produced a forged "
+                            f"'{_CRLF_MARKER}' header/cookie in the raw response - confirmed HTTP "
+                            f"response splitting, not just a reflected newline in the body."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: CRLF injection check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 20. WebSocket hijacking (CSWSH)
+# ---------------------------------------------------------------------
+_WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WS_PROBE_PATHS = ["/ws", "/websocket", "/socket.io/?EIO=4&transport=websocket"]
+_CSWSH_ATTACKER_ORIGIN = "https://swas-cswsh-probe.example.com"
+
+
+def _ws_accept_key(sec_websocket_key: str) -> str:
+    """RFC 6455's Sec-WebSocket-Accept algorithm: SHA1(key + magic GUID),
+    base64-encoded. Used to confirm a 101 response is a genuine completed
+    WebSocket handshake, not some unrelated server that happens to
+    return HTTP 101 for other reasons."""
+    digest = hashlib.sha1((sec_websocket_key + _WEBSOCKET_GUID).encode()).digest()
+    return base64.b64encode(digest).decode()
+
+
+async def _try_ws_handshake(hostname: str, port: int, path: str, use_tls: bool) -> bool:
+    """
+    Hand-rolls a raw WebSocket opening handshake (it's just one HTTP
+    Upgrade request - no need for a websockets library to test only the
+    handshake, and this keeps detective.py dependency-free like the rest
+    of the module). Sends an attacker-controlled Origin header; returns
+    True only if the server completes a byte-verified handshake anyway
+    (101 status AND the correct Sec-WebSocket-Accept value for the key
+    we sent - not just any 101 response).
+    """
+    sec_key = base64.b64encode(os.urandom(16)).decode()
+    expected_accept = _ws_accept_key(sec_key)
+
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {hostname}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {sec_key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"Origin: {_CSWSH_ATTACKER_ORIGIN}\r\n"
+        f"\r\n"
+    ).encode()
+
+    ssl_context = None
+    if use_tls:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(hostname, port, ssl=ssl_context), timeout=4.0
+        )
+    except (OSError, asyncio.TimeoutError, ssl.SSLError):
+        return False
+
+    try:
+        writer.write(request)
+        await writer.drain()
+        try:
+            response = await asyncio.wait_for(reader.read(4096), timeout=4.0)
+        except asyncio.TimeoutError:
+            return False
+        response_text = response.decode(errors="ignore")
+        status_line = response_text.split("\r\n", 1)[0]
+        if " 101 " not in f" {status_line} ":
+            return False
+        return expected_accept.lower() in response_text.lower()
+    except (OSError, asyncio.TimeoutError):
+        return False
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001 - best-effort cleanup, never let this raise
+            pass
+
+
+async def check_websocket_cswsh(host: str) -> dict | None:
+    """
+    Tries a short list of common WebSocket paths under `host`. If any
+    completes a full, byte-verified handshake despite an attacker
+    Origin, that's evidence the server doesn't validate Origin on this
+    endpoint. Deliberately scored medium (not high/critical) with an
+    explicit caveat in the evidence: CSWSH only matters if the socket
+    carries authenticated/session data via cookies, which we can't
+    confirm without a real logged-in session (no test accounts
+    available yet - see the multi-token IDOR discussion). Reporting this
+    as-is against a public/anonymous WebSocket feed would likely come
+    back Informative.
+    """
+    hostname = _extract_hostname(host)
+    if hostname is None:
+        return None
+
+    use_tls = not host.lower().startswith("http://")
+    port = 443 if use_tls else 80
+
+    for path in _WS_PROBE_PATHS:
+        scheme = "wss" if use_tls else "ws"
+        logger.info("detective: checking WebSocket CSWSH for %s://%s%s", scheme, hostname, path)
+        accepted = await _try_ws_handshake(hostname, port, path, use_tls)
+        if accepted:
+            return {
+                "vuln_type": "websocket_origin_not_validated",
+                "severity": "medium",
+                "evidence": (
+                    f"{scheme}://{hostname}{path} completed a full WebSocket handshake despite "
+                    f"an attacker-controlled Origin header ({_CSWSH_ATTACKER_ORIGIN}). This only "
+                    f"has real impact if the endpoint carries session/authenticated data via "
+                    f"cookies - verify that manually before reporting, since CSWSH on a public/"
+                    f"anonymous feed is routinely triaged as Informative."
+                ),
+            }
     return None
