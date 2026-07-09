@@ -37,6 +37,7 @@ _SQLI_TIMING_CHECK_CAP = 8      # each test costs a deliberate multi-second dela
 _SOURCE_MAP_CHECK_CAP = 10
 _OPEN_REDIRECT_CHECK_CAP = 15
 _CRLF_CHECK_CAP = 15
+_HPP_CHECK_CAP = 15
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -429,6 +430,22 @@ async def _phase_scan(
         if cswsh_result is not None:
             await _save_detective_finding(conn, project_id, target_id, cswsh_result)
 
+        # Batch 6 per-host checks: blind NoSQL injection, JSON type
+        # confusion, Apache OptionsBleed. HTTP Parameter Pollution
+        # (recon-only) runs separately below against discovered_urls,
+        # not per-host, since it needs a real query parameter to work with.
+        nosql_bypass_result = await detective.check_blind_nosql_injection(host)
+        if nosql_bypass_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, nosql_bypass_result)
+
+        type_confusion_result = await detective.check_json_type_confusion(host)
+        if type_confusion_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, type_confusion_result)
+
+        optionsbleed_result = await detective.check_apache_optionsbleed(host)
+        if optionsbleed_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, optionsbleed_result)
+
     # Pre-filter discovered_urls once for all the URL-based checks below.
     # gau/waybackurls output is often messy - malformed concatenated URLs,
     # scope-import junk, etc. - and the SQLi timing check especially
@@ -550,6 +567,25 @@ async def _phase_scan(
             continue
         if res is not None:
             await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: HTTP Parameter Pollution. Recon-only (see
+    # check_http_param_pollution's own docstring) - logs a note when
+    # duplicate params change server behavior, never files a finding.
+    hpp_candidates = [url for url in sane_discovered_urls if "=" in url][:_HPP_CHECK_CAP]
+    logger.info(
+        "detective: running HTTP parameter pollution check against %d candidate URL(s)",
+        len(hpp_candidates),
+    )
+    hpp_results = await asyncio.gather(
+        *(detective.check_http_param_pollution(url) for url in hpp_candidates),
+        return_exceptions=True,
+    )
+    for res in hpp_results:
+        if isinstance(res, Exception):
+            logger.debug("HTTP parameter pollution check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: HPP recon note: %s", res)
 
 
 # A hostname like "aem-prod.example.com" or a tech-stack detection
