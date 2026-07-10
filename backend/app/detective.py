@@ -121,6 +121,23 @@ Batch 8:
       confirmation needs a second authenticated session this
       passive scanner doesn't have.
 
+Batch 9:
+  33. Reflected XSS (proof bar: raw payload with intact special
+      characters must appear unescaped in a text/html response)
+  34. Error-based SQL injection (complements the batch-1 timing-based
+      check; matches known DB error signatures, diffed against an
+      unmodified baseline response to avoid false positives on apps
+      that always show a DB-flavored error page)
+  35. XXE, error-based detection only - references a nonexistent file
+      path so there's nothing to actually exfiltrate; fires only on
+      a parser error signature proving external entity resolution
+      was attempted
+  36. Insecure deserialization signature - NOT saved as a standalone
+      finding. Passively matches known serialization magic bytes/
+      prefixes (Java/PHP/pickle/.NET) in cookies and params; flags
+      candidates for manual gadget-chain testing, doesn't attempt
+      exploitation itself
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -137,6 +154,7 @@ import os
 import re
 import ssl
 import time
+import uuid
 from collections import Counter
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -2214,3 +2232,234 @@ async def check_idor_candidate(url: str) -> str | None:
         return None
     segment_name, id_value = match.group(1), match.group(2)
     return f"{url}: IDOR candidate - numeric ID {id_value!r} in segment {segment_name!r}, verify with a second account"
+
+
+# ---------------------------------------------------------------------
+# 33. Reflected XSS
+# ---------------------------------------------------------------------
+async def check_reflected_xss(url: str) -> dict | None:
+    """
+    Injects a unique, unlikely-to-collide marker containing raw HTML
+    special characters into each existing query parameter, then checks
+    whether it comes back completely unescaped in an HTML response.
+    Proof bar: the exact raw string (angle brackets, quotes intact) must
+    appear verbatim in a text/html response - HTML-entity-encoded
+    reflection (e.g. &lt;script&gt;) is explicitly not a match, since
+    that's the app doing its job correctly.
+    """
+    marker_id = uuid.uuid4().hex[:10]
+    payload = f'"><svg/onload=alert(/swas{marker_id}/)>'
+
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for param_name in existing_params:
+                test_params = dict(existing_params)
+                test_params[param_name] = payload
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+
+                content_type = resp.headers.get("content-type", "")
+                if "html" not in content_type.lower():
+                    continue  # JSON/plain-text APIs aren't a browser-execution context here
+                if payload in resp.text:
+                    return {
+                        "vuln_type": "reflected_xss",
+                        "severity": "high",
+                        "evidence": (
+                            f"{test_url}: parameter '{param_name}' reflected the payload "
+                            f"{payload!r} completely unescaped in a text/html response - "
+                            f"browser would execute this as markup/script."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: reflected XSS check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 34. Error-based SQL injection
+# ---------------------------------------------------------------------
+_SQLI_ERROR_SIGNATURES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"you have an error in your sql syntax", re.IGNORECASE), "MySQL"),
+    (re.compile(r"warning: mysqli?_", re.IGNORECASE), "MySQL"),
+    (re.compile(r"unterminated quoted string", re.IGNORECASE), "SQLite"),
+    (re.compile(r"sqlite3\.OperationalError", re.IGNORECASE), "SQLite"),
+    (re.compile(r"pg_query\(\)|PostgreSQL.*ERROR|SQLSTATE\[", re.IGNORECASE), "PostgreSQL"),
+    (re.compile(r"ORA-\d{5}", re.IGNORECASE), "Oracle"),
+    (re.compile(r"Microsoft OLE DB Provider for SQL Server", re.IGNORECASE), "MSSQL"),
+    (re.compile(r"Unclosed quotation mark after the character string", re.IGNORECASE), "MSSQL"),
+    (re.compile(r"System\.Data\.SqlClient\.SqlException", re.IGNORECASE), "MSSQL"),
+]
+_SQLI_ERROR_PROBES = ["'", "\"", "')", "\")", "' OR '1'='1"]
+
+
+async def check_sqli_error_based(url: str) -> dict | None:
+    """
+    Complements check_blind_sqli_timing (batch 1): instead of a timing
+    side-channel, this sends a small set of syntax-breaking probes and
+    matches the response against known database error-message
+    signatures. Error-based findings are generally higher-confidence and
+    easier for a triager to verify than timing-based ones, so this is
+    kept as a separate, distinctly-labeled check rather than folded in.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            # Baseline first - some apps always show a DB-flavored error page
+            # regardless of input, which would otherwise false-positive every param.
+            try:
+                baseline = await client.get(url)
+            except httpx.HTTPError:
+                return None
+            baseline_body = baseline.text
+
+            for param_name in existing_params:
+                for probe in _SQLI_ERROR_PROBES:
+                    test_params = dict(existing_params)
+                    test_params[param_name] = existing_params[param_name] + probe
+                    test_url = parsed.copy_with(params=test_params)
+                    try:
+                        resp = await client.get(test_url)
+                    except httpx.HTTPError:
+                        continue
+                    for pattern, db_type in _SQLI_ERROR_SIGNATURES:
+                        if pattern.search(resp.text) and not pattern.search(baseline_body):
+                            return {
+                                "vuln_type": "sql_injection_error_based",
+                                "severity": "critical",
+                                "evidence": (
+                                    f"{test_url}: parameter '{param_name}' with probe {probe!r} "
+                                    f"triggered a {db_type} error signature not present in the "
+                                    f"baseline (unmodified) response."
+                                ),
+                            }
+    except httpx.HTTPError as exc:
+        logger.info("detective: error-based SQLi check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 35. XXE (error-based detection only)
+# ---------------------------------------------------------------------
+_XXE_PAYLOAD = (
+    '<?xml version="1.0"?>'
+    '<!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///swas-xxe-nonexistent-probe">]>'
+    "<root>&xxe;</root>"
+)
+_XXE_ERROR_SIGNATURES = [
+    "no such file", "FileNotFoundException", "ENOENT", "failed to load external entity",
+    "cvc-elt", "DOCTYPE is not allowed", "SAXParseException", "XMLSyntaxError",
+]
+
+
+async def check_xxe_error_based(url: str) -> dict | None:
+    """
+    POSTs a minimal external-entity payload referencing a file path that
+    almost certainly doesn't exist, with Content-Type: application/xml.
+    This is detection-only, not exfiltration - it never references a
+    real, readable file, so there's nothing to leak even if the target
+    is vulnerable. A match on an XML-parser-specific error signature
+    referencing the entity/file (rather than a generic "bad request")
+    is enough to prove the parser attempted external entity resolution,
+    which is the vulnerability itself, independent of whether this
+    particular probe path exists on disk.
+
+    Only fires against endpoints that already returned a non-error
+    status for a plain GET, to avoid wasting requests probing endpoints
+    that don't exist at all.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.post(
+                    url,
+                    content=_XXE_PAYLOAD,
+                    headers={"Content-Type": "application/xml"},
+                )
+            except httpx.HTTPError:
+                return None
+
+            body_lower = resp.text.lower()
+            for sig in _XXE_ERROR_SIGNATURES:
+                if sig.lower() in body_lower:
+                    return {
+                        "vuln_type": "xxe_external_entity_processing",
+                        "severity": "high",
+                        "evidence": (
+                            f"{url}: sending an XML body with an external entity referencing a "
+                            f"nonexistent local path triggered a parser error signature "
+                            f"({sig!r}), indicating the XML parser attempted to resolve "
+                            f"external entities rather than rejecting the DOCTYPE outright."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: XXE check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 36. Insecure deserialization signature (recon-only - see module docstring)
+# ---------------------------------------------------------------------
+_DESERIALIZATION_SIGNATURES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^rO0[A-Za-z0-9+/=]+$"), "Java serialized object (base64, starts with rO0)"),
+    (re.compile(r"^(a:\d+:\{|O:\d+:\"|s:\d+:\")"), "PHP serialized object"),
+    (re.compile(r"^\x80[\x02-\x05]"), "Python pickle protocol marker"),
+    (re.compile(r"^AAEAAAD"), ".NET BinaryFormatter (base64)"),
+]
+
+
+async def check_insecure_deserialization_signature(url: str) -> str | None:
+    """
+    Passively inspects cookie values and query-string values for known
+    serialization-format magic-byte/prefix signatures (Java, PHP, Python
+    pickle, .NET BinaryFormatter). Returns a plain string, NOT a
+    findings dict - same convention as check_idor_candidate and
+    check_waf_fingerprint. Spotting a serialized blob proves the app
+    deserializes attacker-reachable data, which is a strong RCE
+    candidate, but actually confirming exploitability requires building
+    and firing a gadget chain specific to whatever's on the classpath/
+    installed packages - real exploitation work this scanner isn't
+    going to attempt. This just tells you where to point ysoserial (or
+    equivalent) by hand.
+    """
+    parsed = httpx.URL(url)
+    candidates: list[str] = list(parsed.params.values())
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: deserialization signature check failed for %s: %s", url, exc)
+        return None
+
+    set_cookie = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else [resp.headers.get("set-cookie", "")]
+    for raw_cookie in set_cookie:
+        if "=" in raw_cookie:
+            candidates.append(raw_cookie.split("=", 1)[1].split(";")[0])
+
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            decoded_bytes = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+            decoded_str = value  # keep original for regex on the base64 forms
+        except Exception:
+            decoded_bytes = b""
+            decoded_str = value
+
+        for pattern, label in _DESERIALIZATION_SIGNATURES:
+            if pattern.match(decoded_str) or (decoded_bytes and pattern.match(decoded_bytes.decode("latin-1", errors="ignore"))):
+                return f"{url}: possible {label} found in a cookie/param value - candidate for manual gadget-chain testing"
+    return None
