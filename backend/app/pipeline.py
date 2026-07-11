@@ -48,6 +48,8 @@ _DESERIALIZATION_CHECK_CAP = 20
 _PATH_TRAVERSAL_CHECK_CAP = 15
 _CMDI_CHECK_CAP = 8            # each real hit costs a deliberate multi-second delay - keep tight
 _BUCKET_EXPOSURE_CHECK_CAP = 15
+_METHOD_OVERRIDE_CHECK_CAP = 15
+_REFERRER_LEAK_CHECK_CAP = 15
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -398,6 +400,16 @@ async def _phase_scan(
         graphql_result = await detective.check_graphql_introspection(host)
         if graphql_result is not None:
             await _save_detective_finding(conn, project_id, target_id, graphql_result)
+
+        # Batch 11: GraphQL field-suggestion schema leak. Complements
+        # the introspection check right above - some APIs disable
+        # __schema introspection but leave "did you mean X?" errors on.
+        logger.info("detective: running GraphQL field suggestion check for %s", host)
+        graphql_suggestion_result = await detective.check_graphql_field_suggestion_leak(
+            host.rstrip("/") + "/graphql"
+        )
+        if graphql_suggestion_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, graphql_suggestion_result)
 
         container_api_result = await detective.check_exposed_container_api(host)
         if container_api_result is not None:
@@ -827,6 +839,63 @@ async def _phase_scan(
     for res in bucket_results:
         if isinstance(res, Exception):
             logger.debug("cloud storage bucket exposure check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: DOM XSS sink flagging (batch 11). Recon-only -
+    # reuses js_candidates, same "download and inspect" shape as
+    # check_api_key_leak_signature and the source-map/Firebase checks.
+    logger.info(
+        "detective: running DOM XSS sink check against %d JS bundle URL(s)", len(js_candidates)
+    )
+    dom_xss_notes = await asyncio.gather(
+        *(detective.check_dom_xss_sink_flagging(url) for url in js_candidates),
+        return_exceptions=True,
+    )
+    for res in dom_xss_notes:
+        if isinstance(res, Exception):
+            logger.debug("DOM XSS sink check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: DOM XSS sink note: %s", res)
+
+    # Detective check: auth bypass via method/path override headers
+    # (batch 11). Runs against any discovered URL, not just
+    # parameterized ones - it self-filters by requiring a 401/403
+    # baseline before trying anything, so pointing it at URLs that
+    # were never protected in the first place just costs one cheap
+    # request and returns None.
+    method_override_candidates = sane_discovered_urls[:_METHOD_OVERRIDE_CHECK_CAP]
+    logger.info(
+        "detective: running auth bypass (method override) check against %d URL(s)",
+        len(method_override_candidates),
+    )
+    method_override_results = await asyncio.gather(
+        *(detective.check_auth_bypass_via_method_override(url) for url in method_override_candidates),
+        return_exceptions=True,
+    )
+    for res in method_override_results:
+        if isinstance(res, Exception):
+            logger.debug("auth bypass method override check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: sensitive data leaking via Referer (batch 11).
+    # Needs an actual query parameter to have anything to check.
+    referrer_leak_candidates = [url for url in sane_discovered_urls if "=" in url][:_REFERRER_LEAK_CHECK_CAP]
+    logger.info(
+        "detective: running Referrer-Policy leak check against %d candidate URL(s)",
+        len(referrer_leak_candidates),
+    )
+    referrer_leak_results = await asyncio.gather(
+        *(detective.check_referrer_policy_sensitive_leak(url) for url in referrer_leak_candidates),
+        return_exceptions=True,
+    )
+    for res in referrer_leak_results:
+        if isinstance(res, Exception):
+            logger.debug("Referrer-Policy leak check raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding(conn, project_id, target_id, res)
