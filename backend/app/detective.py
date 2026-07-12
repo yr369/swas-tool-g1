@@ -255,6 +255,28 @@ Batches 18-22 (built together, 4 checks each, 20 total):
   22: 95 Laravel debug mode / 96 .git/config embedded credentials /
       97 exposed AWS credentials file / 98 exposed kubeconfig
 
+Batches 23-28 (built together, 4 checks each, 24 total):
+  23: 99 exposed Nexus/Artifactory / 100 exposed RabbitMQ management /
+      101 exposed Grafana / 102 exposed MinIO console
+  24: introduces _raw_tcp_probe, the first non-HTTP technique in this
+      module (asyncio.open_connection). 103 exposed Redis no-auth /
+      104 exposed Memcached no-auth / 105 FTP anonymous login /
+      106 exposed CouchDB Fauxton UI
+  25: 107 exposed Zookeeper (raw TCP four-letter word) / 108 exposed
+      Solr admin / 109 unauthenticated Jenkins script console
+      (narrower/higher-confidence than the generic DevOps panel
+      check) / 110 CouchDB _all_dbs unauthenticated listing
+  26: framework-specific debug-mode disclosure, complementing
+      check_debug_console_exposure and check_laravel_debug_mode_exposure.
+      111 Spring Boot /env exposure / 112 Django DEBUG=True /
+      113 ASP.NET Yellow Screen of Death / 114 Express stack trace leak
+  27: CI/CD config exposure. 115 npm-debug.log / 116 .travis.yml /
+      117 CircleCI config / 118 GitHub Actions workflow file
+  28: infrastructure-as-code exposure. 119 Terraform state file
+      (plaintext secrets from provisioning) / 120 Ansible Vault file
+      (encrypted, medium not critical) / 121 Helm values.yaml /
+      122 serverless.yml
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -5702,4 +5724,943 @@ async def check_kubeconfig_exposure(host: str) -> dict | None:
                     }
     except httpx.HTTPError as exc:
         logger.info("detective: kubeconfig exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 99. Exposed Nexus/Artifactory artifact repository manager
+# ---------------------------------------------------------------------
+async def check_exposed_nexus_artifactory(host: str) -> dict | None:
+    """
+    Checks common paths for a live Nexus or Artifactory instance -
+    distinct from check_exposed_devops_tool_panel (batch 21), which
+    covers Jenkins/Jira/Confluence. An exposed artifact repo manager can
+    disclose internal package names/versions and, if anonymous deploy
+    is enabled, allow supply-chain-poisoning uploads (not tested here).
+    """
+    base = host.rstrip("/")
+    probes = [
+        ("/nexus/#browse/welcome", "Sonatype Nexus", "Nexus"),
+        ("/service/rest/v1/status", '"data"', "Nexus"),
+        ("/artifactory/api/system/ping", "OK", "Artifactory"),
+        ("/artifactory/webapp/", "JFrog Artifactory", "Artifactory"),
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path, marker, tool in probes:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code == 200 and marker in resp.text[:3000]:
+                    return {
+                        "vuln_type": "exposed_artifact_repository_manager",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{base}{path}: a live {tool} instance is reachable (matched "
+                            f"{marker!r}) - internal package names/versions disclosed, "
+                            f"potential supply-chain attack surface if anonymous deploy is "
+                            f"also enabled (not tested here)."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Nexus/Artifactory check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 100. Exposed RabbitMQ management interface
+# ---------------------------------------------------------------------
+async def check_exposed_rabbitmq_management(host: str) -> dict | None:
+    """
+    Checks the RabbitMQ management HTTP API's /api/overview endpoint,
+    which (even when it demands auth for most operations) frequently
+    responds with a distinctive JSON structure on an unauthenticated
+    probe that at minimum confirms the management interface is
+    reachable at all - real attack surface for message-queue
+    infrastructure that shouldn't be internet-facing.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/api/overview")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: RabbitMQ management check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:2000]
+    if resp.status_code == 200 and '"rabbitmq_version"' in body:
+        return {
+            "vuln_type": "exposed_rabbitmq_management",
+            "severity": "high",
+            "evidence": (
+                f"{base}/api/overview returned RabbitMQ cluster info WITHOUT authentication "
+                f"(200, contains \"rabbitmq_version\") - the management API is reachable and "
+                f"unauthenticated for at least this endpoint."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 101. Exposed Grafana instance
+# ---------------------------------------------------------------------
+async def check_exposed_grafana(host: str) -> dict | None:
+    """
+    Checks Grafana's /api/health endpoint, which by design responds
+    without authentication and includes a distinctive "database": "ok"
+    field alongside a version number - confirms a live Grafana instance
+    is reachable. Dashboards themselves may still require login, but a
+    reachable instance is real attack surface (default creds, older
+    unpatched versions with known CVEs).
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/api/health")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Grafana check failed for %s: %s", host, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if resp.status_code == 200 and isinstance(data, dict) and data.get("database") and "version" in data:
+        return {
+            "vuln_type": "exposed_grafana_instance",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/api/health confirms a live Grafana instance (version "
+                f"{data.get('version')!r}) is reachable - real attack surface (older "
+                f"versions carry known CVEs; credentials not attempted)."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 102. Exposed MinIO console
+# ---------------------------------------------------------------------
+async def check_exposed_minio_console(host: str) -> dict | None:
+    """
+    Checks for MinIO's distinctive "Server: MinIO" response header or
+    login-page marker - MinIO is an S3-compatible object storage server
+    frequently self-hosted, and an exposed instance is a direct path to
+    every bucket it manages if the console/API isn't properly locked
+    down (credentials not attempted here).
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/minio/health/live")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: MinIO check failed for %s: %s", host, exc)
+        return None
+
+    server_header = resp.headers.get("server", "")
+    if resp.status_code == 200 and "minio" in server_header.lower():
+        return {
+            "vuln_type": "exposed_minio_console",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/minio/health/live confirms a live MinIO instance is reachable "
+                f"(Server header: {server_header!r}) - direct object storage attack "
+                f"surface; credentials not attempted."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# Raw TCP helper - new technique for this module. Everything else in
+# detective.py speaks HTTP via httpx; these three checks (103-105) need
+# to speak a raw wire protocol instead, since the services in question
+# aren't HTTP at all. Kept as a single shared helper so the connect/
+# timeout/cleanup logic only needs to be gotten right once.
+# ---------------------------------------------------------------------
+async def _raw_tcp_probe(host: str, port: int, send: bytes, read_bytes: int = 512) -> bytes | None:
+    """
+    Opens a raw TCP connection to host:port, sends `send`, reads up to
+    read_bytes back, and always closes the connection. Returns None on
+    any connection/timeout failure (refused, filtered, wrong protocol)
+    rather than raising - these probes hit ports that are very often
+    closed/filtered, which is the expected common case, not an error
+    worth logging loudly.
+    """
+    hostname = httpx.URL(host).host or host
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(hostname, port), timeout=4.0
+        )
+    except Exception:
+        return None
+    try:
+        writer.write(send)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(read_bytes), timeout=4.0)
+        return data
+    except Exception:
+        return None
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------
+# 103. Exposed Redis with no authentication
+# ---------------------------------------------------------------------
+async def check_exposed_redis_no_auth(host: str) -> dict | None:
+    """
+    Sends a raw RESP-protocol PING to port 6379 and checks for the
+    exact +PONG reply, which only a real Redis server not requiring
+    auth will send back to an unauthenticated connection. Zero
+    coincidence risk - this is a specific wire-protocol response, not a
+    text substring. Unauthenticated Redis is a classic, high-impact
+    finding: MODULE LOAD or writing an SSH authorized_keys/cron entry
+    via SET+SAVE is a well-known path to full RCE (not attempted here -
+    detection only).
+    """
+    data = await _raw_tcp_probe(host, 6379, b"PING\r\n", read_bytes=64)
+    if data and data.startswith(b"+PONG"):
+        return {
+            "vuln_type": "exposed_redis_no_auth",
+            "severity": "critical",
+            "evidence": (
+                f"{httpx.URL(host).host}:6379 responded +PONG to an unauthenticated PING - "
+                f"Redis is reachable with no authentication required. Classic path to RCE "
+                f"via MODULE LOAD or writing SSH keys/cron entries (not attempted here)."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 104. Exposed Memcached with no authentication
+# ---------------------------------------------------------------------
+async def check_exposed_memcached_no_auth(host: str) -> dict | None:
+    """
+    Sends the Memcached text-protocol "version" command to port 11211
+    and checks for the exact "VERSION " reply prefix - Memcached has no
+    authentication mechanism at all in its classic protocol, so a
+    response here means the entire cache (session data, cached DB
+    query results, sometimes tokens) is readable/writable by anyone
+    who can reach the port.
+    """
+    data = await _raw_tcp_probe(host, 11211, b"version\r\n", read_bytes=64)
+    if data and data.startswith(b"VERSION "):
+        return {
+            "vuln_type": "exposed_memcached_no_auth",
+            "severity": "high",
+            "evidence": (
+                f"{httpx.URL(host).host}:11211 responded to the Memcached 'version' command "
+                f"({data[:40]!r}) - Memcached has no authentication mechanism at all in its "
+                f"classic protocol, so the entire cache contents are readable/writable by "
+                f"anyone who can reach this port."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 105. Anonymous FTP login enabled
+# ---------------------------------------------------------------------
+async def check_exposed_ftp_anonymous_login(host: str) -> dict | None:
+    """
+    Attempts the FTP anonymous-login sequence (USER anonymous / PASS
+    anonymous) against port 21 and checks for a 230 (login successful)
+    response code - a fixed, three-digit FTP protocol status code, not
+    a text substring. A successful anonymous login means the FTP
+    server's file tree (whatever it's configured to expose) is
+    directly browsable/downloadable with no credentials.
+    """
+    hostname = httpx.URL(host).host or host
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(hostname, 21), timeout=4.0
+        )
+    except Exception:
+        return None
+    try:
+        await asyncio.wait_for(reader.read(256), timeout=4.0)  # banner
+        writer.write(b"USER anonymous\r\n")
+        await writer.drain()
+        await asyncio.wait_for(reader.read(256), timeout=4.0)
+        writer.write(b"PASS anonymous@example.com\r\n")
+        await writer.drain()
+        pass_resp = await asyncio.wait_for(reader.read(256), timeout=4.0)
+    except Exception:
+        return None
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    if pass_resp.startswith(b"230"):
+        return {
+            "vuln_type": "ftp_anonymous_login_enabled",
+            "severity": "high",
+            "evidence": (
+                f"{hostname}:21 accepted anonymous login (FTP 230 response code) - the "
+                f"server's exposed file tree is browsable/downloadable with no credentials."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 106. Exposed CouchDB Fauxton admin UI
+# ---------------------------------------------------------------------
+async def check_exposed_couchdb_fauxton(host: str) -> dict | None:
+    """
+    Complements check_nosql_db_exposure (batch 1, which tests CouchDB's
+    REST API root) by checking specifically for the Fauxton web admin
+    UI being served - a different exposure surface (the UI layer, not
+    just the API), reachable at /_utils/ on a standard CouchDB install.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/_utils/")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: CouchDB Fauxton check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:3000]
+    if resp.status_code == 200 and ("Fauxton" in body or "couchdb-fauxton" in body.lower()):
+        return {
+            "vuln_type": "exposed_couchdb_fauxton_ui",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/_utils/ serves the CouchDB Fauxton admin UI - database "
+                f"administration interface reachable; credentials not attempted."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 107. Exposed Zookeeper (four-letter-word command)
+# ---------------------------------------------------------------------
+async def check_exposed_zookeeper(host: str) -> dict | None:
+    """
+    Sends Zookeeper's "ruok" (are you ok) four-letter-word command to
+    port 2181 and checks for the exact "imok" reply - a fixed protocol
+    response, not a text substring. Zookeeper coordinates distributed
+    systems (Kafka, Hadoop, etc.) and an exposed instance discloses
+    cluster topology and, on older/misconfigured setups, allows further
+    four-letter commands that can dump full config or trigger a restart.
+    """
+    data = await _raw_tcp_probe(host, 2181, b"ruok\n", read_bytes=32)
+    if data and data.strip() == b"imok":
+        return {
+            "vuln_type": "exposed_zookeeper",
+            "severity": "high",
+            "evidence": (
+                f"{httpx.URL(host).host}:2181 responded 'imok' to the Zookeeper 'ruok' "
+                f"command - Zookeeper is reachable with no authentication; cluster "
+                f"topology and further four-letter administrative commands are exposed."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 108. Exposed Apache Solr admin
+# ---------------------------------------------------------------------
+async def check_exposed_solr_admin(host: str) -> dict | None:
+    """
+    Checks Solr's /solr/admin/info/system endpoint for its distinctive
+    JSON response structure. An exposed, unauthenticated Solr admin
+    interface is historically a direct path to RCE via the
+    VelocityResponseWriter or config-API params-injection techniques on
+    vulnerable versions (not attempted here - detection only).
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/solr/admin/info/system?wt=json")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Solr admin check failed for %s: %s", host, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if resp.status_code == 200 and isinstance(data, dict) and "lucene" in data:
+        return {
+            "vuln_type": "exposed_solr_admin",
+            "severity": "high",
+            "evidence": (
+                f"{base}/solr/admin/info/system is reachable without authentication "
+                f"(valid Solr system-info JSON returned) - historically a direct path to "
+                f"RCE on vulnerable versions via VelocityResponseWriter/config-API "
+                f"injection (not attempted here)."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 109. Unauthenticated Jenkins script console
+# ---------------------------------------------------------------------
+async def check_jenkins_script_console_unauth(host: str) -> dict | None:
+    """
+    Narrower, higher-confidence variant of check_exposed_devops_tool_panel
+    (batch 21): that check only confirms a Jenkins instance exists.
+    This checks whether /script specifically renders the actual Groovy
+    script textarea/form WITHOUT redirecting to a login page - that
+    combination means the Script Console is directly reachable, which
+    is instant unauthenticated RCE (arbitrary Groovy execution). Proof
+    requires the specific script-console form marker, not just any
+    Jenkins page.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                resp = await client.get(base + "/script")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Jenkins script console check failed for %s: %s", host, exc)
+        return None
+
+    if resp.status_code != 200:
+        return None
+    body = resp.text[:5000]
+    if 'name="script"' in body and "textarea" in body.lower() and "j_acegi_security_check" not in body:
+        return {
+            "vuln_type": "jenkins_script_console_unauthenticated",
+            "severity": "critical",
+            "evidence": (
+                f"{base}/script rendered the actual Groovy script console form directly "
+                f"(200, textarea present, no redirect to login) - unauthenticated arbitrary "
+                f"code execution via the Script Console."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 110. CouchDB _all_dbs unauthenticated database listing
+# ---------------------------------------------------------------------
+async def check_couchdb_all_dbs_unauth(host: str) -> dict | None:
+    """
+    Checks CouchDB's /_all_dbs REST endpoint, which on an
+    unauthenticated/misconfigured instance returns a JSON array of
+    every database name on the server. Distinct from
+    check_exposed_couchdb_fauxton (batch 24, the UI layer) - this hits
+    the REST API directly and gets a concrete list of database names,
+    not just confirmation the admin UI is reachable.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/_all_dbs")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: CouchDB _all_dbs check failed for %s: %s", host, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if resp.status_code == 200 and isinstance(data, list) and all(isinstance(x, str) for x in data):
+        return {
+            "vuln_type": "couchdb_all_dbs_unauth_listing",
+            "severity": "high",
+            "evidence": (
+                f"{base}/_all_dbs returned a JSON array of {len(data)} database name(s) "
+                f"without authentication - full database inventory disclosed, each "
+                f"individually a candidate for further unauthenticated read/write testing."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 111. Spring Boot Actuator /env exposure
+# ---------------------------------------------------------------------
+async def check_spring_boot_env_exposure(host: str) -> dict | None:
+    """
+    Narrower, higher-severity variant of whatever check_actuator_exposure
+    (batch 1) tests generically: this specifically hits /env or
+    /actuator/env, which - when reachable - dumps every environment
+    variable and Spring property source, routinely including DB
+    passwords, API keys, and cloud credentials in plaintext.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in ("/actuator/env", "/env"):
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue
+                if isinstance(data, dict) and ("propertySources" in data or "systemEnvironment" in data):
+                    return {
+                        "vuln_type": "spring_boot_env_exposure",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{base}{path} is reachable without authentication and returns "
+                            f"full environment/property-source data - DB passwords, API "
+                            f"keys, and cloud credentials are routinely present in this dump."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Spring Boot env exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 112. Django DEBUG=True exposure
+# ---------------------------------------------------------------------
+_DJANGO_DEBUG_MARKERS = ["DisallowedHost", "You're seeing this error because you have",
+                          "Django Version:", "Exception Type:"]
+
+
+async def check_django_debug_mode_exposure(host: str) -> dict | None:
+    """
+    Requests a deliberately malformed Host header (which Django rejects
+    with DisallowedHost when ALLOWED_HOSTS is enforced) and checks for
+    Django's detailed debug error page. Complements
+    check_laravel_debug_mode_exposure and check_debug_console_exposure
+    with Django specifically - discloses full stack traces, settings
+    values, and installed-app internals when DEBUG=True in production.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                resp = await client.get(base + "/", headers={"Host": "swas-django-debug-probe.invalid"})
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Django debug mode check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:8000]
+    matches = [m for m in _DJANGO_DEBUG_MARKERS if m in body]
+    if len(matches) >= 2:
+        return {
+            "vuln_type": "django_debug_mode_exposure",
+            "severity": "critical",
+            "evidence": (
+                f"{base}: sending an invalid Host header triggered Django's detailed debug "
+                f"error page (matched {matches}) - DEBUG=True in production, full stack "
+                f"traces and settings values disclosed on every error."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 113. ASP.NET debug mode exposure (Yellow Screen of Death)
+# ---------------------------------------------------------------------
+_ASPNET_DEBUG_MARKERS = ["Server Error in", "Stack Trace:", "Version Information: Microsoft .NET Framework"]
+
+
+async def check_aspnet_debug_mode_exposure(host: str) -> dict | None:
+    """
+    Requests a deliberately nonexistent path and checks for ASP.NET's
+    classic detailed error page ("Server Error in '/' Application",
+    full stack trace, .NET Framework version) - produced when
+    <compilation debug="true"/> is left enabled in web.config for a
+    production deployment.
+    """
+    base = host.rstrip("/")
+    probe_path = "/swas-aspnet-debug-probe-" + uuid.uuid4().hex[:8] + ".aspx"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + probe_path)
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: ASP.NET debug mode check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:8000]
+    matches = [m for m in _ASPNET_DEBUG_MARKERS if m in body]
+    if len(matches) >= 2:
+        return {
+            "vuln_type": "aspnet_debug_mode_exposure",
+            "severity": "critical",
+            "evidence": (
+                f"{base}{probe_path}: returned ASP.NET's detailed debug error page "
+                f"(matched {matches}) - <compilation debug=\"true\"/> left enabled in "
+                f"production, full stack traces and framework internals disclosed."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 114. Node.js/Express default error handler stack trace leak
+# ---------------------------------------------------------------------
+async def check_express_stack_trace_leak(host: str) -> dict | None:
+    """
+    Requests a deliberately nonexistent path and checks for Express's
+    default error handler output, which in non-production NODE_ENV
+    includes the full stack trace with node_modules file paths.
+    Complements check_graphql_error_stack_trace_leak with a general
+    (non-GraphQL) Express check.
+    """
+    base = host.rstrip("/")
+    probe_path = "/swas-express-debug-probe-" + uuid.uuid4().hex[:8]
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + probe_path)
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Express stack trace check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:8000]
+    if "node_modules" in body and re.search(r"at \S+ \(.*:\d+:\d+\)", body):
+        return {
+            "vuln_type": "express_stack_trace_leak",
+            "severity": "medium",
+            "evidence": (
+                f"{base}{probe_path}: returned a Node.js/Express stack trace with "
+                f"node_modules file paths and line numbers - NODE_ENV is not set to "
+                f"production, or a custom error handler is echoing stack details."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 115. Exposed npm-debug.log / yarn-error.log
+# ---------------------------------------------------------------------
+async def check_npm_debug_log_exposure(host: str) -> dict | None:
+    """
+    Checks for a deployment leftover npm-debug.log or yarn-error.log at
+    the web root - a common CI/build artifact accidentally shipped.
+    Discloses internal package registry URLs and, on misconfigured
+    private-registry setups, sometimes auth tokens embedded in a
+    failed-install error trace.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in ("/npm-debug.log", "/yarn-error.log"):
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.text[:3000]
+                if re.search(r"^\d+ (info|verbose|error) ", body, re.MULTILINE) or "yarn install" in body.lower():
+                    return {
+                        "vuln_type": "exposed_npm_debug_log",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and is a real npm/yarn "
+                            f"install log - discloses internal package registry URLs and "
+                            f"potentially auth tokens from a failed private-registry install."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: npm-debug.log check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 116. Exposed .travis.yml
+# ---------------------------------------------------------------------
+async def check_travis_yml_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible .travis.yml. Travis CI configs
+    occasionally contain plaintext deploy keys or misconfigured
+    `env: global:` secrets that were meant to stay encrypted -
+    disclosing CI/CD pipeline structure at minimum, credentials at worst.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/.travis.yml")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: .travis.yml check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:3000]
+    if resp.status_code == 200 and "language:" in body and ("before_install" in body or "script:" in body):
+        severity = "high" if re.search(r"(?:password|secret|key)\s*:\s*[\"']?[A-Za-z0-9+/]{16,}", body, re.IGNORECASE) else "medium"
+        return {
+            "vuln_type": "exposed_travis_yml",
+            "severity": severity,
+            "evidence": (
+                f"{base}/.travis.yml is publicly accessible - CI/CD pipeline structure "
+                f"disclosed" + (", and appears to contain an unencrypted credential-shaped value" if severity == "high" else "") + "."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 117. Exposed CircleCI config
+# ---------------------------------------------------------------------
+async def check_circleci_config_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible .circleci/config.yml. Same
+    reasoning as check_travis_yml_exposure - CircleCI configs disclose
+    build/deploy pipeline structure and occasionally embed values meant
+    to come only from CircleCI's encrypted contexts.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/.circleci/config.yml")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: CircleCI config check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:3000]
+    if resp.status_code == 200 and "version:" in body and "jobs:" in body:
+        return {
+            "vuln_type": "exposed_circleci_config",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/.circleci/config.yml is publicly accessible - CI/CD build and "
+                f"deploy pipeline structure disclosed."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 118. Exposed GitHub Actions workflow file
+# ---------------------------------------------------------------------
+_GITHUB_WORKFLOW_COMMON_NAMES = ["ci.yml", "deploy.yml", "main.yml", "build.yml", "release.yml"]
+
+
+async def check_github_workflow_exposure(host: str) -> dict | None:
+    """
+    Tries a handful of common GitHub Actions workflow filenames under
+    .github/workflows/. GitHub Actions references secrets by name
+    rather than embedding values, so this is usually structure/
+    architecture disclosure rather than a direct credential leak - but
+    it maps out exactly what the deploy pipeline does and which
+    external services it talks to.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for filename in _GITHUB_WORKFLOW_COMMON_NAMES:
+                try:
+                    resp = await client.get(f"{base}/.github/workflows/{filename}")
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.text[:3000]
+                if "on:" in body and "jobs:" in body:
+                    return {
+                        "vuln_type": "exposed_github_workflow_file",
+                        "severity": "low",
+                        "evidence": (
+                            f"{base}/.github/workflows/{filename} is publicly accessible - "
+                            f"CI/CD pipeline structure and external service integrations "
+                            f"disclosed (secrets are referenced by name, not embedded, so "
+                            f"this is architecture disclosure rather than a direct leak)."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: GitHub workflow exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 119. Exposed Terraform state file
+# ---------------------------------------------------------------------
+async def check_terraform_state_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible terraform.tfstate. State files
+    routinely contain plaintext secrets generated or referenced during
+    provisioning - DB passwords, private keys, API tokens - even when
+    the Terraform config itself never hardcodes them, because the state
+    file records actual resource attribute values after apply. Proof
+    requires valid JSON with both terraform_version and resources keys,
+    the two fields unique to a real state file.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in ("/terraform.tfstate", "/.terraform/terraform.tfstate"):
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue
+                if isinstance(data, dict) and "terraform_version" in data and "resources" in data:
+                    return {
+                        "vuln_type": "exposed_terraform_state",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and is a real Terraform "
+                            f"state file (terraform_version + resources present) - state "
+                            f"files routinely contain plaintext secrets recorded during "
+                            f"provisioning, even when the source config never hardcodes them."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Terraform state check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 120. Exposed Ansible Vault file
+# ---------------------------------------------------------------------
+async def check_ansible_vault_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible Ansible Vault-encrypted file at
+    common paths. Proof is the exact, fixed "$ANSIBLE_VAULT;1.1;AES256"
+    header line - contents remain encrypted (so severity is medium, not
+    critical, unlike the plaintext Terraform state case), but exposure
+    plus a weak/reused vault password would still fully compromise it,
+    and it confirms exactly what secrets exist and where.
+    """
+    base = host.rstrip("/")
+    paths = ["/vault.yml", "/secrets.yml", "/group_vars/all/vault.yml", "/vault.yaml"]
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in paths:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                if resp.text.startswith("$ANSIBLE_VAULT;1.1;AES256"):
+                    return {
+                        "vuln_type": "exposed_ansible_vault_file",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and is a real Ansible "
+                            f"Vault-encrypted file - contents remain encrypted, but exposure "
+                            f"confirms exactly what secrets exist and where, and a weak/"
+                            f"reused vault password would fully compromise it."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Ansible Vault check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 121. Exposed Helm values.yaml
+# ---------------------------------------------------------------------
+async def check_helm_values_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible Helm values.yaml at common paths -
+    Kubernetes deployment configuration that sometimes includes inline
+    secrets (DB connection strings, API keys) when a chart wasn't
+    properly set up to pull them from a Secret resource instead.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in ("/values.yaml", "/helm/values.yaml", "/chart/values.yaml"):
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.text[:3000]
+                if "image:" in body and ("replicaCount:" in body or "service:" in body):
+                    return {
+                        "vuln_type": "exposed_helm_values_yaml",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and is a real Helm "
+                            f"values.yaml - Kubernetes deployment configuration disclosed, "
+                            f"sometimes including inline secrets not properly sourced from a "
+                            f"Secret resource."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Helm values.yaml check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 122. Exposed serverless.yml
+# ---------------------------------------------------------------------
+async def check_serverless_yml_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible serverless.yml (Serverless
+    Framework config for AWS Lambda deployments) - discloses IAM role
+    ARNs, resource naming conventions, and occasionally inline
+    environment secrets not properly pulled from AWS Secrets Manager/
+    SSM Parameter Store.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/serverless.yml")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: serverless.yml check failed for %s: %s", host, exc)
+        return None
+
+    body = resp.text[:3000]
+    if resp.status_code == 200 and "provider:" in body and "functions:" in body:
+        return {
+            "vuln_type": "exposed_serverless_yml",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/serverless.yml is publicly accessible - Lambda deployment "
+                f"configuration disclosed, including IAM role references and resource "
+                f"naming conventions, occasionally inline environment secrets."
+            ),
+        }
     return None

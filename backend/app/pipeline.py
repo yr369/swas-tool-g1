@@ -657,6 +657,128 @@ async def _phase_scan(
         if kubeconfig_result is not None:
             await _save_detective_finding(conn, project_id, target_id, kubeconfig_result)
 
+        # ---- Batches 23-28 host-level checks (24 total) ----
+
+        logger.info("detective: running Nexus/Artifactory exposure check for %s", host)
+        nexus_result = await detective.check_exposed_nexus_artifactory(host)
+        if nexus_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, nexus_result)
+
+        logger.info("detective: running RabbitMQ management exposure check for %s", host)
+        rabbitmq_result = await detective.check_exposed_rabbitmq_management(host)
+        if rabbitmq_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, rabbitmq_result)
+
+        logger.info("detective: running Grafana exposure check for %s", host)
+        grafana_result = await detective.check_exposed_grafana(host)
+        if grafana_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, grafana_result)
+
+        logger.info("detective: running MinIO console exposure check for %s", host)
+        minio_result = await detective.check_exposed_minio_console(host)
+        if minio_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, minio_result)
+
+        logger.info("detective: running Redis no-auth exposure check for %s", host)
+        redis_result = await detective.check_exposed_redis_no_auth(host)
+        if redis_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, redis_result)
+
+        logger.info("detective: running Memcached no-auth exposure check for %s", host)
+        memcached_result = await detective.check_exposed_memcached_no_auth(host)
+        if memcached_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, memcached_result)
+
+        logger.info("detective: running FTP anonymous login check for %s", host)
+        ftp_anon_result = await detective.check_exposed_ftp_anonymous_login(host)
+        if ftp_anon_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, ftp_anon_result)
+
+        logger.info("detective: running CouchDB Fauxton exposure check for %s", host)
+        couchdb_fauxton_result = await detective.check_exposed_couchdb_fauxton(host)
+        if couchdb_fauxton_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, couchdb_fauxton_result)
+
+        logger.info("detective: running Zookeeper exposure check for %s", host)
+        zookeeper_result = await detective.check_exposed_zookeeper(host)
+        if zookeeper_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, zookeeper_result)
+
+        logger.info("detective: running Solr admin exposure check for %s", host)
+        solr_result = await detective.check_exposed_solr_admin(host)
+        if solr_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, solr_result)
+
+        logger.info("detective: running Jenkins script console check for %s", host)
+        jenkins_script_result = await detective.check_jenkins_script_console_unauth(host)
+        if jenkins_script_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, jenkins_script_result)
+
+        logger.info("detective: running CouchDB _all_dbs listing check for %s", host)
+        couchdb_alldbs_result = await detective.check_couchdb_all_dbs_unauth(host)
+        if couchdb_alldbs_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, couchdb_alldbs_result)
+
+        logger.info("detective: running Spring Boot env exposure check for %s", host)
+        spring_env_result = await detective.check_spring_boot_env_exposure(host)
+        if spring_env_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, spring_env_result)
+
+        logger.info("detective: running Django debug mode check for %s", host)
+        django_debug_result = await detective.check_django_debug_mode_exposure(host)
+        if django_debug_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, django_debug_result)
+
+        logger.info("detective: running ASP.NET debug mode check for %s", host)
+        aspnet_debug_result = await detective.check_aspnet_debug_mode_exposure(host)
+        if aspnet_debug_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, aspnet_debug_result)
+
+        logger.info("detective: running Express stack trace leak check for %s", host)
+        express_stack_result = await detective.check_express_stack_trace_leak(host)
+        if express_stack_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, express_stack_result)
+
+        logger.info("detective: running npm-debug.log exposure check for %s", host)
+        npm_debug_result = await detective.check_npm_debug_log_exposure(host)
+        if npm_debug_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, npm_debug_result)
+
+        logger.info("detective: running .travis.yml exposure check for %s", host)
+        travis_yml_result = await detective.check_travis_yml_exposure(host)
+        if travis_yml_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, travis_yml_result)
+
+        logger.info("detective: running CircleCI config exposure check for %s", host)
+        circleci_result = await detective.check_circleci_config_exposure(host)
+        if circleci_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, circleci_result)
+
+        logger.info("detective: running GitHub workflow exposure check for %s", host)
+        github_workflow_result = await detective.check_github_workflow_exposure(host)
+        if github_workflow_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, github_workflow_result)
+
+        logger.info("detective: running Terraform state exposure check for %s", host)
+        terraform_state_result = await detective.check_terraform_state_exposure(host)
+        if terraform_state_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, terraform_state_result)
+
+        logger.info("detective: running Ansible Vault exposure check for %s", host)
+        ansible_vault_result = await detective.check_ansible_vault_exposure(host)
+        if ansible_vault_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, ansible_vault_result)
+
+        logger.info("detective: running Helm values.yaml exposure check for %s", host)
+        helm_values_result = await detective.check_helm_values_exposure(host)
+        if helm_values_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, helm_values_result)
+
+        logger.info("detective: running serverless.yml exposure check for %s", host)
+        serverless_yml_result = await detective.check_serverless_yml_exposure(host)
+        if serverless_yml_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, serverless_yml_result)
+
         # Batch 8 per-host check: prototype pollution via a JSON
         # __proto__ gadget POSTed to the host root. (The other three
         # batch 8 checks - SSTI, API key signature, IDOR candidate
