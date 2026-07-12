@@ -1,0 +1,258 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 0000000..0000000 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -153,6 +153,21 @@
+       only fires on a recognized secret-shaped KEY=VALUE line, not
+       just a 200 response on /.env
+ 
++Batch 11:
++  41. DOM XSS sink flagging - NOT saved as a standalone finding.
++      Static match of source+sink keyword presence in a JS bundle,
++      doesn't trace actual taint flow between them.
++  42. Auth bypass via method/path override headers (X-HTTP-Method-
++      Override, X-Original-URL, etc.) - deterministic status-code
++      transition (401/403 -> 200 with real content), no coincidental-
++      string risk at all.
++  43. Sensitive query-string data leaking via Referer - structural
++      check (sensitive param name + missing Referrer-Policy + a
++      third-party resource present), not a live-traffic confirmation.
++  44. GraphQL schema leak via field-suggestion errors - complements
++      check_graphql_introspection for APIs that disable introspection
++      but leave "did you mean X?" suggestions on.
++
+ Every function here is read-only / non-destructive - no writes, no
+ exploitation, just detection. Each returns None when nothing is found, or
+ a dict describing the finding when something is. Callers (pipeline.py)
+@@ -2735,3 +2750,231 @@
+     except httpx.HTTPError as exc:
+         logger.info("detective: .env exposure check failed for %s: %s", host, exc)
+     return None
++
++
++# ---------------------------------------------------------------------
++# 41. DOM XSS sink flagging (recon-only - see module docstring)
++# ---------------------------------------------------------------------
++_DOM_XSS_SOURCES = ["location.hash", "location.search", "location.href", "document.URL",
++                     "document.referrer", "window.name"]
++_DOM_XSS_SINKS = ["innerHTML", "outerHTML", "document.write(", "document.writeln(",
++                   "eval(", "insertAdjacentHTML("]
++
++
++async def check_dom_xss_sink_flagging(url: str) -> str | None:
++    """
++    Downloads a JS bundle and flags it if it contains BOTH a known
++    attacker-controllable source (location.hash, document.referrer, etc.)
++    and a known dangerous sink (innerHTML, eval, document.write) within
++    the same file. Returns a plain string, NOT a findings dict - same
++    convention as check_idor_candidate and check_waf_fingerprint.
++    Confirming actual DOM XSS requires tracing real taint flow from the
++    specific source to the specific sink (the source's value has to
++    actually reach the sink unsanitized), which static keyword presence
++    can't prove - a file can easily use both independently with no
++    connection between them. This flags candidates worth a manual
++    browser-based check (or a proper taint-analysis tool), not a
++    verdict.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: DOM XSS sink check failed for %s: %s", url, exc)
++        return None
++
++    body = resp.text
++    found_sources = [s for s in _DOM_XSS_SOURCES if s in body]
++    found_sinks = [s for s in _DOM_XSS_SINKS if s in body]
++    if found_sources and found_sinks:
++        return (
++            f"{url}: contains both attacker-controllable source(s) "
++            f"({', '.join(found_sources[:3])}) and dangerous sink(s) "
++            f"({', '.join(found_sinks[:3])}) - candidate for manual DOM XSS "
++            f"taint-flow verification (static match only, source->sink "
++            f"connection not confirmed)"
++        )
++    return None
++
++
++# ---------------------------------------------------------------------
++# 42. Authorization bypass via HTTP method/path override headers
++# ---------------------------------------------------------------------
++_METHOD_OVERRIDE_HEADER_SETS = [
++    {"X-HTTP-Method-Override": "GET"},
++    {"X-HTTP-Method": "GET"},
++    {"X-Method-Override": "GET"},
++    {"X-Original-URL": "/"},
++    {"X-Rewrite-URL": "/"},
++]
++# Generic "you need to log in" pages are the main false-positive risk for
++# this check - a login page can easily be under 200 chars of real content
++# once markup is stripped, so anything this short is treated as
++# still-blocked rather than a genuine bypass.
++_MIN_BYPASS_BODY_LENGTH = 200
++
++
++async def check_auth_bypass_via_method_override(url: str) -> dict | None:
++    """
++    Some reverse proxies / app frameworks honor X-HTTP-Method-Override,
++    X-Original-URL, or X-Rewrite-URL headers meant for legitimate REST
++    tunneling, but apply access-control checks BEFORE processing them -
++    so a request that's correctly blocked on the real method/path can
++    slip through when the override header points somewhere the
++    authorization layer never inspected.
++
++    Proof bar is a clean status-code transition, not a substring match:
++    the plain request must come back 401/403 (confirmed blocked), and an
++    override-header request to the exact same URL must come back 200
++    with a non-trivial body (not just a same-length login/error page).
++    This is deterministic - no coincidental-string risk at all, unlike
++    several batch 7-9 checks that needed a later audit fix.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
++            try:
++                baseline_resp = await client.get(url)
++            except httpx.HTTPError:
++                return None
++            if baseline_resp.status_code not in (401, 403):
++                return None  # not blocked to begin with - nothing to bypass
++
++            for headers in _METHOD_OVERRIDE_HEADER_SETS:
++                try:
++                    resp = await client.get(url, headers=headers)
++                except httpx.HTTPError:
++                    continue
++                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
++                    return {
++                        "vuln_type": "auth_bypass_method_override",
++                        "severity": "critical",
++                        "evidence": (
++                            f"{url}: plain request returned {baseline_resp.status_code} "
++                            f"(blocked), but adding header(s) {headers} returned 200 with a "
++                            f"{len(resp.text)}-byte body - authorization check is being "
++                            f"bypassed by an override header the access-control layer doesn't "
++                            f"account for."
++                        ),
++                    }
++    except httpx.HTTPError as exc:
++        logger.info("detective: method override auth bypass check failed for %s: %s", url, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 43. Sensitive query-string data leaking via Referer (missing Referrer-Policy)
++# ---------------------------------------------------------------------
++_SENSITIVE_PARAM_NAME_RE = re.compile(
++    r"^(token|session|sessionid|auth|api[_-]?key|apikey|access[_-]?token|"
++    r"reset[_-]?token|password|secret|otp|code)$",
++    re.IGNORECASE,
++)
++_EXTERNAL_RESOURCE_RE = re.compile(
++    r'(?:src|href)=["\']https?://([^/"\']+)', re.IGNORECASE
++)
++
++
++async def check_referrer_policy_sensitive_leak(url: str) -> dict | None:
++    """
++    If a URL's own query string contains a sensitive-looking parameter
++    (token, session id, reset code, etc.) AND the page both lacks a
++    restrictive Referrer-Policy header/meta tag AND loads at least one
++    resource from a third-party origin, the full URL - including that
++    sensitive value - gets sent in the Referer header to that third
++    party by default browser behavior. This is a structural check (are
++    the ingredients for the leak present), not a live confirmation that
++    a specific third party received it, so it's a real but analyst-
++    verifiable finding rather than something claiming certainty beyond
++    what was actually observed.
++    """
++    parsed = httpx.URL(url)
++    query_params = dict(parsed.params)
++    sensitive_params = [p for p in query_params if _SENSITIVE_PARAM_NAME_RE.match(p)]
++    if not sensitive_params:
++        return None
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: referrer policy check failed for %s: %s", url, exc)
++        return None
++
++    policy_header = resp.headers.get("referrer-policy", "").strip().lower()
++    restrictive_policies = {"no-referrer", "same-origin", "strict-origin", "strict-origin-when-cross-origin"}
++    if policy_header in restrictive_policies:
++        return None
++
++    body = resp.text
++    if "referrer-policy" in body.lower() and re.search(
++        r'<meta[^>]+name=["\']referrer["\'][^>]+content=["\'](?:no-referrer|same-origin|strict-origin)',
++        body, re.IGNORECASE,
++    ):
++        return None  # restrictive policy set via meta tag instead of header
++
++    own_host = parsed.host
++    external_hosts = {
++        h for h in _EXTERNAL_RESOURCE_RE.findall(body)
++        if h.split(":")[0] != own_host
++    }
++    if not external_hosts:
++        return None
++
++    return {
++        "vuln_type": "sensitive_data_referrer_leak",
++        "severity": "medium",
++        "evidence": (
++            f"{url}: query string contains sensitive-looking parameter(s) "
++            f"{sensitive_params}, no restrictive Referrer-Policy is set "
++            f"(header value: {policy_header!r}), and the page loads resources from "
++            f"{len(external_hosts)} third-party origin(s) (e.g. {next(iter(external_hosts))}) "
++            f"- the full URL including the sensitive value would be sent to those origins "
++            f"via the Referer header under default browser behavior."
++        ),
++    }
++
++
++# ---------------------------------------------------------------------
++# 44. GraphQL schema leak via field-suggestion errors (introspection disabled)
++# ---------------------------------------------------------------------
++_GRAPHQL_SUGGESTION_QUERY = '{"query": "{ swasNonexistentFieldProbe }"}'
++_GRAPHQL_SUGGESTION_RE = re.compile(r'Did you mean ["\']?(\w+)["\']?', re.IGNORECASE)
++
++
++async def check_graphql_field_suggestion_leak(url: str) -> dict | None:
++    """
++    Complements check_graphql_introspection (batch 1): some APIs
++    correctly disable introspection but leave "did you mean X?"
++    suggestion errors turned on, which leaks real field/type names one
++    query at a time even without a working __schema query. Sends one
++    deliberately-invalid field name and checks for that specific
++    suggestion-error format - a fixed, distinctive GraphQL error phrase,
++    not a generic string, so this doesn't need baseline diffing the way
++    the batch 7/9 substring-based checks did.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                resp = await client.post(
++                    url,
++                    content=_GRAPHQL_SUGGESTION_QUERY,
++                    headers={"Content-Type": "application/json"},
++                )
++            except httpx.HTTPError:
++                return None
++    except httpx.HTTPError as exc:
++        logger.info("detective: GraphQL field suggestion check failed for %s: %s", url, exc)
++        return None
++
++    match = _GRAPHQL_SUGGESTION_RE.search(resp.text)
++    if match:
++        return {
++            "vuln_type": "graphql_field_suggestion_schema_leak",
++            "severity": "low",
++            "evidence": (
++                f"{url}: querying a deliberately nonexistent field returned a "
++                f"\"Did you mean {match.group(1)!r}\" suggestion error, revealing a real "
++                f"schema field name even though introspection itself may be disabled."
++            ),
++        }
++    return None

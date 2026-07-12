@@ -1,0 +1,25 @@
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 0000000..0000000 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -402,10 +402,12 @@
+ 
+         # Batch 14: two narrower, deterministic CORS variants grouped
+         # with the generic misconfig check above.
++        logger.info("detective: running CORS null-origin bypass check for %s", host)
+         cors_null_origin_result = await detective.check_cors_null_origin_bypass(host)
+         if cors_null_origin_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, cors_null_origin_result)
+ 
++        logger.info("detective: running CORS wildcard+credentials check for %s", host)
+         cors_wildcard_creds_result = await detective.check_cors_wildcard_with_credentials(host)
+         if cors_wildcard_creds_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, cors_wildcard_creds_result)
+@@ -521,6 +523,7 @@
+ 
+         # Batch 14: JWT 'kid' header injection candidate. Recon-only -
+         # grouped with the other JWT checks above.
++        logger.info("detective: running JWT kid injection check for %s", host)
+         jwt_kid_note = await detective.check_jwt_kid_header_injection_candidate(host)
+         if jwt_kid_note is not None:
+             logger.info("detective: JWT kid injection note: %s", jwt_kid_note)

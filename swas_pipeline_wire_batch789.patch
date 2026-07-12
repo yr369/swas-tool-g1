@@ -1,0 +1,201 @@
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 0000000..0000000 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -38,6 +38,13 @@
+ _OPEN_REDIRECT_CHECK_CAP = 15
+ _CRLF_CHECK_CAP = 15
+ _HPP_CHECK_CAP = 15
++_SSRF_CHECK_CAP = 15
++_SSTI_CHECK_CAP = 10           # multiple payloads tried per param - keep tighter
++_IDOR_CANDIDATE_CHECK_CAP = 40 # pure regex match, no network request - cheap
++_XSS_CHECK_CAP = 15
++_SQLI_ERROR_CHECK_CAP = 10     # extra baseline request per URL on top of per-param probes
++_XXE_CHECK_CAP = 10
++_DESERIALIZATION_CHECK_CAP = 20
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -446,6 +453,29 @@
+         if optionsbleed_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, optionsbleed_result)
+ 
++        # Batch 7 per-host checks: JWT alg confusion, host header
++        # injection, exposed framework debug console.
++        jwt_result = await detective.check_jwt_alg_confusion(host)
++        if jwt_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, jwt_result)
++
++        hhi_result = await detective.check_host_header_injection(host)
++        if hhi_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, hhi_result)
++
++        debug_console_result = await detective.check_debug_console_exposure(host)
++        if debug_console_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, debug_console_result)
++
++        # Batch 8 per-host check: prototype pollution via a JSON
++        # __proto__ gadget POSTed to the host root. (The other three
++        # batch 8 checks - SSTI, API key signature, IDOR candidate
++        # flagging - need an actual query-string URL to work with, so
++        # they run in the URL-candidate section below instead.)
++        proto_pollution_result = await detective.check_prototype_pollution(host)
++        if proto_pollution_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, proto_pollution_result)
++
+     # Pre-filter discovered_urls once for all the URL-based checks below.
+     # gau/waybackurls output is often messy - malformed concatenated URLs,
+     # scope-import junk, etc. - and the SQLi timing check especially
+@@ -587,6 +617,152 @@
+         if res is not None:
+             logger.info("detective: HPP recon note: %s", res)
+ 
++    # Detective check: reflected SSRF (batch 7) - non-blind only,
++    # requires an existing query parameter to redirect at cloud
++    # metadata/localhost.
++    ssrf_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_CHECK_CAP]
++    logger.info(
++        "detective: running reflected SSRF check against %d candidate URL(s)", len(ssrf_candidates)
++    )
++    ssrf_results = await asyncio.gather(
++        *(detective.check_ssrf_reflected(url) for url in ssrf_candidates),
++        return_exceptions=True,
++    )
++    for res in ssrf_results:
++        if isinstance(res, Exception):
++            logger.debug("reflected SSRF check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: server-side template injection (batch 8).
++    ssti_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSTI_CHECK_CAP]
++    logger.info(
++        "detective: running SSTI check against %d candidate URL(s)", len(ssti_candidates)
++    )
++    ssti_results = await asyncio.gather(
++        *(detective.check_ssti(url) for url in ssti_candidates),
++        return_exceptions=True,
++    )
++    for res in ssti_results:
++        if isinstance(res, Exception):
++            logger.debug("SSTI check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: known API key/secret signature leak (batch 8).
++    # Reuses js_candidates - both this and source-map/Firebase checks
++    # are "download this JS bundle and inspect it" operations.
++    logger.info(
++        "detective: running API key signature check against %d JS bundle URL(s)", len(js_candidates)
++    )
++    api_key_results = await asyncio.gather(
++        *(detective.check_api_key_leak_signature(url) for url in js_candidates),
++        return_exceptions=True,
++    )
++    for res in api_key_results:
++        if isinstance(res, Exception):
++            logger.debug("API key signature check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: IDOR candidate flagging (batch 8). Recon-only -
++    # see check_idor_candidate's own docstring - never becomes a
++    # findings-table row, just a log line pointing at manual-
++    # verification targets. Pure URL-pattern matching, no network
++    # request per candidate, so this can safely run against a larger
++    # slice of sane_discovered_urls than the request-issuing checks.
++    idor_candidates = sane_discovered_urls[:_IDOR_CANDIDATE_CHECK_CAP]
++    logger.info(
++        "detective: running IDOR candidate flagging against %d URL(s)", len(idor_candidates)
++    )
++    idor_notes = await asyncio.gather(
++        *(detective.check_idor_candidate(url) for url in idor_candidates),
++        return_exceptions=True,
++    )
++    for res in idor_notes:
++        if isinstance(res, Exception):
++            logger.debug("IDOR candidate check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: IDOR candidate note: %s", res)
++
++    # Detective check: reflected XSS (batch 9).
++    xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]
++    logger.info(
++        "detective: running reflected XSS check against %d candidate URL(s)", len(xss_candidates)
++    )
++    xss_results = await asyncio.gather(
++        *(detective.check_reflected_xss(url) for url in xss_candidates),
++        return_exceptions=True,
++    )
++    for res in xss_results:
++        if isinstance(res, Exception):
++            logger.debug("reflected XSS check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: error-based SQL injection (batch 9). Complements
++    # the timing-based check above with a higher-confidence signature
++    # match; kept as its own capped candidate list since it issues an
++    # extra baseline request per URL on top of the per-param probes.
++    sqli_error_candidates = [url for url in sane_discovered_urls if "=" in url][:_SQLI_ERROR_CHECK_CAP]
++    logger.info(
++        "detective: running error-based SQLi check against %d candidate URL(s)", len(sqli_error_candidates)
++    )
++    sqli_error_results = await asyncio.gather(
++        *(detective.check_sqli_error_based(url) for url in sqli_error_candidates),
++        return_exceptions=True,
++    )
++    for res in sqli_error_results:
++        if isinstance(res, Exception):
++            logger.debug("error-based SQLi check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: XXE, error-based detection only (batch 9). Only
++    # worth trying against real endpoints, so this reuses the same "="
++    # candidate list as a reasonable-cost slice rather than trying
++    # every discovered URL.
++    xxe_candidates = [url for url in sane_discovered_urls if "=" in url][:_XXE_CHECK_CAP]
++    logger.info(
++        "detective: running XXE check against %d candidate URL(s)", len(xxe_candidates)
++    )
++    xxe_results = await asyncio.gather(
++        *(detective.check_xxe_error_based(url) for url in xxe_candidates),
++        return_exceptions=True,
++    )
++    for res in xxe_results:
++        if isinstance(res, Exception):
++            logger.debug("XXE check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: insecure deserialization signature (batch 9).
++    # Recon-only - see check_insecure_deserialization_signature's own
++    # docstring - never becomes a findings-table row on its own, just
++    # a log line pointing at manual gadget-chain testing targets.
++    deserialization_candidates = sane_discovered_urls[:_DESERIALIZATION_CHECK_CAP]
++    logger.info(
++        "detective: running deserialization signature check against %d URL(s)",
++        len(deserialization_candidates),
++    )
++    deserialization_notes = await asyncio.gather(
++        *(detective.check_insecure_deserialization_signature(url) for url in deserialization_candidates),
++        return_exceptions=True,
++    )
++    for res in deserialization_notes:
++        if isinstance(res, Exception):
++            logger.debug("deserialization signature check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: deserialization signature note: %s", res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a

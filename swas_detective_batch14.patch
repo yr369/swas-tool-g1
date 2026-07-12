@@ -1,0 +1,503 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 0000000..0000000 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -206,6 +206,25 @@
+       standalone finding, broader/less format-specific complement to
+       check_api_key_leak_signature.
+ 
++Batch 14 (bulkier still, 10 checks):
++  57. LFI via PHP wrapper - php://filter source disclosure, proof
++      requires successful base64 decode to real PHP source markers.
++  58. LDAP injection, error-based - baseline-diffed error signatures.
++  59. XPath injection, error-based - same technique, rarer surface.
++  60. CORS null-origin + credentials bypass - deterministic header
++      check, distinct from the generic CORS check in batch 1.
++  61. Web cache poisoning via unkeyed header - two-step proof (poison
++      then a completely plain follow-up still shows the marker).
++  62. JWT 'kid' header injection candidate - NOT a standalone finding,
++      detection only, no forging/replay.
++  63. Missing CSRF token on POST forms - NOT a standalone finding,
++      SameSite cookies alone can make this a non-issue.
++  64. File upload form candidate - NOT a standalone finding, never
++      attempts an actual upload (avoids leaving artifacts on target).
++  65. CORS wildcard + credentials together - spec-violating even
++      where modern browsers won't act on it.
++  66. WebSocket loaded over unencrypted ws:// from an HTTPS page.
++
+ Every function here is read-only / non-destructive - no writes, no
+ exploitation, just detection. Each returns None when nothing is found, or
+ a dict describing the finding when something is. Callers (pipeline.py)
+@@ -3661,3 +3680,472 @@
+             f"severity varies widely by what's actually present"
+         )
+     return None
++
++
++# ---------------------------------------------------------------------
++# 57. LFI via PHP wrapper (source disclosure, not just file existence)
++# ---------------------------------------------------------------------
++_PHP_WRAPPER_PROBES = [
++    "php://filter/convert.base64-encode/resource=index",
++    "php://filter/convert.base64-encode/resource=config",
++]
++_PHP_SOURCE_MARKERS = ["<?php", "<?="]
++
++
++async def check_lfi_via_php_wrapper(url: str) -> dict | None:
++    """
++    Complements check_path_traversal_lfi (batch 10) with PHP-specific
++    wrapper-based file disclosure - php://filter/convert.base64-encode
++    reads a file's raw source (bypassing execution) instead of needing a
++    predictable absolute path like /etc/passwd. Proof bar: the response
++    must contain a valid base64 blob that decodes to recognizable PHP
++    source markers (<?php, <?=) - decoding successfully AND finding
++    those markers rules out coincidental base64-looking text.
++    """
++    parsed = httpx.URL(url)
++    if not parsed.query:
++        return None
++    existing_params = dict(parsed.params)
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                baseline_resp = await client.get(url)
++                baseline_body = baseline_resp.text
++            except httpx.HTTPError:
++                return None
++
++            for param_name in existing_params:
++                for probe in _PHP_WRAPPER_PROBES:
++                    test_params = dict(existing_params)
++                    test_params[param_name] = probe
++                    test_url = parsed.copy_with(params=test_params)
++                    try:
++                        resp = await client.get(test_url)
++                    except httpx.HTTPError:
++                        continue
++                    if resp.text == baseline_body:
++                        continue
++                    candidate = resp.text.strip()
++                    for token in re.findall(r"[A-Za-z0-9+/]{40,}={0,2}", candidate):
++                        try:
++                            decoded = base64.b64decode(token + "=" * (-len(token) % 4)).decode("utf-8", errors="ignore")
++                        except Exception:
++                            continue
++                        if any(marker in decoded for marker in _PHP_SOURCE_MARKERS):
++                            return {
++                                "vuln_type": "lfi_php_wrapper_source_disclosure",
++                                "severity": "critical",
++                                "evidence": (
++                                    f"{test_url}: parameter '{param_name}' with php://filter "
++                                    f"wrapper probe {probe!r} returned a base64 blob that "
++                                    f"decodes to PHP source (contains {'/'.join(_PHP_SOURCE_MARKERS)}) "
++                                    f"- confirmed local file read via wrapper bypass, not just "
++                                    f"file existence."
++                                ),
++                            }
++    except httpx.HTTPError as exc:
++        logger.info("detective: PHP wrapper LFI check failed for %s: %s", url, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 58. LDAP injection (error-based)
++# ---------------------------------------------------------------------
++_LDAP_INJECTION_PROBES = ["*)(uid=*))(|(uid=*", "*)(|(objectclass=*", "*))%00"]
++_LDAP_ERROR_SIGNATURES = [
++    "LDAPException", "javax.naming.directory", "Invalid DN syntax",
++    "LDAP: error code", "com.sun.jndi.ldap",
++]
++
++
++async def check_ldap_injection_error_based(url: str) -> dict | None:
++    """
++    Sends LDAP filter-breaking syntax and checks for LDAP-library-
++    specific error signatures. Baseline-diffed against an unmodified
++    request first, same discipline the audit added to check_ssrf_reflected
++    and check_xxe_error_based - these error strings are distinctive
++    enough to rarely collide, but not risking it after the SSTI lesson.
++    """
++    parsed = httpx.URL(url)
++    if not parsed.query:
++        return None
++    existing_params = dict(parsed.params)
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                baseline_resp = await client.get(url)
++                baseline_body = baseline_resp.text
++            except httpx.HTTPError:
++                return None
++
++            for param_name in existing_params:
++                for probe in _LDAP_INJECTION_PROBES:
++                    test_params = dict(existing_params)
++                    test_params[param_name] = probe
++                    test_url = parsed.copy_with(params=test_params)
++                    try:
++                        resp = await client.get(test_url)
++                    except httpx.HTTPError:
++                        continue
++                    for sig in _LDAP_ERROR_SIGNATURES:
++                        if sig in resp.text and sig not in baseline_body:
++                            return {
++                                "vuln_type": "ldap_injection_error_based",
++                                "severity": "high",
++                                "evidence": (
++                                    f"{test_url}: parameter '{param_name}' with LDAP filter-"
++                                    f"breaking probe {probe!r} triggered an LDAP-specific error "
++                                    f"signature ({sig!r}, absent from baseline)."
++                                ),
++                            }
++    except httpx.HTTPError as exc:
++        logger.info("detective: LDAP injection check failed for %s: %s", url, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 59. XPath injection (error-based)
++# ---------------------------------------------------------------------
++_XPATH_INJECTION_PROBES = ["' or '1'='1", "'] | //user/*[contains(*,'"]
++_XPATH_ERROR_SIGNATURES = [
++    "XPathException", "MS.Internal.Xml.XPath", "System.Xml.XPath",
++    "org.apache.xpath", "libxml2",
++]
++
++
++async def check_xpath_injection_error_based(url: str) -> dict | None:
++    """
++    Same technique and baseline-diffing discipline as
++    check_ldap_injection_error_based, targeting XPath query parsers
++    instead. XPath-backed auth/search functionality is much rarer than
++    SQL, so this has a low hit rate in general - but a genuine hit is
++    typically high-value (auth bypass on XML-backed user stores).
++    """
++    parsed = httpx.URL(url)
++    if not parsed.query:
++        return None
++    existing_params = dict(parsed.params)
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                baseline_resp = await client.get(url)
++                baseline_body = baseline_resp.text
++            except httpx.HTTPError:
++                return None
++
++            for param_name in existing_params:
++                for probe in _XPATH_INJECTION_PROBES:
++                    test_params = dict(existing_params)
++                    test_params[param_name] = probe
++                    test_url = parsed.copy_with(params=test_params)
++                    try:
++                        resp = await client.get(test_url)
++                    except httpx.HTTPError:
++                        continue
++                    for sig in _XPATH_ERROR_SIGNATURES:
++                        if sig in resp.text and sig not in baseline_body:
++                            return {
++                                "vuln_type": "xpath_injection_error_based",
++                                "severity": "medium",
++                                "evidence": (
++                                    f"{test_url}: parameter '{param_name}' with XPath-breaking "
++                                    f"probe {probe!r} triggered an XPath-specific error signature "
++                                    f"({sig!r}, absent from baseline)."
++                                ),
++                            }
++    except httpx.HTTPError as exc:
++        logger.info("detective: XPath injection check failed for %s: %s", url, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 60. CORS null-origin bypass
++# ---------------------------------------------------------------------
++async def check_cors_null_origin_bypass(url: str) -> dict | None:
++    """
++    Specifically tests the "Origin: null" bypass - browsers send a
++    literal null origin for sandboxed iframes and some data:/file:
++    contexts, which an attacker fully controls regardless of any
++    domain allowlist. If the server reflects "null" back in Access-
++    Control-Allow-Origin alongside Access-Control-Allow-Credentials:
++    true, any attacker page can steal authenticated data via a
++    sandboxed iframe - distinct from (and narrower than) whatever
++    check_cors_misconfig (batch 1) tests generically. Pure deterministic
++    header comparison, zero substring-coincidence risk.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                resp = await client.get(url, headers={"Origin": "null"})
++            except httpx.HTTPError:
++                return None
++    except httpx.HTTPError as exc:
++        logger.info("detective: CORS null origin check failed for %s: %s", url, exc)
++        return None
++
++    acao = resp.headers.get("access-control-allow-origin", "")
++    acac = resp.headers.get("access-control-allow-credentials", "").lower()
++    if acao.strip() == "null" and acac == "true":
++        return {
++            "vuln_type": "cors_null_origin_credentials_bypass",
++            "severity": "high",
++            "evidence": (
++                f"{url}: sending Origin: null returned Access-Control-Allow-Origin: null "
++                f"with Access-Control-Allow-Credentials: true - any attacker page can read "
++                f"authenticated responses via a sandboxed iframe (Origin: null is fully "
++                f"attacker-controlled, not a real domain restriction)."
++            ),
++        }
++    return None
++
++
++# ---------------------------------------------------------------------
++# 61. Web cache poisoning via unkeyed header
++# ---------------------------------------------------------------------
++async def check_web_cache_poisoning_unkeyed_header(url: str) -> dict | None:
++    """
++    Sends a unique marker via X-Forwarded-Host (an "unkeyed" header -
++    most caches don't include it in the cache key), then makes a
++    SEPARATE, completely plain follow-up request with no special headers
++    at all. If the marker still comes back on that plain request, the
++    poisoned response got cached and would be served to any other user
++    hitting the same URL - that's the actual proof of cache poisoning,
++    not just "the header was reflected once" (which check_host_header_
++    injection from batch 7 already covers for the non-cached case).
++    """
++    marker = "swas-cache-poison-" + uuid.uuid4().hex[:10]
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                await client.get(url, headers={"X-Forwarded-Host": marker})
++            except httpx.HTTPError:
++                return None
++            try:
++                followup_resp = await client.get(url)
++            except httpx.HTTPError:
++                return None
++            if marker in followup_resp.text:
++                return {
++                    "vuln_type": "web_cache_poisoning_unkeyed_header",
++                    "severity": "high",
++                    "evidence": (
++                        f"{url}: sending X-Forwarded-Host: {marker} once, then making a "
++                        f"completely plain follow-up request with no special headers, still "
++                        f"returned the marker - the poisoned response was cached and would be "
++                        f"served to any other visitor of this URL."
++                    ),
++                }
++    except httpx.HTTPError as exc:
++        logger.info("detective: cache poisoning check failed for %s: %s", url, exc)
++    return None
++
++
++# ---------------------------------------------------------------------
++# 62. JWT 'kid' header injection candidate (recon-only)
++# ---------------------------------------------------------------------
++async def check_jwt_kid_header_injection_candidate(url: str) -> str | None:
++    """
++    Finds a JWT and checks whether its header includes a 'kid' (Key ID)
++    claim that looks like a file path or SQL-fragment - a classic
++    injection point where the key-lookup logic uses attacker-influenced
++    input to locate/construct the verification key (path traversal to a
++    predictable low-entropy file, or SQLi in a "SELECT key FROM keys
++    WHERE id = ?" lookup). Returns a plain string, NOT a findings dict -
++    same reasoning as check_jwt_alg_confusion: detecting a suspicious
++    'kid' value doesn't confirm the key-lookup is actually exploitable,
++    and confirming it requires forging and replaying a token against a
++    protected endpoint, which this scanner deliberately doesn't do.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: JWT kid header check failed for %s: %s", url, exc)
++        return None
++
++    haystack = resp.text[:20000] + " " + resp.headers.get("set-cookie", "")
++    match = _JWT_RE.search(haystack)
++    if not match:
++        return None
++    header_b64 = match.group(0).split(".")[0]
++    try:
++        header = json.loads(base64.urlsafe_b64decode(header_b64 + "=" * (-len(header_b64) % 4)))
++    except Exception:
++        return None
++
++    kid = header.get("kid")
++    if not kid or not isinstance(kid, str):
++        return None
++    if "/" in kid or "\\" in kid or "'" in kid or ".." in kid:
++        return (
++            f"{url}: JWT header includes a 'kid' claim ({kid!r}) that looks like a file path "
++            f"or contains injection-relevant characters - candidate for manual kid-based key-"
++            f"confusion testing (path traversal to a predictable key file, or SQLi in the key "
++            f"lookup); not exploited here since that requires forging and replaying a token"
++        )
++    return None
++
++
++# ---------------------------------------------------------------------
++# 63. Missing CSRF token on state-changing forms (recon-only)
++# ---------------------------------------------------------------------
++_CSRF_TOKEN_FIELD_RE = re.compile(r'name=["\'][^"\']*(?:csrf|xsrf|authenticity_token|_token)[^"\']*["\']', re.IGNORECASE)
++_POST_FORM_RE = re.compile(r'<form[^>]+method=["\']?post["\']?[^>]*>(.*?)</form>', re.IGNORECASE | re.DOTALL)
++
++
++async def check_csrf_token_missing(url: str) -> str | None:
++    """
++    Scans POST forms for the absence of any csrf/xsrf/authenticity-
++    token-shaped hidden field. Returns a plain string, NOT a findings
++    dict - many modern apps rely entirely on SameSite cookies instead of
++    a token field and are still perfectly protected, so a missing token
++    field alone doesn't confirm a real CSRF vulnerability. Confirming
++    that needs checking SameSite/Origin-validation behavior too, which
++    this scanner doesn't attempt. Flag for manual review, not a verdict.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: CSRF token check failed for %s: %s", url, exc)
++        return None
++
++    body = resp.text
++    forms_without_token = 0
++    for form_match in _POST_FORM_RE.finditer(body):
++        form_body = form_match.group(1)
++        if not _CSRF_TOKEN_FIELD_RE.search(form_body):
++            forms_without_token += 1
++
++    if forms_without_token:
++        return (
++            f"{url}: {forms_without_token} POST form(s) with no csrf/xsrf/authenticity-token-"
++            f"shaped hidden field - candidate for manual CSRF review (check SameSite cookie "
++            f"attributes and Origin validation before concluding this is exploitable; a "
++            f"missing token field alone isn't a confirmed vulnerability on modern browsers)"
++        )
++    return None
++
++
++# ---------------------------------------------------------------------
++# 64. File upload form candidate (recon-only)
++# ---------------------------------------------------------------------
++_FILE_INPUT_RE = re.compile(r'<input[^>]+type=["\']file["\'][^>]*>', re.IGNORECASE)
++_ACCEPT_ATTR_RE = re.compile(r'accept=["\']([^"\']*)["\']', re.IGNORECASE)
++
++
++async def check_file_upload_form_candidate(url: str) -> str | None:
++    """
++    Flags pages containing a file-upload form (<input type="file">).
++    Returns a plain string, NOT a findings dict, and never attempts an
++    actual upload - unrestricted file upload -> RCE is a high-payout bug
++    class, but actually testing extension/content-type/magic-byte
++    bypasses means uploading real files to what might be production
++    storage, which carries real risk of leaving artifacts behind on a
++    target you don't control. This only tells you where the upload
++    surface is so you can test it manually and clean up after yourself.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: file upload form check failed for %s: %s", url, exc)
++        return None
++
++    body = resp.text
++    file_inputs = _FILE_INPUT_RE.findall(body)
++    if not file_inputs:
++        return None
++
++    accept_values = [m for m in _ACCEPT_ATTR_RE.findall(" ".join(file_inputs))]
++    accept_note = f", accept={accept_values}" if accept_values else " (no accept attribute set)"
++    return (
++        f"{url}: contains {len(file_inputs)} file-upload input(s){accept_note} - candidate "
++        f"for manual upload-restriction-bypass testing (double extensions, null byte, "
++        f"content-type spoofing, magic-byte bypass); not tested here to avoid leaving "
++        f"uploaded artifacts on the target"
++    )
++
++
++# ---------------------------------------------------------------------
++# 65. CORS wildcard + credentials (spec-violating misconfiguration)
++# ---------------------------------------------------------------------
++async def check_cors_wildcard_with_credentials(url: str) -> dict | None:
++    """
++    Per spec, browsers should refuse to honor Access-Control-Allow-
++    Origin: * combined with Access-Control-Allow-Credentials: true - but
++    plenty of misconfigured servers/proxies still SEND both together
++    anyway, which is a genuine server-side policy bug even where modern
++    browsers won't act on it (older clients, non-browser HTTP clients,
++    and some proxy/cache layers may not enforce the same restriction).
++    Pure deterministic header inspection, zero substring-coincidence risk.
++    """
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                resp = await client.get(url, headers={"Origin": "https://swas-cors-probe.test"})
++            except httpx.HTTPError:
++                return None
++    except httpx.HTTPError as exc:
++        logger.info("detective: CORS wildcard credentials check failed for %s: %s", url, exc)
++        return None
++
++    acao = resp.headers.get("access-control-allow-origin", "").strip()
++    acac = resp.headers.get("access-control-allow-credentials", "").strip().lower()
++    if acao == "*" and acac == "true":
++        return {
++            "vuln_type": "cors_wildcard_with_credentials",
++            "severity": "medium",
++            "evidence": (
++                f"{url}: server sent Access-Control-Allow-Origin: * together with "
++                f"Access-Control-Allow-Credentials: true in the same response - a spec-"
++                f"violating combination most browsers won't honor, but indicates a genuinely "
++                f"broken CORS policy that may still be exploitable via non-browser clients or "
++                f"proxy/cache layers that don't enforce the same restriction."
++            ),
++        }
++    return None
++
++
++# ---------------------------------------------------------------------
++# 66. WebSocket loaded over unencrypted ws:// from an HTTPS page
++# ---------------------------------------------------------------------
++_WS_URL_RE = re.compile(r'\bws://[^\s"\'<>]+', re.IGNORECASE)
++
++
++async def check_websocket_downgrade(url: str) -> dict | None:
++    """
++    Scans an HTTPS page for hardcoded ws:// (unencrypted) WebSocket URLs
++    instead of wss://. A WebSocket carrying session tokens, chat
++    content, or live app data over plaintext on an otherwise-HTTPS site
++    is a real, low-collision structural finding - "ws://" as an exact
++    scheme prefix essentially never appears coincidentally in unrelated
++    content, so this doesn't need baseline diffing the way generic
++    substring checks do.
++    """
++    if not url.lower().startswith("https://"):
++        return None  # only meaningful as a downgrade if the page itself is HTTPS
++
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)
++    except httpx.HTTPError as exc:
++        logger.info("detective: WebSocket downgrade check failed for %s: %s", url, exc)
++        return None
++
++    match = _WS_URL_RE.search(resp.text)
++    if match:
++        return {
++            "vuln_type": "websocket_unencrypted_downgrade",
++            "severity": "medium",
++            "evidence": (
++                f"{url}: HTTPS page references an unencrypted WebSocket URL "
++                f"({match.group(0)[:100]!r}) instead of wss:// - any data sent over that "
++                f"connection (session tokens, live app data) is exposed to network-level "
++                f"interception despite the page itself being served over HTTPS."
++            ),
++        }
++    return None

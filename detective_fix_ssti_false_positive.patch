@@ -1,0 +1,105 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 0000000..0000000 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -151,6 +151,7 @@
+ import logging
+ import math
+ import os
++import random
+ import re
+ import ssl
+ import time
+@@ -1973,28 +1974,47 @@
+ # ---------------------------------------------------------------------
+ # 29. Server-side template injection (SSTI)
+ # ---------------------------------------------------------------------
+-# (payload, expected-evaluated-result) pairs across the common template
+-# engines. Each payload is a harmless arithmetic expression - if the
+-# *evaluated* result comes back in the response, the engine executed our
+-# input as code, which is the proof bar (not just "no error thrown").
+-_SSTI_PROBES: list[tuple[str, str]] = [
+-    ("${7*7}", "49"),          # Java (Freemarker/Velocity/Thymeleaf-ish)
+-    ("#{7*7}", "49"),          # Java EL / Ruby-style
+-    ("{{7*7}}", "49"),         # Jinja2/Twig/Django
+-    ("{{=7*7}}", "49"),        # Some PHP template engines
+-    ("<%= 7*7 %>", "49"),      # ERB
+-]
++def _ssti_probes() -> list[tuple[str, str]]:
++    """
++    Builds SSTI probes with randomized operands, computed fresh per scan
++    rather than the fixed 7*7=49 this shipped with initially. A static
++    two-digit result like "49" can trivially appear in a response by
++    pure coincidence (a byte count, a CSS value, part of an unrelated
++    longer number) with no baseline comparison to rule that out - that
++    was a real false-positive bug (see check_ssti's docstring). Using
++    two random 2-3 digit operands makes the product effectively unique
++    per request, and it's paired with an explicit baseline diff in
++    check_ssti itself as defense in depth.
++    """
++    a = random.randint(37, 97)
++    b = random.randint(41, 89)
++    product = str(a * b)
++    return [
++        (f"${{{a}*{b}}}", product),
++        (f"#{{{a}*{b}}}", product),
++        (f"{{{{{a}*{b}}}}}", product),
++        (f"{{{{={a}*{b}}}}}", product),
++        (f"<%= {a}*{b} %>", product),
++    ]
+ 
+ 
+ async def check_ssti(url: str) -> dict | None:
+     """
+     Appends each SSTI probe as a value on every existing query parameter
+-    and checks whether the *evaluated* result (49) shows up in the
+-    response body somewhere the raw payload didn't already appear. This
+-    is proof-based, not signature-based - a template engine that just
+-    echoes "{{7*7}}" back verbatim isn't vulnerable, so echoed-but-
++    and checks whether the *evaluated* result shows up in the response
++    body somewhere the raw payload didn't already appear. This is
++    proof-based, not signature-based - a template engine that just
++    echoes "{{91*67}}" back verbatim isn't vulnerable, so echoed-but-
+     unevaluated payloads are explicitly excluded to avoid false positives
+     from any app that reflects input at all (which is most of them).
++
++    Two layers against false positives: (1) operands are randomized per
++    scan, so the expected product is different every time and
++    effectively unique rather than a common short number like "49" that
++    can coincidentally appear anywhere in a page; (2) the expected value
++    must be ABSENT from a baseline (unmodified) request to the same URL
++    before a match counts - if it's already present without the payload,
++    it's coincidence, not evaluation.
+     """
+     parsed = httpx.URL(url)
+     if not parsed.query:
+@@ -2003,8 +2023,16 @@
+ 
+     try:
+         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            try:
++                baseline_resp = await client.get(url)
++                baseline_body = baseline_resp.text
++            except httpx.HTTPError:
++                return None
++
+             for param_name in existing_params:
+-                for payload, expected in _SSTI_PROBES:
++                for payload, expected in _ssti_probes():
++                    if expected in baseline_body:
++                        continue  # would coincidentally match even unmodified - skip this operand pair
+                     test_params = dict(existing_params)
+                     test_params[param_name] = existing_params[param_name] + payload
+                     test_url = parsed.copy_with(params=test_params)
+@@ -2022,8 +2050,9 @@
+                             "evidence": (
+                                 f"{test_url}: parameter '{param_name}' with payload {payload!r} "
+                                 f"caused the literal evaluated result {expected!r} to appear in the "
+-                                f"response body (payload itself not present unevaluated), consistent "
+-                                f"with server-side template injection / RCE."
++                                f"response body (payload itself not present unevaluated, and "
++                                f"{expected!r} was absent from an unmodified baseline request to "
++                                f"the same URL), consistent with server-side template injection / RCE."
+                             ),
+                         }
+     except httpx.HTTPError as exc:

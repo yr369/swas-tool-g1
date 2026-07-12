@@ -1,0 +1,203 @@
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 0000000..0000000 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -74,6 +74,12 @@
+ _BACKUP_FILE_CHECK_CAP = 15
+ _AZURE_BLOB_CHECK_CAP = 15
+ _CORS_SUBDOMAIN_BYPASS_CHECK_CAP = 15
++_HSTS_CHECK_CAP = 15
++_COOKIE_SAMESITE_CHECK_CAP = 15
++_SESSION_ID_URL_CHECK_CAP = 25  # pure pattern match, no extra requests
++_META_REFRESH_CHECK_CAP = 15
++_WSDL_CHECK_CAP = 15
++_UUID_VERSION_CHECK_CAP = 25  # pure pattern match, no extra requests
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -577,6 +583,80 @@
+         if prometheus_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, prometheus_result)
+ 
++        # ---- Batches 18-22 host-level checks (14 total) ----
++
++        logger.info("detective: running dependency manifest exposure check for %s", host)
++        dep_manifest_result = await detective.check_dependency_manifest_exposure(host)
++        if dep_manifest_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, dep_manifest_result)
++
++        logger.info("detective: running Swagger path enumeration check for %s", host)
++        swagger_enum_note = await detective.check_swagger_path_enumeration_unauth(host)
++        if swagger_enum_note is not None:
++            logger.info("detective: Swagger path enumeration note: %s", swagger_enum_note)
++
++        logger.info("detective: running TRACE method check for %s", host)
++        trace_method_note = await detective.check_http_trace_method_enabled(host)
++        if trace_method_note is not None:
++            logger.info("detective: TRACE method note: %s", trace_method_note)
++
++        logger.info("detective: running docker-compose exposure check for %s", host)
++        docker_compose_result = await detective.check_exposed_docker_compose_file(host)
++        if docker_compose_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, docker_compose_result)
++
++        logger.info("detective: running WordPress config backup check for %s", host)
++        wp_config_result = await detective.check_wordpress_config_backup_exposure(host)
++        if wp_config_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, wp_config_result)
++
++        logger.info("detective: running GraphQL error stack trace check for %s", host)
++        graphql_stack_trace_result = await detective.check_graphql_error_stack_trace_leak(
++            host.rstrip("/") + "/graphql"
++        )
++        if graphql_stack_trace_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, graphql_stack_trace_result)
++
++        logger.info("detective: running DevOps tool panel check for %s", host)
++        devops_panel_result = await detective.check_exposed_devops_tool_panel(host)
++        if devops_panel_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, devops_panel_result)
++
++        logger.info("detective: running phpMyAdmin exposure check for %s", host)
++        phpmyadmin_result = await detective.check_exposed_phpmyadmin(host)
++        if phpmyadmin_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, phpmyadmin_result)
++
++        logger.info("detective: running ELMAH exposure check for %s", host)
++        elmah_result = await detective.check_exposed_elmah_axd(host)
++        if elmah_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, elmah_result)
++
++        logger.info("detective: running Trace.axd exposure check for %s", host)
++        trace_axd_result = await detective.check_exposed_trace_axd(host)
++        if trace_axd_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, trace_axd_result)
++
++        logger.info("detective: running Laravel debug mode check for %s", host)
++        laravel_debug_result = await detective.check_laravel_debug_mode_exposure(host)
++        if laravel_debug_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, laravel_debug_result)
++
++        logger.info("detective: running .git/config credentials check for %s", host)
++        git_config_creds_result = await detective.check_git_config_credentials_leak(host)
++        if git_config_creds_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, git_config_creds_result)
++
++        logger.info("detective: running AWS credentials file check for %s", host)
++        aws_creds_result = await detective.check_aws_credentials_file_exposure(host)
++        if aws_creds_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, aws_creds_result)
++
++        logger.info("detective: running kubeconfig exposure check for %s", host)
++        kubeconfig_result = await detective.check_kubeconfig_exposure(host)
++        if kubeconfig_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, kubeconfig_result)
++
+         # Batch 8 per-host check: prototype pollution via a JSON
+         # __proto__ gadget POSTed to the host root. (The other three
+         # batch 8 checks - SSTI, API key signature, IDOR candidate
+@@ -1408,6 +1488,104 @@
+         if res is not None:
+             await _save_detective_finding(conn, project_id, target_id, res)
+ 
++    # ---- Batches 18-22 URL-level checks (6 total) ----
++
++    # Detective check: missing HSTS. Recon-only.
++    hsts_candidates = sane_discovered_urls[:_HSTS_CHECK_CAP]
++    logger.info("detective: running HSTS check against %d URL(s)", len(hsts_candidates))
++    hsts_notes = await asyncio.gather(
++        *(detective.check_hsts_missing(url) for url in hsts_candidates),
++        return_exceptions=True,
++    )
++    for res in hsts_notes:
++        if isinstance(res, Exception):
++            logger.debug("HSTS check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: HSTS note: %s", res)
++
++    # Detective check: session cookie missing SameSite. Recon-only.
++    cookie_samesite_candidates = sane_discovered_urls[:_COOKIE_SAMESITE_CHECK_CAP]
++    logger.info(
++        "detective: running cookie SameSite check against %d URL(s)", len(cookie_samesite_candidates)
++    )
++    cookie_samesite_notes = await asyncio.gather(
++        *(detective.check_insecure_cookie_without_samesite(url) for url in cookie_samesite_candidates),
++        return_exceptions=True,
++    )
++    for res in cookie_samesite_notes:
++        if isinstance(res, Exception):
++            logger.debug("cookie SameSite check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: cookie SameSite note: %s", res)
++
++    # Detective check: session identifier in URL. Recon-only, pure
++    # pattern match - no extra requests, capped higher.
++    session_id_url_candidates = sane_discovered_urls[:_SESSION_ID_URL_CHECK_CAP]
++    logger.info(
++        "detective: running session-ID-in-URL check against %d URL(s)", len(session_id_url_candidates)
++    )
++    session_id_url_notes = await asyncio.gather(
++        *(detective.check_session_id_in_url(url) for url in session_id_url_candidates),
++        return_exceptions=True,
++    )
++    for res in session_id_url_notes:
++        if isinstance(res, Exception):
++            logger.debug("session ID in URL check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: session ID in URL note: %s", res)
++
++    # Detective check: open redirect via meta-refresh.
++    meta_refresh_candidates = [url for url in sane_discovered_urls if "=" in url][:_META_REFRESH_CHECK_CAP]
++    logger.info(
++        "detective: running meta-refresh open redirect check against %d candidate URL(s)",
++        len(meta_refresh_candidates),
++    )
++    meta_refresh_results = await asyncio.gather(
++        *(detective.check_open_redirect_via_meta_refresh(url) for url in meta_refresh_candidates),
++        return_exceptions=True,
++    )
++    for res in meta_refresh_results:
++        if isinstance(res, Exception):
++            logger.debug("meta-refresh open redirect check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: exposed WSDL/SOAP service.
++    wsdl_candidates = sane_discovered_urls[:_WSDL_CHECK_CAP]
++    logger.info("detective: running WSDL exposure check against %d URL(s)", len(wsdl_candidates))
++    wsdl_results = await asyncio.gather(
++        *(detective.check_exposed_wsdl_soap_service(url) for url in wsdl_candidates),
++        return_exceptions=True,
++    )
++    for res in wsdl_results:
++        if isinstance(res, Exception):
++            logger.debug("WSDL exposure check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: predictable UUIDv1 resource identifier.
++    # Recon-only, pure pattern match - no extra requests, capped higher.
++    uuid_version_candidates = sane_discovered_urls[:_UUID_VERSION_CHECK_CAP]
++    logger.info(
++        "detective: running predictable UUID version check against %d URL(s)",
++        len(uuid_version_candidates),
++    )
++    uuid_version_notes = await asyncio.gather(
++        *(detective.check_predictable_uuid_version(url) for url in uuid_version_candidates),
++        return_exceptions=True,
++    )
++    for res in uuid_version_notes:
++        if isinstance(res, Exception):
++            logger.debug("predictable UUID version check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: predictable UUID note: %s", res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a

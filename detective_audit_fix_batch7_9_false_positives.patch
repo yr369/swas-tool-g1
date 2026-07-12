@@ -1,0 +1,169 @@
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 0000000..0000000 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -1908,35 +1908,52 @@
+     skips blind/out-of-band SSRF detection - that needs a collaborator
+     server you control and manual confirmation, which this pure-Python,
+     no-infra check can't safely automate.
++
++    Baseline-diffed against an unmodified request first - "instance-id"
++    and similar phrases are specific, but not so specific that they can
++    never appear on an unrelated page (an infra/inventory dashboard, for
++    instance). Same false-positive lesson as check_ssti: don't trust a
++    substring match without ruling out it was already there.
+     """
+     parsed = httpx.URL(url)
+     if not parsed.query:
+         return None
+ 
+     existing_params = dict(parsed.params)
+-    for param_name in _SSRF_PARAM_NAMES:
+-        if param_name not in existing_params:
+-            continue
+-        for probe in _SSRF_INTERNAL_PROBES:
+-            test_params = dict(existing_params)
+-            test_params[param_name] = probe
+-            test_url = parsed.copy_with(params=test_params)
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+             try:
+-                async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+-                    resp = await client.get(test_url)
++                baseline_resp = await client.get(url)
++                baseline_body = baseline_resp.text[:3000].lower()
+             except httpx.HTTPError:
+-                continue
+-            body = resp.text[:3000].lower()
+-            if "ami-id" in body or "instance-id" in body or "iam/security-credentials" in body:
+-                return {
+-                    "vuln_type": "ssrf_reflected_cloud_metadata",
+-                    "severity": "critical",
+-                    "evidence": (
+-                        f"{test_url}: server-side fetch of parameter '{param_name}' pointed at "
+-                        f"the cloud metadata endpoint and the response body contains metadata "
+-                        f"content (ami-id/instance-id/iam credentials markers)."
+-                    ),
+-                }
++                return None
++
++            for param_name in _SSRF_PARAM_NAMES:
++                if param_name not in existing_params:
++                    continue
++                for probe in _SSRF_INTERNAL_PROBES:
++                    test_params = dict(existing_params)
++                    test_params[param_name] = probe
++                    test_url = parsed.copy_with(params=test_params)
++                    try:
++                        resp = await client.get(test_url)
++                    except httpx.HTTPError:
++                        continue
++                    body = resp.text[:3000].lower()
++                    for sig in ("ami-id", "instance-id", "iam/security-credentials"):
++                        if sig in body and sig not in baseline_body:
++                            return {
++                                "vuln_type": "ssrf_reflected_cloud_metadata",
++                                "severity": "critical",
++                                "evidence": (
++                                    f"{test_url}: server-side fetch of parameter '{param_name}' "
++                                    f"pointed at the cloud metadata endpoint and the response "
++                                    f"body contains {sig!r} (absent from the unmodified baseline "
++                                    f"response)."
++                                ),
++                            }
++    except httpx.HTTPError as exc:
++        logger.info("detective: SSRF check failed for %s: %s", url, exc)
+     return None
+ 
+ 
+@@ -1962,22 +1979,43 @@
+     disabled, or an exposed Rails/Symfony info page, is typically an easy
+     path to RCE or full config/secret disclosure - high severity and
+     reliably in-scope, unlike generic version-banner findings.
++
++    Control-checked against a deliberately nonexistent path on the same
++    host first - these marker strings are fairly specific, but not
++    impossible to hit coincidentally (e.g. "phpinfo()" appearing as plain
++    text in a PHP tutorial blog post), and some hosts (SPA catch-alls,
++    certain WAFs) return 200 with the same generic body for every path
++    regardless of what's requested. If the control path also matches,
++    the host is match-everything and this isn't a real finding.
+     """
+     base = host.rstrip("/")
+     try:
+         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            control_path = "/swas-nonexistent-probe-" + uuid.uuid4().hex[:8]
++            try:
++                control_resp = await client.get(base + control_path)
++                control_body_lower = control_resp.text[:5000].lower()
++            except httpx.HTTPError:
++                control_body_lower = ""
++
+             for path, marker, framework in _DEBUG_PATHS:
+                 try:
+                     resp = await client.get(base + path)
+                 except httpx.HTTPError:
+                     continue
+-                if resp.status_code == 200 and marker.lower() in resp.text[:5000].lower():
++                marker_lower = marker.lower()
++                if (
++                    resp.status_code == 200
++                    and marker_lower in resp.text[:5000].lower()
++                    and marker_lower not in control_body_lower
++                ):
+                     return {
+                         "vuln_type": "exposed_debug_console",
+                         "severity": "critical",
+                         "evidence": (
+                             f"{base}{path} returned a live {framework} debug/info page "
+-                            f"(matched marker: {marker!r}). Often exploitable for RCE "
++                            f"(matched marker: {marker!r}, absent from a control request to a "
++                            f"nonexistent path on the same host). Often exploitable for RCE "
+                             f"(Werkzeug PIN bypass) or full environment/secret disclosure."
+                         ),
+                     }
+@@ -2351,13 +2389,20 @@
+     which is the vulnerability itself, independent of whether this
+     particular probe path exists on disk.
+ 
+-    Only fires against endpoints that already returned a non-error
+-    status for a plain GET, to avoid wasting requests probing endpoints
+-    that don't exist at all.
++    Baseline-diffed against a plain GET on the same URL first - some of
++    these signatures ("no such file", "ENOENT") are generic enough that
++    an unrelated 404/error page could already contain them with nothing
++    to do with XML at all. Same false-positive lesson as check_ssti.
+     """
+     try:
+         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+             try:
++                baseline_resp = await client.get(url)
++                baseline_lower = baseline_resp.text.lower()
++            except httpx.HTTPError:
++                baseline_lower = ""
++
++            try:
+                 resp = await client.post(
+                     url,
+                     content=_XXE_PAYLOAD,
+@@ -2368,15 +2413,17 @@
+ 
+             body_lower = resp.text.lower()
+             for sig in _XXE_ERROR_SIGNATURES:
+-                if sig.lower() in body_lower:
++                sig_lower = sig.lower()
++                if sig_lower in body_lower and sig_lower not in baseline_lower:
+                     return {
+                         "vuln_type": "xxe_external_entity_processing",
+                         "severity": "high",
+                         "evidence": (
+                             f"{url}: sending an XML body with an external entity referencing a "
+                             f"nonexistent local path triggered a parser error signature "
+-                            f"({sig!r}), indicating the XML parser attempted to resolve "
+-                            f"external entities rather than rejecting the DOCTYPE outright."
++                            f"({sig!r}, absent from a baseline GET on the same URL), indicating "
++                            f"the XML parser attempted to resolve external entities rather than "
++                            f"rejecting the DOCTYPE outright."
+                         ),
+                     }
+     except httpx.HTTPError as exc:

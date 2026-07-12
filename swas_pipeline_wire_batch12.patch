@@ -1,0 +1,86 @@
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 0000000..0000000 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -50,6 +50,8 @@
+ _BUCKET_EXPOSURE_CHECK_CAP = 15
+ _METHOD_OVERRIDE_CHECK_CAP = 15
+ _REFERRER_LEAK_CHECK_CAP = 15
++_OPEN_REDIRECT_ENCODING_CHECK_CAP = 15
++_SRI_CHECK_CAP = 15
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -475,6 +477,15 @@
+         if jwt_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, jwt_result)
+ 
++        # Batch 12: JWT weak/common HMAC signing secret. Pure local
++        # cryptography, no extra network requests - kept right next
++        # to the alg-confusion check since both work off the same
++        # discovered JWT.
++        logger.info("detective: running JWT weak secret check for %s", host)
++        jwt_weak_secret_result = await detective.check_jwt_weak_secret(host)
++        if jwt_weak_secret_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, jwt_weak_secret_result)
++
+         logger.info("detective: running host header injection check for %s", host)
+         hhi_result = await detective.check_host_header_injection(host)
+         if hhi_result is not None:
+@@ -485,6 +496,14 @@
+         if debug_console_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, debug_console_result)
+ 
++        # Batch 12: exposed admin/management panel. Recon-only - see
++        # check_exposed_admin_panel's own docstring - never attempts
++        # credentials.
++        logger.info("detective: running admin panel exposure check for %s", host)
++        admin_panel_note = await detective.check_exposed_admin_panel(host)
++        if admin_panel_note is not None:
++            logger.info("detective: admin panel note: %s", admin_panel_note)
++
+         # Batch 8 per-host check: prototype pollution via a JSON
+         # __proto__ gadget POSTed to the host root. (The other three
+         # batch 8 checks - SSTI, API key signature, IDOR candidate
+@@ -900,6 +919,41 @@
+         if res is not None:
+             await _save_detective_finding(conn, project_id, target_id, res)
+ 
++    # Detective check: open redirect via encoding/parsing bypass
++    # (batch 12). Complements the batch-1 open redirect check.
++    open_redirect_encoding_candidates = [url for url in sane_discovered_urls if "=" in url][:_OPEN_REDIRECT_ENCODING_CHECK_CAP]
++    logger.info(
++        "detective: running open redirect encoding bypass check against %d candidate URL(s)",
++        len(open_redirect_encoding_candidates),
++    )
++    open_redirect_encoding_results = await asyncio.gather(
++        *(detective.check_open_redirect_encoding_bypass(url) for url in open_redirect_encoding_candidates),
++        return_exceptions=True,
++    )
++    for res in open_redirect_encoding_results:
++        if isinstance(res, Exception):
++            logger.debug("open redirect encoding bypass check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: missing Subresource Integrity (batch 12).
++    # Recon-only - see check_missing_sri's own docstring.
++    sri_candidates = sane_discovered_urls[:_SRI_CHECK_CAP]
++    logger.info(
++        "detective: running missing SRI check against %d URL(s)", len(sri_candidates)
++    )
++    sri_notes = await asyncio.gather(
++        *(detective.check_missing_sri(url) for url in sri_candidates),
++        return_exceptions=True,
++    )
++    for res in sri_notes:
++        if isinstance(res, Exception):
++            logger.debug("missing SRI check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: missing SRI note: %s", res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a

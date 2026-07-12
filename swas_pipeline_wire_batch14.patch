@@ -1,0 +1,176 @@
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 0000000..0000000 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -59,6 +59,13 @@
+ _PREDICTABLE_TOKEN_CHECK_CAP = 25  # pure pattern match, no extra requests beyond the URL's own
+ _CLICKJACKING_CHECK_CAP = 15
+ _HARDCODED_SECRETS_CHECK_CAP = 15
++_LFI_PHP_WRAPPER_CHECK_CAP = 10
++_LDAP_INJECTION_CHECK_CAP = 10
++_XPATH_INJECTION_CHECK_CAP = 10
++_CACHE_POISONING_CHECK_CAP = 15
++_CSRF_TOKEN_CHECK_CAP = 15
++_FILE_UPLOAD_CANDIDATE_CHECK_CAP = 15
++_WEBSOCKET_DOWNGRADE_CHECK_CAP = 15
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -393,6 +400,16 @@
+         if cors_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, cors_result)
+ 
++        # Batch 14: two narrower, deterministic CORS variants grouped
++        # with the generic misconfig check above.
++        cors_null_origin_result = await detective.check_cors_null_origin_bypass(host)
++        if cors_null_origin_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, cors_null_origin_result)
++
++        cors_wildcard_creds_result = await detective.check_cors_wildcard_with_credentials(host)
++        if cors_wildcard_creds_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, cors_wildcard_creds_result)
++
+         cache_result = await detective.check_cache_deception(host)
+         if cache_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, cache_result)
+@@ -502,6 +519,12 @@
+         if jwt_weak_secret_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, jwt_weak_secret_result)
+ 
++        # Batch 14: JWT 'kid' header injection candidate. Recon-only -
++        # grouped with the other JWT checks above.
++        jwt_kid_note = await detective.check_jwt_kid_header_injection_candidate(host)
++        if jwt_kid_note is not None:
++            logger.info("detective: JWT kid injection note: %s", jwt_kid_note)
++
+         logger.info("detective: running host header injection check for %s", host)
+         hhi_result = await detective.check_host_header_injection(host)
+         if hhi_result is not None:
+@@ -1096,6 +1119,127 @@
+         if res is not None:
+             logger.info("detective: hardcoded secrets note: %s", res)
+ 
++    # ---- Batch 14 (bulkier still, 10 checks) ----
++
++    # Detective check: LFI via PHP wrapper (source disclosure).
++    lfi_wrapper_candidates = [url for url in sane_discovered_urls if "=" in url][:_LFI_PHP_WRAPPER_CHECK_CAP]
++    logger.info(
++        "detective: running PHP wrapper LFI check against %d candidate URL(s)",
++        len(lfi_wrapper_candidates),
++    )
++    lfi_wrapper_results = await asyncio.gather(
++        *(detective.check_lfi_via_php_wrapper(url) for url in lfi_wrapper_candidates),
++        return_exceptions=True,
++    )
++    for res in lfi_wrapper_results:
++        if isinstance(res, Exception):
++            logger.debug("PHP wrapper LFI check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: LDAP injection, error-based.
++    ldap_injection_candidates = [url for url in sane_discovered_urls if "=" in url][:_LDAP_INJECTION_CHECK_CAP]
++    logger.info(
++        "detective: running LDAP injection check against %d candidate URL(s)",
++        len(ldap_injection_candidates),
++    )
++    ldap_injection_results = await asyncio.gather(
++        *(detective.check_ldap_injection_error_based(url) for url in ldap_injection_candidates),
++        return_exceptions=True,
++    )
++    for res in ldap_injection_results:
++        if isinstance(res, Exception):
++            logger.debug("LDAP injection check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: XPath injection, error-based.
++    xpath_injection_candidates = [url for url in sane_discovered_urls if "=" in url][:_XPATH_INJECTION_CHECK_CAP]
++    logger.info(
++        "detective: running XPath injection check against %d candidate URL(s)",
++        len(xpath_injection_candidates),
++    )
++    xpath_injection_results = await asyncio.gather(
++        *(detective.check_xpath_injection_error_based(url) for url in xpath_injection_candidates),
++        return_exceptions=True,
++    )
++    for res in xpath_injection_results:
++        if isinstance(res, Exception):
++            logger.debug("XPath injection check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: web cache poisoning via unkeyed header.
++    cache_poisoning_candidates = sane_discovered_urls[:_CACHE_POISONING_CHECK_CAP]
++    logger.info(
++        "detective: running cache poisoning check against %d URL(s)", len(cache_poisoning_candidates)
++    )
++    cache_poisoning_results = await asyncio.gather(
++        *(detective.check_web_cache_poisoning_unkeyed_header(url) for url in cache_poisoning_candidates),
++        return_exceptions=True,
++    )
++    for res in cache_poisoning_results:
++        if isinstance(res, Exception):
++            logger.debug("cache poisoning check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: missing CSRF token on POST forms. Recon-only -
++    # see the check's own docstring.
++    csrf_token_candidates = sane_discovered_urls[:_CSRF_TOKEN_CHECK_CAP]
++    logger.info(
++        "detective: running CSRF token check against %d URL(s)", len(csrf_token_candidates)
++    )
++    csrf_token_notes = await asyncio.gather(
++        *(detective.check_csrf_token_missing(url) for url in csrf_token_candidates),
++        return_exceptions=True,
++    )
++    for res in csrf_token_notes:
++        if isinstance(res, Exception):
++            logger.debug("CSRF token check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: CSRF token note: %s", res)
++
++    # Detective check: file upload form candidate. Recon-only, never
++    # attempts an actual upload - see the check's own docstring.
++    file_upload_candidates = sane_discovered_urls[:_FILE_UPLOAD_CANDIDATE_CHECK_CAP]
++    logger.info(
++        "detective: running file upload form check against %d URL(s)", len(file_upload_candidates)
++    )
++    file_upload_notes = await asyncio.gather(
++        *(detective.check_file_upload_form_candidate(url) for url in file_upload_candidates),
++        return_exceptions=True,
++    )
++    for res in file_upload_notes:
++        if isinstance(res, Exception):
++            logger.debug("file upload form check raised: %s", res)
++            continue
++        if res is not None:
++            logger.info("detective: file upload form note: %s", res)
++
++    # Detective check: WebSocket loaded over unencrypted ws:// from
++    # an HTTPS page.
++    websocket_downgrade_candidates = sane_discovered_urls[:_WEBSOCKET_DOWNGRADE_CHECK_CAP]
++    logger.info(
++        "detective: running WebSocket downgrade check against %d URL(s)",
++        len(websocket_downgrade_candidates),
++    )
++    websocket_downgrade_results = await asyncio.gather(
++        *(detective.check_websocket_downgrade(url) for url in websocket_downgrade_candidates),
++        return_exceptions=True,
++    )
++    for res in websocket_downgrade_results:
++        if isinstance(res, Exception):
++            logger.debug("WebSocket downgrade check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a

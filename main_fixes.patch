@@ -1,0 +1,63 @@
+--- a/backend/app/main.py	2026-07-09 23:26:47.998183723 +0000
++++ b/backend/app/main.py	2026-07-09 23:26:48.000742905 +0000
+@@ -70,9 +70,14 @@
+     """
+     pool = database.get_pool()
+     async with pool.acquire() as conn:
+-        project = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
++        project = await conn.fetchrow("SELECT id, status FROM projects WHERE id = $1", project_id)
+         if project is None:
+             raise HTTPException(status_code=404, detail="Project not found")
++        if project["status"] == "scanning":
++            raise HTTPException(
++                status_code=409,
++                detail="A scan is already in progress for this project",
++            )
+ 
+         targets = await conn.fetch(
+             "SELECT id, target FROM scope_targets WHERE project_id = $1 AND in_scope = true",
+@@ -107,10 +112,13 @@
+             "INSERT INTO scan_runs (project_id) VALUES ($1)", project_id
+         )
+ 
+-    for target_row in targets:
++    tasks = [
+         asyncio.create_task(
+             pipeline.run_target_pipeline(pool, project_id, target_row["id"], target_row["target"])
+         )
++        for target_row in targets
++    ]
++    asyncio.create_task(_finalize_scan_status(pool, project_id, tasks))
+ 
+     return {
+         "message": f"Scan started for {len(targets)} target(s)",
+@@ -118,6 +126,29 @@
+     }
+ 
+ 
++async def _finalize_scan_status(pool, project_id: int, tasks: list) -> None:
++    """Waits for every per-target pipeline task from a single scan kickoff
++    to finish, then flips the project out of 'scanning'.
++
++    Without this, `status` sticks on 'scanning' forever (targets run as
++    fire-and-forget asyncio tasks - nothing else ever writes a terminal
++    status), which also silently breaks the scheduler loop and the
++    duplicate-scan guard above, since both gate on status != 'scanning'.
++    """
++    results = await asyncio.gather(*tasks, return_exceptions=True)
++    failures = [r for r in results if isinstance(r, Exception)]
++    if failures:
++        logger.warning(
++            "scan for project %s: %d of %d target(s) raised an error",
++            project_id, len(failures), len(results),
++        )
++    new_status = "error" if failures else "completed"
++    async with pool.acquire() as conn:
++        await conn.execute(
++            "UPDATE projects SET status = $1 WHERE id = $2", new_status, project_id
++        )
++
++
+ async def _run_due_scheduled_scans() -> None:
+     """One pass of the scheduler: find every project whose recurring
+     schedule is due, kick each one off, and push its next-run time

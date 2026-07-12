@@ -1,0 +1,89 @@
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 0000000..0000000 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -45,6 +45,9 @@
+ _SQLI_ERROR_CHECK_CAP = 10     # extra baseline request per URL on top of per-param probes
+ _XXE_CHECK_CAP = 10
+ _DESERIALIZATION_CHECK_CAP = 20
++_PATH_TRAVERSAL_CHECK_CAP = 15
++_CMDI_CHECK_CAP = 8            # each real hit costs a deliberate multi-second delay - keep tight
++_BUCKET_EXPOSURE_CHECK_CAP = 15
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+@@ -480,6 +483,12 @@
+         if proto_pollution_result is not None:
+             await _save_detective_finding(conn, project_id, target_id, proto_pollution_result)
+ 
++        # Batch 10 per-host check: exposed .env file.
++        logger.info("detective: running .env exposure check for %s", host)
++        env_file_result = await detective.check_env_file_exposure(host)
++        if env_file_result is not None:
++            await _save_detective_finding(conn, project_id, target_id, env_file_result)
++
+     # Pre-filter discovered_urls once for all the URL-based checks below.
+     # gau/waybackurls output is often messy - malformed concatenated URLs,
+     # scope-import junk, etc. - and the SQLi timing check especially
+@@ -767,6 +776,61 @@
+         if res is not None:
+             logger.info("detective: deserialization signature note: %s", res)
+ 
++    # Detective check: path traversal / LFI (batch 10).
++    path_traversal_candidates = [url for url in sane_discovered_urls if "=" in url][:_PATH_TRAVERSAL_CHECK_CAP]
++    logger.info(
++        "detective: running path traversal check against %d candidate URL(s)", len(path_traversal_candidates)
++    )
++    path_traversal_results = await asyncio.gather(
++        *(detective.check_path_traversal_lfi(url) for url in path_traversal_candidates),
++        return_exceptions=True,
++    )
++    for res in path_traversal_results:
++        if isinstance(res, Exception):
++            logger.debug("path traversal check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: OS command injection, blind timing-based
++    # (batch 10). Same cost profile as the SQLi timing check - each
++    # real hit costs several deliberate seconds - so capped tighter.
++    cmdi_candidates = [url for url in sane_discovered_urls if "=" in url][:_CMDI_CHECK_CAP]
++    logger.info(
++        "detective: running OS command injection check against %d parameterized URL(s)",
++        len(cmdi_candidates),
++    )
++    cmdi_results = await asyncio.gather(
++        *(detective.check_os_command_injection(url) for url in cmdi_candidates),
++        return_exceptions=True,
++    )
++    for res in cmdi_results:
++        if isinstance(res, Exception):
++            logger.debug("OS command injection check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
++    # Detective check: publicly-listable cloud storage bucket
++    # (batch 10). Runs against any page that might reference a
++    # bucket name, not just parameterized URLs - reuses
++    # sane_discovered_urls directly rather than the "=" filter.
++    bucket_candidates = sane_discovered_urls[:_BUCKET_EXPOSURE_CHECK_CAP]
++    logger.info(
++        "detective: running cloud storage bucket exposure check against %d URL(s)",
++        len(bucket_candidates),
++    )
++    bucket_results = await asyncio.gather(
++        *(detective.check_cloud_storage_bucket_exposure(url) for url in bucket_candidates),
++        return_exceptions=True,
++    )
++    for res in bucket_results:
++        if isinstance(res, Exception):
++            logger.debug("cloud storage bucket exposure check raised: %s", res)
++            continue
++        if res is not None:
++            await _save_detective_finding(conn, project_id, target_id, res)
++
+ 
+ # A hostname like "aem-prod.example.com" or a tech-stack detection
+ # ("AEM", "Adobe Experience Manager") is a strong recon signal, not a

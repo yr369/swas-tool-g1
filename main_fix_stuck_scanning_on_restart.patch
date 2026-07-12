@@ -1,0 +1,40 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 0000000..0000000 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -216,12 +216,35 @@
+     pool = database.get_pool()
+     async with pool.acquire() as conn:
+         recovered_count = await checkpoint.recover_interrupted_runs(conn)
++
++        # The scan-status fix relies on an in-memory supervisor task
++        # (_finalize_scan_status) to flip a project out of 'scanning'
++        # once every target's pipeline finishes. That task lives only in
++        # this process - a restart kills it along with everything else,
++        # leaving the project stuck on 'scanning' with nothing left to
++        # ever resolve it, same symptom as the original bug but from a
++        # different cause. Any project still 'scanning' at startup time
++        # is, by definition, orphaned from a previous process.
++        stuck_project_rows = await conn.fetch(
++            "SELECT id, name FROM projects WHERE status = 'scanning'"
++        )
++        if stuck_project_rows:
++            await conn.execute("UPDATE projects SET status = 'error' WHERE status = 'scanning'")
++
+     if recovered_count > 0:
+         logger.warning(
+             "Found and flagged %d scan phase(s) interrupted by a previous "
+             "restart - check phase_runs with status='needs_attention'",
+             recovered_count,
+         )
++    if stuck_project_rows:
++        logger.warning(
++            "Reset %d project(s) stuck on 'scanning' from a previous restart "
++            "to 'error' (orphaned by process restart, not a real failure - "
++            "safe to re-trigger a scan): %s",
++            len(stuck_project_rows),
++            ", ".join(f"{r['id']}:{r['name']}" for r in stuck_project_rows),
++        )
+ 
+     scheduler_task = asyncio.create_task(_scheduler_loop())
+ 
