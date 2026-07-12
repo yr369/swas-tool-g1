@@ -225,6 +225,20 @@ Batch 14 (bulkier still, 10 checks):
       where modern browsers won't act on it.
   66. WebSocket loaded over unencrypted ws:// from an HTTPS page.
 
+Batches 15-17 (built together, 4 checks each):
+  Batch 15: 67. Excessive data exposure in API JSON (recon-only) /
+    68. API version downgrade bypass (deterministic status-code proof)
+    / 69. Missing SPF/DMARC (recon-only, commonly out-of-scope) /
+    70. GraphQL query via GET (recon-only, CSRF-chaining candidate)
+  Batch 16: 71. Boolean-based blind SQLi (three-way baseline/true/false
+    comparison) / 72. SVG upload flagging (recon-only) / 73. JSONP
+    callback XSS (unique-marker proof) / 74. Backup/temp file
+    disclosure (baseline-diffed against real 404 behavior)
+  Batch 17: 75. Azure Blob public exposure (same technique as the S3/
+    GCS check) / 76. Origin IP WAF/CDN bypass / 77. CORS subdomain-
+    suffix bypass (distinct from the null-origin and wildcard-creds
+    checks) / 78. Exposed Prometheus metrics
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -4215,6 +4229,661 @@ async def check_websocket_downgrade(url: str) -> dict | None:
                 f"({match.group(0)[:100]!r}) instead of wss:// - any data sent over that "
                 f"connection (session tokens, live app data) is exposed to network-level "
                 f"interception despite the page itself being served over HTTPS."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 67. Excessive data exposure in JSON API responses (recon-only)
+# ---------------------------------------------------------------------
+_EXCESSIVE_EXPOSURE_FIELD_NAMES = [
+    "password", "password_hash", "passwordhash", "salt", "ssn", "social_security",
+    "credit_card", "creditcard", "cvv", "api_secret", "private_key", "internal_notes",
+    "is_admin", "hashed_password",
+]
+
+
+def _find_sensitive_keys(obj, depth: int = 0) -> list[str]:
+    if depth > 4:
+        return []
+    found = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key.lower() in _EXCESSIVE_EXPOSURE_FIELD_NAMES:
+                found.append(key)
+            found.extend(_find_sensitive_keys(value, depth + 1))
+    elif isinstance(obj, list):
+        for item in obj[:5]:
+            found.extend(_find_sensitive_keys(item, depth + 1))
+    return found
+
+
+async def check_excessive_data_exposure_api(url: str) -> str | None:
+    """
+    Parses a JSON API response and looks for field names that suggest
+    the server is returning more than the client needs (password
+    hashes, salts, internal notes, raw SSNs/credit-card numbers).
+    Returns a plain string, NOT a findings dict - a field NAME existing
+    in a response doesn't confirm it's actually sensitive data (could be
+    a null placeholder, a schema artifact, or intentionally exposed to
+    an admin-only endpoint this request happens to be hitting); this
+    flags candidates for manual inspection of the actual values returned.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: excessive data exposure check failed for %s: %s", url, exc)
+        return None
+
+    try:
+        response_json = resp.json()
+    except Exception:
+        return None
+
+    sensitive_keys = _find_sensitive_keys(response_json)
+    if sensitive_keys:
+        unique_keys = sorted(set(sensitive_keys))
+        return (
+            f"{url}: JSON response contains field name(s) suggesting excessive data exposure "
+            f"({', '.join(unique_keys)}) - candidate for manual review of the actual values "
+            f"returned (a present field name alone doesn't confirm real sensitive data)"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 68. API version downgrade bypass
+# ---------------------------------------------------------------------
+_API_VERSION_RE = re.compile(r"/v(\d+)/")
+_DOWNGRADE_VERSIONS = ["v1", "v0", "beta", "internal", "legacy"]
+
+
+async def check_api_version_downgrade_bypass(url: str) -> dict | None:
+    """
+    If a URL's path contains a version segment (/v2/, /v3/, etc.), tries
+    swapping it for older/deprecated version markers (v1, v0, beta,
+    internal, legacy) - a common real-world gap where a deprecated API
+    version stays live with weaker or no access control, while the
+    "current" version everyone assumes is the only path in is properly
+    secured. Same deterministic status-code-transition proof bar as
+    check_auth_bypass_via_method_override: the current-version URL must
+    be blocked (401/403) first, and the older-version URL must return
+    200 with real content - no substring-matching risk.
+    """
+    match = _API_VERSION_RE.search(str(httpx.URL(url).path))
+    if not match:
+        return None
+    current_version = match.group(0)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                baseline_resp = await client.get(url)
+            except httpx.HTTPError:
+                return None
+            if baseline_resp.status_code not in (401, 403):
+                return None  # not blocked on the current version - nothing to bypass
+
+            for old_version in _DOWNGRADE_VERSIONS:
+                downgraded_url = url.replace(current_version, f"/{old_version}/", 1)
+                if downgraded_url == url:
+                    continue
+                try:
+                    resp = await client.get(downgraded_url)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                    return {
+                        "vuln_type": "api_version_downgrade_bypass",
+                        "severity": "high",
+                        "evidence": (
+                            f"{url}: blocked with {baseline_resp.status_code} on the current "
+                            f"API version, but {downgraded_url} (older/deprecated version) "
+                            f"returned 200 with a {len(resp.text)}-byte body - the deprecated "
+                            f"version doesn't enforce the same access control."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: API version downgrade check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 69. Missing SPF/DMARC email authentication records (recon-only)
+# ---------------------------------------------------------------------
+async def check_missing_spf_dmarc(host: str) -> str | None:
+    """
+    Looks up SPF (TXT record starting "v=spf1") and DMARC
+    (_dmarc.<domain> TXT record) for the host's domain via DNS-over-
+    HTTPS. Returns a plain string, NOT a findings dict - missing email
+    authentication enables spoofing, which is real, but email security
+    is explicitly out of scope or rated Informative on a large fraction
+    of bug bounty programs (it affects the mail domain broadly, not a
+    specific app vulnerability) - flag for awareness, check program
+    policy before treating this as report-worthy, same reasoning
+    already applied to check_clickjacking_missing_protection.
+    """
+    domain = httpx.URL(host).host
+    if not domain or domain.replace(".", "").isdigit():
+        return None  # bare IP, no domain to check
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            try:
+                spf_resp = await client.get(
+                    f"https://cloudflare-dns.com/dns-query?name={domain}&type=TXT",
+                    headers={"Accept": "application/dns-json"},
+                )
+                spf_data = spf_resp.json()
+            except Exception:
+                spf_data = {}
+            has_spf = any(
+                "v=spf1" in a.get("data", "") for a in spf_data.get("Answer", [])
+            )
+
+            try:
+                dmarc_resp = await client.get(
+                    f"https://cloudflare-dns.com/dns-query?name=_dmarc.{domain}&type=TXT",
+                    headers={"Accept": "application/dns-json"},
+                )
+                dmarc_data = dmarc_resp.json()
+            except Exception:
+                dmarc_data = {}
+            has_dmarc = any(
+                "v=dmarc1" in a.get("data", "").lower() for a in dmarc_data.get("Answer", [])
+            )
+    except httpx.HTTPError as exc:
+        logger.info("detective: SPF/DMARC check failed for %s: %s", host, exc)
+        return None
+
+    if not has_spf and not has_dmarc:
+        return (
+            f"{domain}: no SPF or DMARC TXT record found - domain email is spoofable. "
+            f"Email authentication gaps are frequently out of scope or Informative on bug "
+            f"bounty programs - check program policy before reporting."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 70. GraphQL queries accepted via GET (recon-only, CSRF-chaining candidate)
+# ---------------------------------------------------------------------
+async def check_graphql_query_via_get(url: str) -> str | None:
+    """
+    Checks whether a GraphQL endpoint accepts queries via GET (as query-
+    string parameters) rather than requiring POST. Returns a plain
+    string, NOT a findings dict - this is a structural capability check,
+    not a vulnerability by itself. It matters because a GET-based query
+    rides along with a victim's cookies automatically in a simple cross-
+    site request (no preflight needed the way a custom-header POST
+    would trigger), which is a real CSRF-chaining candidate - but
+    confirming actual impact needs an authenticated session to see what
+    data a forced query could exfiltrate, which this scanner doesn't
+    have.
+    """
+    probe_url = url.rstrip("/") + '?query={__typename}'
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(probe_url)
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: GraphQL GET query check failed for %s: %s", url, exc)
+        return None
+
+    try:
+        response_json = resp.json()
+    except Exception:
+        return None
+    if isinstance(response_json, dict) and response_json.get("data") and "errors" not in response_json:
+        return (
+            f"{probe_url}: GraphQL query accepted via GET - candidate for CSRF-chaining "
+            f"(rides along with victim cookies with no preflight); confirming real impact "
+            f"needs an authenticated session to see what a forced query could exfiltrate"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 71. SQL injection, boolean-based blind
+# ---------------------------------------------------------------------
+_SQLI_BOOLEAN_TRUE = "' AND '1'='1"
+_SQLI_BOOLEAN_FALSE = "' AND '1'='2"
+
+
+async def check_sql_injection_boolean_based(url: str) -> dict | None:
+    """
+    Complements check_blind_sqli_timing (time-based) and
+    check_sqli_error_based (error-signature) with the third classic
+    blind-SQLi technique: compare responses for an always-TRUE injected
+    condition vs an always-FALSE one against the SAME baseline. If the
+    app is vulnerable, the TRUE payload's response matches the baseline
+    (query behaves normally) while the FALSE payload's response differs
+    (query returns no rows / different content) - a clean three-way
+    comparison, not a single substring match, which is what keeps this
+    safe from the SSTI-class false-positive problem.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_body = baseline_resp.text
+            except httpx.HTTPError:
+                return None
+
+            for param_name in existing_params:
+                test_params_true = dict(existing_params)
+                test_params_true[param_name] = existing_params[param_name] + _SQLI_BOOLEAN_TRUE
+                true_url = parsed.copy_with(params=test_params_true)
+
+                test_params_false = dict(existing_params)
+                test_params_false[param_name] = existing_params[param_name] + _SQLI_BOOLEAN_FALSE
+                false_url = parsed.copy_with(params=test_params_false)
+
+                try:
+                    true_resp = await client.get(true_url)
+                    false_resp = await client.get(false_url)
+                except httpx.HTTPError:
+                    continue
+
+                true_matches_baseline = (
+                    true_resp.status_code == baseline_resp.status_code
+                    and abs(len(true_resp.text) - len(baseline_body)) < max(20, len(baseline_body) * 0.02)
+                )
+                false_differs_from_baseline = (
+                    false_resp.status_code != baseline_resp.status_code
+                    or abs(len(false_resp.text) - len(baseline_body)) > max(20, len(baseline_body) * 0.02)
+                )
+
+                if true_matches_baseline and false_differs_from_baseline:
+                    return {
+                        "vuln_type": "sql_injection_boolean_based",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{url} parameter '{param_name}': baseline body length "
+                            f"{len(baseline_body)}. Injecting an always-TRUE condition "
+                            f"({_SQLI_BOOLEAN_TRUE!r}) produced a response matching the "
+                            f"baseline ({len(true_resp.text)} bytes, status "
+                            f"{true_resp.status_code}), while an always-FALSE condition "
+                            f"({_SQLI_BOOLEAN_FALSE!r}) produced a different response "
+                            f"({len(false_resp.text)} bytes, status {false_resp.status_code}) - "
+                            f"the query logic is responding to injected boolean conditions."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: boolean-based SQLi check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 72. SVG file upload acceptance flagging (recon-only)
+# ---------------------------------------------------------------------
+async def check_insecure_svg_upload_flagging(url: str) -> str | None:
+    """
+    Narrower complement to check_file_upload_form_candidate (batch 14):
+    specifically flags upload forms whose accept attribute includes SVG
+    (image/svg+xml or .svg). SVG files can embed <script> tags and are
+    frequently rendered inline or served with a permissive content-type,
+    making SVG upload a well-known path to stored XSS that a generic
+    "has a file upload" note doesn't call out specifically. Returns a
+    plain string, NOT a findings dict, and never uploads anything -
+    same reasoning as the general file-upload check.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: SVG upload flagging check failed for %s: %s", url, exc)
+        return None
+
+    body = resp.text
+    for file_input in _FILE_INPUT_RE.findall(body):
+        if "svg" in file_input.lower():
+            return (
+                f"{url}: file upload form explicitly accepts SVG (accept attribute "
+                f"references svg) - SVG can embed <script> and is a well-known stored-XSS "
+                f"upload vector; not tested here to avoid leaving uploaded artifacts on the "
+                f"target"
+            )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 73. JSONP callback parameter XSS
+# ---------------------------------------------------------------------
+_JSONP_PARAM_NAMES = ["callback", "jsonp", "cb", "jsonpcallback"]
+
+
+async def check_jsonp_callback_xss(url: str) -> dict | None:
+    """
+    JSONP endpoints wrap a JSON response in a caller-controlled function
+    name: callback({...}). If the callback parameter isn't validated
+    against a strict identifier pattern, injecting script-breaking
+    characters produces attacker-controlled JavaScript that executes
+    when the response is loaded as a <script src>. Same unique-marker
+    discipline as check_reflected_xss: a UUID fragment in the payload
+    means a coincidental match is effectively impossible, so this
+    doesn't need baseline diffing.
+    """
+    parsed = httpx.URL(url)
+    existing_params = dict(parsed.params)
+    marker_id = uuid.uuid4().hex[:10]
+    payload = f"alert(/swas{marker_id}/)//"
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for param_name in _JSONP_PARAM_NAMES:
+                test_params = dict(existing_params)
+                test_params[param_name] = payload
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                content_type = resp.headers.get("content-type", "").lower()
+                if "javascript" not in content_type and "json" not in content_type:
+                    continue
+                if payload not in resp.text:
+                    continue
+                # Confirm the payload wasn't JSON-string-escaped into harmlessness
+                # (e.g. "alert(\/swas...\/)//" inside a quoted string literal) -
+                # check the few characters immediately before it for an escaping
+                # backslash-quote, which would mean it's inert data, not live code.
+                idx = resp.text.find(payload)
+                preceding = resp.text[max(0, idx - 5):idx]
+                if '\\"' in preceding or "\\'" in preceding:
+                    continue
+                return {
+                    "vuln_type": "jsonp_callback_xss",
+                    "severity": "high",
+                    "evidence": (
+                        f"{test_url}: JSONP parameter '{param_name}' with payload "
+                        f"{payload!r} was reflected unescaped into a "
+                        f"javascript/json-typed response - executes as script when "
+                        f"loaded via <script src>."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: JSONP callback XSS check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 74. Backup/temp file disclosure
+# ---------------------------------------------------------------------
+_BACKUP_FILE_SUFFIXES = [".bak", ".old", ".orig", ".swp", "~", ".save", ".backup"]
+_SOURCE_CODE_MARKERS = ["<?php", "<%", "import ", "function ", "SELECT ", "password"]
+
+
+async def check_backup_temp_file_disclosure(url: str) -> dict | None:
+    """
+    Appends common backup/editor-temp-file suffixes to a discovered
+    URL's path and checks whether the result returns 200 with content
+    meaningfully different from a real 404, AND containing something
+    that looks like source code rather than a rendered page - editors
+    (vim swap files) and deploy scripts routinely leave .bak/.orig/~
+    copies of source files sitting next to the real ones in the web
+    root. Baseline-diffed against the real 404 behavior first.
+    """
+    parsed = httpx.URL(url)
+    path = str(parsed.path)
+    if not path or path == "/":
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                nonexistent_probe = parsed.copy_with(path=path + ".swas-nonexistent-" + uuid.uuid4().hex[:8])
+                baseline_404_resp = await client.get(nonexistent_probe)
+                baseline_404_body = baseline_404_resp.text[:2000]
+            except httpx.HTTPError:
+                return None
+
+            for suffix in _BACKUP_FILE_SUFFIXES:
+                test_url = parsed.copy_with(path=path + suffix)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.text[:3000]
+                if body[:2000] == baseline_404_body:
+                    continue  # same content as a real 404 - server returns 200 for everything
+                for marker in _SOURCE_CODE_MARKERS:
+                    if marker in body:
+                        return {
+                            "vuln_type": "backup_temp_file_disclosure",
+                            "severity": "high",
+                            "evidence": (
+                                f"{test_url}: returned 200 with content distinct from the "
+                                f"server's real 404 response, and containing a source-code "
+                                f"marker ({marker!r}) - a backup/temp copy of source is "
+                                f"publicly readable."
+                            ),
+                        }
+    except httpx.HTTPError as exc:
+        logger.info("detective: backup/temp file check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 75. Publicly-listable Azure Blob Storage container
+# ---------------------------------------------------------------------
+_AZURE_BLOB_REFERENCE_RE = re.compile(
+    r"([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\.blob\.core\.windows\.net/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+async def check_azure_blob_public_exposure(url: str) -> dict | None:
+    """
+    Same technique and proof bar as check_cloud_storage_bucket_exposure
+    (batch 9), targeting Azure Blob Storage instead of S3/GCS: scans
+    page content for account.blob.core.windows.net/container
+    references, then issues a direct, read-only container-listing
+    request. Only fires on an actual object listing
+    (<EnumerationResults>), not just a reachable container.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                return None
+            body = resp.text
+
+            seen = set()
+            for account, container in _AZURE_BLOB_REFERENCE_RE.findall(body):
+                key = f"{account}/{container}".lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                listing_url = f"https://{account}.blob.core.windows.net/{container}?restype=container&comp=list"
+                try:
+                    listing_resp = await client.get(listing_url)
+                except httpx.HTTPError:
+                    continue
+                if "<EnumerationResults" in listing_resp.text[:2000]:
+                    return {
+                        "vuln_type": "publicly_listable_azure_blob_container",
+                        "severity": "high",
+                        "evidence": (
+                            f"Azure Blob container '{container}' on account '{account}' "
+                            f"(referenced on {url}) is publicly listable at {listing_url} - "
+                            f"returned an actual <EnumerationResults> object listing."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Azure blob check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 76. Origin IP disclosure / WAF-CDN bypass
+# ---------------------------------------------------------------------
+async def check_origin_ip_waf_bypass(host: str) -> dict | None:
+    """
+    Resolves the host's A record via DNS-over-HTTPS, then compares a
+    normal hostname-based request against a direct request to the raw
+    IP (with the Host header stripped to a generic value). If a WAF/CDN
+    sits in front of the hostname but the origin server is directly
+    reachable on its IP and serves the SAME real content, any
+    hostname-based protection (WAF rules, rate limiting, geo-blocking)
+    can be bypassed entirely by hitting the origin directly. Proof bar:
+    the IP-direct response must actually resemble real application
+    content (reasonable size, 200 status), not a default nginx/apache
+    placeholder page or a connection failure.
+    """
+    domain = httpx.URL(host).host
+    if not domain or domain.replace(".", "").isdigit():
+        return None  # already a bare IP
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            try:
+                dns_resp = await client.get(
+                    f"https://cloudflare-dns.com/dns-query?name={domain}&type=A",
+                    headers={"Accept": "application/dns-json"},
+                )
+                dns_data = dns_resp.json()
+            except Exception:
+                return None
+            answers = [a.get("data") for a in dns_data.get("Answer", []) if a.get("type") == 1]
+            if not answers:
+                return None
+            origin_ip = answers[0]
+
+            try:
+                hostname_resp = await client.get(host)
+            except httpx.HTTPError:
+                return None
+
+            scheme = "https" if host.startswith("https") else "http"
+            ip_url = f"{scheme}://{origin_ip}/"
+            try:
+                ip_resp = await client.get(ip_url, headers={"Host": domain})
+            except httpx.HTTPError:
+                return None
+
+            if (
+                ip_resp.status_code == 200
+                and len(ip_resp.text) > 200
+                and abs(len(ip_resp.text) - len(hostname_resp.text)) < max(200, len(hostname_resp.text) * 0.3)
+            ):
+                return {
+                    "vuln_type": "origin_ip_waf_cdn_bypass",
+                    "severity": "high",
+                    "evidence": (
+                        f"{domain} resolves to {origin_ip}, and requesting that IP directly "
+                        f"(with Host: {domain} set explicitly) returned a "
+                        f"{len(ip_resp.text)}-byte response closely matching the real "
+                        f"hostname-based response ({len(hostname_resp.text)} bytes) - the "
+                        f"origin server is directly reachable, bypassing any WAF/CDN/rate-"
+                        f"limiting that only protects the hostname."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: origin IP WAF bypass check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 77. CORS subdomain-suffix validation bypass
+# ---------------------------------------------------------------------
+async def check_cors_subdomain_suffix_bypass(url: str) -> dict | None:
+    """
+    Tests for a naive CORS origin-validator that checks "does the Origin
+    contain/end with my domain" rather than an exact allowlist match -
+    sending Origin: https://{domain}.evil-swas-probe.test (the real
+    domain as a PREFIX of an attacker-controlled one) or
+    https://evil-swas-probe-{domain} (domain concatenated without a
+    separator) can slip past a substring/endswith check that isn't
+    anchored properly. Distinct from check_cors_null_origin_bypass and
+    check_cors_wildcard_with_credentials - this targets a third,
+    separate CORS misconfiguration pattern. Deterministic header
+    reflection check, zero substring-coincidence risk.
+    """
+    domain = httpx.URL(url).host
+    if not domain:
+        return None
+    attacker_origins = [
+        f"https://{domain}.evil-swas-probe.test",
+        f"https://evil-swas-probe{domain}",
+    ]
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for attacker_origin in attacker_origins:
+                try:
+                    resp = await client.get(url, headers={"Origin": attacker_origin})
+                except httpx.HTTPError:
+                    continue
+                acao = resp.headers.get("access-control-allow-origin", "").strip()
+                acac = resp.headers.get("access-control-allow-credentials", "").strip().lower()
+                if acao == attacker_origin and acac == "true":
+                    return {
+                        "vuln_type": "cors_subdomain_suffix_bypass",
+                        "severity": "high",
+                        "evidence": (
+                            f"{url}: sending Origin: {attacker_origin} (contains the real "
+                            f"domain as a substring, not an actual subdomain) was reflected "
+                            f"back exactly in Access-Control-Allow-Origin with "
+                            f"Access-Control-Allow-Credentials: true - the origin validator "
+                            f"uses an unanchored substring/endswith check instead of a real "
+                            f"allowlist match."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: CORS subdomain suffix bypass check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 78. Exposed Prometheus metrics endpoint
+# ---------------------------------------------------------------------
+async def check_exposed_prometheus_metrics(host: str) -> dict | None:
+    """
+    Checks the standard /metrics path for Prometheus's distinctive
+    exposition format (# HELP / # TYPE comment lines followed by
+    metric_name{labels} value data). This format is specific enough
+    that a match essentially never happens by coincidence - unrelated
+    pages don't produce "# HELP http_requests_total ..." followed by a
+    numeric value on the next line. An exposed metrics endpoint can leak
+    internal hostnames, request patterns, and sometimes business metrics
+    (signups, transaction counts) with no authentication.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/metrics")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Prometheus metrics check failed for %s: %s", host, exc)
+        return None
+
+    if resp.status_code != 200:
+        return None
+    body = resp.text[:5000]
+    if re.search(r"^# HELP \S+", body, re.MULTILINE) and re.search(r"^# TYPE \S+ \w+", body, re.MULTILINE):
+        return {
+            "vuln_type": "exposed_prometheus_metrics",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/metrics is publicly accessible and returns valid Prometheus "
+                f"exposition-format data (# HELP/# TYPE lines present) with no "
+                f"authentication - internal operational and potentially business metrics "
+                f"are exposed."
             ),
         }
     return None

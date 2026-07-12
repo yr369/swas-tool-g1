@@ -66,6 +66,14 @@ _CACHE_POISONING_CHECK_CAP = 15
 _CSRF_TOKEN_CHECK_CAP = 15
 _FILE_UPLOAD_CANDIDATE_CHECK_CAP = 15
 _WEBSOCKET_DOWNGRADE_CHECK_CAP = 15
+_EXCESSIVE_EXPOSURE_CHECK_CAP = 15
+_API_VERSION_DOWNGRADE_CHECK_CAP = 15
+_SQLI_BOOLEAN_CHECK_CAP = 10
+_SVG_UPLOAD_CHECK_CAP = 15
+_JSONP_XSS_CHECK_CAP = 15
+_BACKUP_FILE_CHECK_CAP = 15
+_AZURE_BLOB_CHECK_CAP = 15
+_CORS_SUBDOMAIN_BYPASS_CHECK_CAP = 15
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -448,6 +456,13 @@ async def _phase_scan(
         if graphql_mutation_result is not None:
             await _save_detective_finding(conn, project_id, target_id, graphql_mutation_result)
 
+        # Batch 15: GraphQL query via GET. Recon-only - grouped with
+        # the other GraphQL checks above.
+        logger.info("detective: running GraphQL GET query check for %s", host)
+        graphql_get_note = await detective.check_graphql_query_via_get(host.rstrip("/") + "/graphql")
+        if graphql_get_note is not None:
+            logger.info("detective: GraphQL GET query note: %s", graphql_get_note)
+
         container_api_result = await detective.check_exposed_container_api(host)
         if container_api_result is not None:
             await _save_detective_finding(conn, project_id, target_id, container_api_result)
@@ -545,6 +560,22 @@ async def _phase_scan(
         admin_panel_note = await detective.check_exposed_admin_panel(host)
         if admin_panel_note is not None:
             logger.info("detective: admin panel note: %s", admin_panel_note)
+
+        # Batches 15/17: infra-level checks grouped together.
+        logger.info("detective: running SPF/DMARC check for %s", host)
+        spf_dmarc_note = await detective.check_missing_spf_dmarc(host)
+        if spf_dmarc_note is not None:
+            logger.info("detective: SPF/DMARC note: %s", spf_dmarc_note)
+
+        logger.info("detective: running origin IP WAF bypass check for %s", host)
+        origin_ip_result = await detective.check_origin_ip_waf_bypass(host)
+        if origin_ip_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, origin_ip_result)
+
+        logger.info("detective: running Prometheus metrics exposure check for %s", host)
+        prometheus_result = await detective.check_exposed_prometheus_metrics(host)
+        if prometheus_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, prometheus_result)
 
         # Batch 8 per-host check: prototype pollution via a JSON
         # __proto__ gadget POSTed to the host root. (The other three
@@ -1239,6 +1270,140 @@ async def _phase_scan(
     for res in websocket_downgrade_results:
         if isinstance(res, Exception):
             logger.debug("WebSocket downgrade check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # ---- Batches 15-17 (built together, 4 checks each) ----
+
+    # Detective check: excessive data exposure in API JSON. Recon-only.
+    excessive_exposure_candidates = sane_discovered_urls[:_EXCESSIVE_EXPOSURE_CHECK_CAP]
+    logger.info(
+        "detective: running excessive data exposure check against %d URL(s)",
+        len(excessive_exposure_candidates),
+    )
+    excessive_exposure_notes = await asyncio.gather(
+        *(detective.check_excessive_data_exposure_api(url) for url in excessive_exposure_candidates),
+        return_exceptions=True,
+    )
+    for res in excessive_exposure_notes:
+        if isinstance(res, Exception):
+            logger.debug("excessive data exposure check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: excessive data exposure note: %s", res)
+
+    # Detective check: API version downgrade bypass.
+    api_version_candidates = sane_discovered_urls[:_API_VERSION_DOWNGRADE_CHECK_CAP]
+    logger.info(
+        "detective: running API version downgrade check against %d URL(s)",
+        len(api_version_candidates),
+    )
+    api_version_results = await asyncio.gather(
+        *(detective.check_api_version_downgrade_bypass(url) for url in api_version_candidates),
+        return_exceptions=True,
+    )
+    for res in api_version_results:
+        if isinstance(res, Exception):
+            logger.debug("API version downgrade check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: boolean-based blind SQL injection.
+    sqli_boolean_candidates = [url for url in sane_discovered_urls if "=" in url][:_SQLI_BOOLEAN_CHECK_CAP]
+    logger.info(
+        "detective: running boolean-based SQLi check against %d candidate URL(s)",
+        len(sqli_boolean_candidates),
+    )
+    sqli_boolean_results = await asyncio.gather(
+        *(detective.check_sql_injection_boolean_based(url) for url in sqli_boolean_candidates),
+        return_exceptions=True,
+    )
+    for res in sqli_boolean_results:
+        if isinstance(res, Exception):
+            logger.debug("boolean-based SQLi check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: SVG upload flagging. Recon-only.
+    svg_upload_candidates = sane_discovered_urls[:_SVG_UPLOAD_CHECK_CAP]
+    logger.info(
+        "detective: running SVG upload flagging check against %d URL(s)", len(svg_upload_candidates)
+    )
+    svg_upload_notes = await asyncio.gather(
+        *(detective.check_insecure_svg_upload_flagging(url) for url in svg_upload_candidates),
+        return_exceptions=True,
+    )
+    for res in svg_upload_notes:
+        if isinstance(res, Exception):
+            logger.debug("SVG upload flagging check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: SVG upload note: %s", res)
+
+    # Detective check: JSONP callback XSS.
+    jsonp_xss_candidates = sane_discovered_urls[:_JSONP_XSS_CHECK_CAP]
+    logger.info(
+        "detective: running JSONP callback XSS check against %d URL(s)", len(jsonp_xss_candidates)
+    )
+    jsonp_xss_results = await asyncio.gather(
+        *(detective.check_jsonp_callback_xss(url) for url in jsonp_xss_candidates),
+        return_exceptions=True,
+    )
+    for res in jsonp_xss_results:
+        if isinstance(res, Exception):
+            logger.debug("JSONP callback XSS check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: backup/temp file disclosure.
+    backup_file_candidates = sane_discovered_urls[:_BACKUP_FILE_CHECK_CAP]
+    logger.info(
+        "detective: running backup/temp file check against %d URL(s)", len(backup_file_candidates)
+    )
+    backup_file_results = await asyncio.gather(
+        *(detective.check_backup_temp_file_disclosure(url) for url in backup_file_candidates),
+        return_exceptions=True,
+    )
+    for res in backup_file_results:
+        if isinstance(res, Exception):
+            logger.debug("backup/temp file check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: publicly-listable Azure Blob container.
+    azure_blob_candidates = sane_discovered_urls[:_AZURE_BLOB_CHECK_CAP]
+    logger.info(
+        "detective: running Azure blob exposure check against %d URL(s)", len(azure_blob_candidates)
+    )
+    azure_blob_results = await asyncio.gather(
+        *(detective.check_azure_blob_public_exposure(url) for url in azure_blob_candidates),
+        return_exceptions=True,
+    )
+    for res in azure_blob_results:
+        if isinstance(res, Exception):
+            logger.debug("Azure blob exposure check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: CORS subdomain-suffix bypass.
+    cors_subdomain_candidates = sane_discovered_urls[:_CORS_SUBDOMAIN_BYPASS_CHECK_CAP]
+    logger.info(
+        "detective: running CORS subdomain suffix bypass check against %d URL(s)",
+        len(cors_subdomain_candidates),
+    )
+    cors_subdomain_results = await asyncio.gather(
+        *(detective.check_cors_subdomain_suffix_bypass(url) for url in cors_subdomain_candidates),
+        return_exceptions=True,
+    )
+    for res in cors_subdomain_results:
+        if isinstance(res, Exception):
+            logger.debug("CORS subdomain suffix bypass check raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding(conn, project_id, target_id, res)
