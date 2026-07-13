@@ -177,7 +177,7 @@ async def mark_needs_attention(
 
 # Phases listed here so this module doesn't need to import pipeline.py
 # (which would create a circular import - pipeline.py imports checkpoint).
-_ALL_PHASES = ["recon", "probe", "fuzz", "scan", "notify"]
+_ALL_PHASES = ["recon", "probe", "fuzz", "scan", "triage", "notify"]
 
 
 async def mark_remaining_phases_skipped(

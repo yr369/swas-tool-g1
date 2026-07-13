@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS phase_runs (
     project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     target_id       INTEGER NOT NULL REFERENCES scope_targets(id) ON DELETE CASCADE,
     phase_name      TEXT NOT NULL
-                    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'notify')),
+                    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'triage', 'notify')),
     status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'needs_attention')),
     started_at      TIMESTAMPTZ,

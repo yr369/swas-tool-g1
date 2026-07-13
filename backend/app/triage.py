@@ -14,6 +14,7 @@ accuracy on the genuinely ambiguous cases.
 import json
 import logging
 import os
+import re
 
 from google import genai
 
@@ -28,13 +29,13 @@ _TRIAGE_PROMPT = """You are triaging a security finding from an automated \
 bug bounty scan. Assign a severity and a confidence score.
 
 Tool: {tool_name}
-Evidence (raw tool output, may contain multiple lines):
+{self_declared_context}Evidence (raw tool output, may contain multiple lines):
 ---
 {evidence}
 ---
 {outcome_context}{vrt_context}
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence", "vrt_category": "closest matching VRT category name or null"}}
+{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null"}}
 
 Guidance: missing security headers, generic fingerprinting (server/version
 detection), and DNS records are almost always "info". Known CVEs with
@@ -54,6 +55,26 @@ certificate/TLS data as reconnaissance (it can reveal org names,
 internal hostnames, or infrastructure) rather than as a reportable
 vulnerability in its own right - say so in "reasoning" rather than
 inventing a higher severity.
+
+Policy-exclusion check - do this BEFORE assigning severity: most bug
+bounty programs (Bugcrowd/HackerOne standard disclosure terms) treat
+the following as near-automatic "Informative" or "Out of Scope" UNLESS
+the evidence shows a concrete chained impact beyond the bare technique
+itself: denial-of-service / resource exhaustion / rate-limit-only
+findings, unauthenticated cache purge or cache-busting without
+demonstrated cache POISONING (poisoning another user's response is
+reportable; purging alone usually is not), self-XSS or XSS requiring
+the victim to paste something into their own console, clickjacking on
+a page with no sensitive state-changing action, missing rate limiting
+alone, open redirect with no further chained impact, verbose error
+messages/stack traces with no sensitive data, best-practice
+recommendations, and social-engineering-required scenarios. If the
+evidence matches one of these, set severity "info", confidence 0.85+,
+and say plainly in "reasoning" which excluded category it falls under
+and what additional evidence (if any) would change that. Do not let a
+technically-correct proof-of-concept override this - "it works" and
+"a program will pay for it" are different questions, and this field is
+answering the second one.
 
 If the evidence mentions or the target hostname suggests Adobe
 Experience Manager (AEM), note in "reasoning" that this is worth manual
@@ -109,8 +130,31 @@ def _parse_triage_response(text: str) -> dict:
     return json.loads(text)
 
 
+def _format_self_declared_context(self_declared_severity: str | None) -> str:
+    """
+    detective.py checks assign their own severity based on their own
+    confirmation logic at detection time. That self-assessment is
+    useful signal, not ground truth - a check's own confidence in its
+    match doesn't mean a program will pay for it. Feeding it in as
+    context (rather than trusting it directly) lets the model sanity
+    check, confirm, or downgrade it instead of it going straight into
+    the findings table unexamined.
+    """
+    if not self_declared_severity:
+        return ""
+    return (
+        f"The detection check itself self-assessed this as severity "
+        f"\"{self_declared_severity}\" based on its own confirmation logic. "
+        f"Treat that as one input, not the answer - independently verify "
+        f"against the evidence and policy-exclusion guidance below, and "
+        f"downgrade it if the self-assessment overstates real-world impact "
+        f"or falls into a commonly-excluded category.\n"
+    )
+
+
 async def triage_finding(
-    tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None
+    tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None,
+    self_declared_severity: str | None = None,
 ) -> dict:
     """
     Returns {"severity": str, "confidence": float, "reasoning": str,
@@ -131,6 +175,12 @@ async def triage_finding(
     category - grounding our generic severity scale in Bugcrowd's actual
     scoring language, not just our own words.
 
+    self_declared_severity (optional): the severity a detective.py check
+    assigned itself at detection time. Passed through as context (see
+    _format_self_declared_context) rather than trusted directly - this is
+    what makes detective.py findings go through the same independent
+    review as every other finding instead of skipping it.
+
     Tries the cheap model first. If its own reported confidence is below
     0.6, escalates ONE retry to the stronger model - this is the
     "spend more only on the hard cases" behavior, not a blanket upgrade.
@@ -140,11 +190,13 @@ async def triage_finding(
     # and avoids wasting tokens on truncated-anyway giant tool dumps.
     capped_evidence = evidence[:2000]
     outcome_context = _format_outcome_context(outcome_stats)
+    self_declared_context = _format_self_declared_context(self_declared_severity)
     from . import vrt as vrt_module  # local import avoids a circular import at module load time
     vrt_context = vrt_module.format_vrt_context(vrt_entries or [])
     prompt = _TRIAGE_PROMPT.format(
         tool_name=tool_name, evidence=capped_evidence,
         outcome_context=outcome_context, vrt_context=vrt_context,
+        self_declared_context=self_declared_context,
     )
 
     try:
@@ -179,3 +231,87 @@ async def triage_finding(
             return result
 
     return result
+
+
+# detective.py findings get saved with severity='unknown' (same as every
+# other finding) plus their own self-assessed severity embedded at the
+# front of the evidence text, in this format. See pipeline.py's
+# _save_detective_finding for the writer side.
+_SELF_DECLARED_PREFIX_RE = re.compile(r"^\[self-declared-severity: (\w+)\]\n")
+
+
+def _extract_self_declared_severity(evidence: str) -> tuple[str, str | None]:
+    """
+    Splits a detective.py finding's embedded self-assessment out of the
+    evidence text. Returns (evidence_without_prefix, self_declared_severity
+    or None). Findings from other tools never have this prefix, so this
+    is a no-op for them.
+    """
+    match = _SELF_DECLARED_PREFIX_RE.match(evidence)
+    if not match:
+        return evidence, None
+    return evidence[match.end():], match.group(1)
+
+
+async def fetch_signature_stats(conn, signature: str) -> dict | None:
+    """
+    Aggregated past-outcome history for one signature. Shared by every
+    caller of triage (the on-demand API endpoint and the automatic
+    post-scan phase) so they look up history the exact same way.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE outcome = 'accepted') AS accepted,
+            COUNT(*) FILTER (WHERE outcome = 'duplicate') AS duplicate,
+            COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected,
+            COUNT(*) FILTER (WHERE outcome = 'informative') AS informative,
+            COUNT(*) FILTER (WHERE outcome = 'not_applicable') AS not_applicable
+        FROM finding_outcomes
+        WHERE signature = $1
+        """,
+        signature,
+    )
+    return dict(row) if row and row["total"] else None
+
+
+async def triage_project_findings(conn, project_id: int) -> int:
+    """
+    Triages every 'unknown'-severity finding in a project, one at a
+    time, looking up past outcome history and stripping/passing through
+    any self-declared severity a detective.py check embedded. Shared by
+    the on-demand /triage-all endpoint AND the automatic "triage" phase
+    that now runs at the end of every scan (see pipeline.py) - so
+    detective.py findings get the same independent AI review tool
+    findings always got, without you needing to remember to click
+    anything. Returns the number of findings triaged.
+    """
+    from . import vrt as vrt_module
+
+    rows = await conn.fetch(
+        "SELECT id, tool_name, vuln_type, evidence FROM findings WHERE project_id = $1 AND severity = 'unknown'",
+        project_id,
+    )
+
+    vrt_entries = await vrt_module.get_vrt_entries()  # fetched once, reused for every finding in this batch
+    triaged = 0
+    for row in rows:
+        signature = build_signature(row["tool_name"], row["vuln_type"])
+        outcome_stats = await fetch_signature_stats(conn, signature)
+        clean_evidence, self_declared_severity = _extract_self_declared_severity(row["evidence"] or "")
+
+        result = await triage_finding(
+            row["tool_name"], clean_evidence,
+            outcome_stats=outcome_stats, vrt_entries=vrt_entries,
+            self_declared_severity=self_declared_severity,
+        )
+        await conn.execute(
+            "UPDATE findings SET severity = $1 WHERE id = $2",
+            result["severity"] if result["severity"] in
+            ("critical", "high", "medium", "low", "info") else "unknown",
+            row["id"],
+        )
+        triaged += 1
+
+    return triaged

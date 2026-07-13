@@ -1,13 +1,15 @@
 /**
  * PipelineTracker.jsx - the signature visual of the whole app.
  *
- * Shows the 5-phase pipeline (recon -> probe -> fuzz -> scan -> notify)
- * as connected stages. Each stage's color reflects its real status from
- * the backend's phase_runs table - this isn't decorative, it's a direct
- * readout of the checkpoint table we built and tested earlier.
+ * Shows the 6-phase pipeline (recon -> probe -> fuzz -> scan -> triage
+ * -> notify) as connected stages. Each stage's color reflects its real
+ * status from the backend's phase_runs table - this isn't decorative,
+ * it's a direct readout of the checkpoint table we built and tested
+ * earlier. "triage" was added so findings from detective.py get a
+ * visible, trackable AI-review step instead of silently skipping it.
  */
 
-const PHASES = ["recon", "probe", "fuzz", "scan", "notify"];
+const PHASES = ["recon", "probe", "fuzz", "scan", "triage", "notify"];
 
 function statusForPhase(phaseRuns, phaseName) {
   // A phase can have multiple historical runs (e.g. re-scanned later).

@@ -800,31 +800,17 @@ async def _fetch_signature_stats(conn, signature: str) -> dict | None:
 
 @app.post("/api/projects/{project_id}/triage-all")
 async def triage_all_findings(project_id: int):
-    """Triages every 'unknown'-severity finding in a project, one at a time,
-    looking up past outcome history per signature before each call."""
+    """
+    Triages every 'unknown'-severity finding in a project. Now also runs
+    automatically at the end of every scan (pipeline.py's "triage"
+    phase) - this endpoint stays for re-running on demand, e.g. after
+    tuning triage.py's prompt or after outcome history has changed.
+    Both share the exact same logic via triage.triage_project_findings,
+    so they can never drift out of sync.
+    """
     pool = database.get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, tool_name, vuln_type, evidence FROM findings WHERE project_id = $1 AND severity = 'unknown'",
-            project_id,
-        )
-
-        triaged = 0
-        vrt_entries = await vrt.get_vrt_entries()  # fetched once, reused for every finding in this batch
-        for row in rows:
-            signature = triage.build_signature(row["tool_name"], row["vuln_type"])
-            outcome_stats = await _fetch_signature_stats(conn, signature)
-            result = await triage.triage_finding(
-                row["tool_name"], row["evidence"] or "",
-                outcome_stats=outcome_stats, vrt_entries=vrt_entries,
-            )
-            await conn.execute(
-                "UPDATE findings SET severity = $1 WHERE id = $2",
-                result["severity"] if result["severity"] in
-                ("critical", "high", "medium", "low", "info") else "unknown",
-                row["id"],
-            )
-            triaged += 1
+        triaged = await triage.triage_project_findings(conn, project_id)
 
     return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
 

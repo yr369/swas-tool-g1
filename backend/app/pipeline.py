@@ -1,8 +1,8 @@
 """
 pipeline.py - the orchestrator. This is what actually runs a scan: it
-takes a target, runs it through the 5 phases in order (recon, probe,
-fuzz, scan, notify), using checkpoint.py to track progress safely and
-tools.py to do the real work.
+takes a target, runs it through the 6 phases in order (recon, probe,
+fuzz, scan, triage, notify), using checkpoint.py to track progress
+safely and tools.py to do the real work.
 
 Plain-language explanation: think of this as the project manager. It
 doesn't do the scanning itself (tools.py does that) and it doesn't do
@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, tools
+from . import checkpoint, detective, fp_filter, tools, triage
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -94,14 +94,14 @@ _PW_RESET_ENUM_CHECK_CAP = 10
 
 logger = logging.getLogger("swas.pipeline")
 
-PHASES = ["recon", "probe", "fuzz", "scan", "notify"]
+PHASES = ["recon", "probe", "fuzz", "scan", "triage", "notify"]
 
 
 async def run_target_pipeline(
     pool: asyncpg.Pool, project_id: int, target_id: int, target: str
 ) -> None:
     """
-    Runs all 5 phases, in order, for a single target. This function is
+    Runs all 6 phases, in order, for a single target. This function is
     meant to be run concurrently for multiple targets at once (the
     caller decides how many targets run in parallel) - everything in
     here is async and non-blocking.
@@ -259,6 +259,9 @@ async def _execute_phase(
 
     elif phase_name == "scan":
         await _phase_scan(conn, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
+
+    elif phase_name == "triage":
+        await _phase_triage(conn, project_id)
 
     elif phase_name == "notify":
         await _phase_notify(target)
@@ -2068,28 +2071,67 @@ async def _save_detective_finding(
 ) -> None:
     """
     Saves a finding produced by detective.py's checks (subdomain takeover,
-    CORS misconfig, cache deception, entropy). Unlike _save_finding /
-    _save_nuclei_findings, these don't go through fp_filter or get
-    stored as 'unknown' severity - each detective check already did its
-    own confirmation logic before returning a result at all, and already
-    knows its own severity/vuln_type, so there's nothing left to filter
-    or triage.
+    CORS misconfig, cache deception, entropy, and 100+ others).
+
+    IMPORTANT - this used to trust each check's own self-declared
+    severity as final and skip triage entirely ("each detective check
+    already did its own confirmation logic ... nothing left to filter
+    or triage"). That was the actual reason detective.py findings were
+    noisy: a check's own confirmation logic can still be a single-signal
+    heuristic, and a self-graded "critical" never got a second,
+    independent look the way every other tool's findings do.
+
+    Now these are stored the same way tool/nuclei findings are:
+    severity='unknown', so the automatic post-scan "triage" phase (and
+    the on-demand /triage-all endpoint) picks them up and runs them
+    through triage.triage_finding() - independent AI review, VRT
+    mapping, and the policy-exclusion guidance baked into triage.py's
+    prompt. The check's own severity verdict isn't thrown away, just
+    demoted from "final answer" to "input": it's embedded at the front
+    of the evidence text and triage.py strips it back out to feed the
+    model as context (see triage._extract_self_declared_severity).
     """
+    self_declared_prefix = f"[self-declared-severity: {result['severity']}]\n"
     await conn.execute(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
-        VALUES ($1, $2, 'detective', $3, $4, $5)
+        VALUES ($1, $2, 'detective', $3, 'unknown', $4)
         """,
         project_id,
         target_id,
         result["vuln_type"],
-        result["severity"],
-        result["evidence"][:5000],
+        (self_declared_prefix + result["evidence"])[:5000],
     )
     logger.info(
-        "detective: saved %s finding (severity=%s) for target_id=%s",
+        "detective: saved %s finding (self-declared severity=%s, pending triage) for target_id=%s",
         result["vuln_type"], result["severity"], target_id,
     )
+
+
+async def _phase_triage(conn: asyncpg.Connection, project_id: int) -> None:
+    """
+    Runs AI triage on every 'unknown'-severity finding in this project -
+    this now includes detective.py findings (see _save_detective_finding),
+    which used to skip triage entirely. Kept as its own phase, after
+    scan and before notify, so:
+
+    - it's checkpointed/retried the same as every other phase (a triage
+      failure doesn't silently lose findings, it retries once then
+      marks needs_attention like anything else)
+    - it runs automatically at the end of every scan, so findings get
+      an independent AI look without you needing to remember to call
+      /triage-all yourself
+    - it's idempotent to re-run: it only ever processes rows still
+      marked 'unknown', so if multiple targets in the same project
+      finish around the same time this just triages whatever's new
+      each time, nothing gets triaged twice
+
+    Failures inside triage_finding() itself are already caught per-
+    finding (falls back to severity='unknown' with a logged reason,
+    see triage.py) so one bad finding can't take down the whole batch.
+    """
+    triaged = await triage.triage_project_findings(conn, project_id)
+    logger.info("triage: reviewed %s finding(s) for project_id=%s", triaged, project_id)
 
 
 async def _phase_notify(target: str) -> None:
