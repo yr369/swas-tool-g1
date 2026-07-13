@@ -277,6 +277,30 @@ Batches 23-28 (built together, 4 checks each, 24 total):
       (encrypted, medium not critical) / 121 Helm values.yaml /
       122 serverless.yml
 
+Batches 29-33 (built together, 4 checks each, 20 total):
+  29: introduces a real binary-protocol handshake (PostgreSQL v3
+      startup packet + AuthenticationOk parsing), the most involved
+      non-HTTP check in this module. 123 exposed Docker daemon API /
+      124 Postgres trust auth (raw TCP) / 125 exposed InfluxDB /
+      126 exposed Kibana
+  30: proactive (not discovery-dependent) file probes. 127 backup
+      archive (real magic-byte check) / 128 SQL dump file / 129
+      server log file / 130 .htpasswd
+  31: 131 OAuth missing state param (recon) / 132 Basic Auth over
+      plaintext HTTP / 133 weak TLS protocol (TLSv1.0, raw ssl
+      handshake) / 134 cookie missing Secure over HTTPS (recon)
+  32: 135 Firebase Realtime DB open read rules / 136-138 cloud
+      metadata SSRF for GCP/Azure/DigitalOcean specifically - these
+      evade the generic AWS-shaped check_ssrf_reflected because GCP/
+      Azure require a specific header the generic probe doesn't send,
+      and DigitalOcean uses a distinct path a signature-based WAF
+      rule targeting the AWS path wouldn't catch
+  33: three more deterministic bypass-header checks (4th technique
+      alongside method-override/verb-tampering/host-header) plus two
+      recon checks. 139 XFF IP-restriction bypass / 140 Referer-based
+      access control bypass / 141 API key in URL query param (recon)
+      / 142 password-reset user-enumeration candidate (recon)
+
 Every function here is read-only / non-destructive - no writes, no
 exploitation, just detection. Each returns None when nothing is found, or
 a dict describing the finding when something is. Callers (pipeline.py)
@@ -294,6 +318,7 @@ import os
 import random
 import re
 import ssl
+import struct
 import time
 import uuid
 from collections import Counter
@@ -6663,4 +6688,892 @@ async def check_serverless_yml_exposure(host: str) -> dict | None:
                 f"naming conventions, occasionally inline environment secrets."
             ),
         }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 123. Exposed Docker daemon API (unencrypted, no TLS)
+# ---------------------------------------------------------------------
+async def check_exposed_docker_daemon_api(host: str) -> dict | None:
+    """
+    Checks port 2375 (the Docker daemon's plain-HTTP API port, meant to
+    only ever be bound to localhost or behind TLS on 2376) for a valid
+    Docker API /version response. Distinct from check_exposed_container_api
+    (batch 1), which targets generic container-orchestration API
+    surfaces - this specifically confirms the raw Docker socket-over-TCP
+    is reachable, which is full host compromise (create a privileged
+    container with the host filesystem mounted) if truly unauthenticated.
+    """
+    hostname = httpx.URL(host).host
+    if not hostname:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            try:
+                resp = await client.get(f"http://{hostname}:2375/version")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Docker daemon API check failed for %s: %s", host, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if resp.status_code == 200 and isinstance(data, dict) and "ApiVersion" in data:
+        return {
+            "vuln_type": "exposed_docker_daemon_api",
+            "severity": "critical",
+            "evidence": (
+                f"{hostname}:2375/version returned a valid Docker API response "
+                f"(ApiVersion {data.get('ApiVersion')!r}) with no TLS/authentication - "
+                f"full host compromise via creating a privileged container with the host "
+                f"filesystem mounted (not attempted here - detection only)."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 124. Exposed PostgreSQL with trust authentication (raw wire protocol)
+# ---------------------------------------------------------------------
+def _build_pg_startup_packet(user: str = "postgres", database: str = "postgres") -> bytes:
+    params = f"user\x00{user}\x00database\x00{database}\x00\x00".encode()
+    return struct.pack("!I", len(params) + 8) + struct.pack("!I", 196608) + params
+
+
+async def check_exposed_postgres_trust_auth(host: str) -> dict | None:
+    """
+    Sends a real PostgreSQL v3 protocol startup packet on port 5432 and
+    parses the server's authentication-request response. Byte 0 == 'R'
+    (AuthenticationRequest) with the following 4-byte auth-type code
+    equal to 0 means AuthenticationOk was sent immediately - the server
+    is configured for "trust" authentication and will let this
+    connection through with NO password at all. Any other auth-type
+    code (3=cleartext, 5=md5, 10=SASL, etc.) means a password IS
+    required, which is correctly NOT flagged. This is the second non-
+    HTTP check in this module after batch 24's Redis/Memcached/FTP
+    probes, and the most involved: it constructs and parses a real
+    binary protocol message rather than just matching a fixed reply.
+    """
+    hostname = httpx.URL(host).host
+    if not hostname:
+        return None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(hostname, 5432), timeout=4.0
+        )
+    except Exception:
+        return None
+    try:
+        writer.write(_build_pg_startup_packet())
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(64), timeout=4.0)
+    except Exception:
+        return None
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    if len(response) >= 9 and response[0:1] == b"R":
+        auth_type = struct.unpack("!I", response[5:9])[0]
+        if auth_type == 0:
+            return {
+                "vuln_type": "exposed_postgres_trust_auth",
+                "severity": "critical",
+                "evidence": (
+                    f"{hostname}:5432 accepted a PostgreSQL startup packet and immediately "
+                    f"sent AuthenticationOk (auth-type 0) with no password requested at all - "
+                    f"the server is configured for 'trust' authentication, granting direct "
+                    f"database access to anyone who can reach the port."
+                ),
+            }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 125. Exposed InfluxDB with no authentication
+# ---------------------------------------------------------------------
+async def check_exposed_influxdb_no_auth(host: str) -> dict | None:
+    """
+    Checks InfluxDB's HTTP API /query endpoint for the classic
+    unauthenticated-by-default configuration (common on older/
+    misconfigured installs). Proof requires a successful SHOW DATABASES
+    query returning real results, not just a reachable port.
+    """
+    hostname = httpx.URL(host).host
+    if not hostname:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            try:
+                resp = await client.get(
+                    f"http://{hostname}:8086/query", params={"q": "SHOW DATABASES"}
+                )
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: InfluxDB check failed for %s: %s", host, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if resp.status_code == 200 and isinstance(data, dict) and "results" in data:
+        return {
+            "vuln_type": "exposed_influxdb_no_auth",
+            "severity": "high",
+            "evidence": (
+                f"{hostname}:8086/query executed 'SHOW DATABASES' without authentication and "
+                f"returned real results - InfluxDB is reachable with no auth required."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 126. Exposed Kibana instance
+# ---------------------------------------------------------------------
+async def check_exposed_kibana_no_auth(host: str) -> dict | None:
+    """
+    Complements check_elasticsearch_exposure (batch 1) with Kibana, the
+    companion visualization/dashboard UI. Checks /api/status for
+    Kibana's distinctive JSON response structure without authentication
+    - if reachable, every index/dashboard Kibana is configured to show
+    is browsable, and Kibana's own console feature can sometimes be
+    used to issue arbitrary queries against the underlying Elasticsearch
+    cluster.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/api/status")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Kibana check failed for %s: %s", host, exc)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+    if resp.status_code == 200 and isinstance(data, dict) and "version" in data and "status" in data:
+        return {
+            "vuln_type": "exposed_kibana_no_auth",
+            "severity": "medium",
+            "evidence": (
+                f"{base}/api/status returned Kibana status info without authentication - "
+                f"every index/dashboard Kibana is configured to show is potentially "
+                f"browsable, and its console feature can sometimes query the underlying "
+                f"Elasticsearch cluster directly."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 127. Exposed backup archive at a predictable filename
+# ---------------------------------------------------------------------
+_BACKUP_ARCHIVE_PATHS = ["/backup.zip", "/backup.tar.gz", "/site-backup.zip", "/www-backup.zip"]
+_ZIP_MAGIC = b"PK\x03\x04"
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+async def check_backup_archive_exposure(host: str) -> dict | None:
+    """
+    Proactively probes a short list of predictable backup-archive
+    filenames at the web root (distinct from check_backup_temp_file_
+    disclosure, batch 16, which only appends suffixes to already-
+    discovered URLs). Proof is the real archive file-format magic
+    bytes (ZIP's PK\\x03\\x04 or gzip's \\x1f\\x8b header) at the start
+    of the response body, not just a 200 status.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in _BACKUP_ARCHIVE_PATHS:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                content = resp.content[:8]
+                if content.startswith(_ZIP_MAGIC) or content.startswith(_GZIP_MAGIC):
+                    return {
+                        "vuln_type": "exposed_backup_archive",
+                        "severity": "high",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and its content starts "
+                            f"with a real archive-format magic byte sequence - a genuine "
+                            f"site backup archive, not an unrelated 200 response, is "
+                            f"downloadable."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: backup archive check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 128. Exposed SQL database dump file
+# ---------------------------------------------------------------------
+_SQL_DUMP_PATHS = ["/database.sql", "/dump.sql", "/backup.sql", "/db.sql", "/db_backup.sql"]
+_SQL_DUMP_MARKERS = ["-- MySQL dump", "PostgreSQL database dump", "CREATE TABLE", "INSERT INTO"]
+
+
+async def check_sql_dump_file_exposure(host: str) -> dict | None:
+    """
+    Proactively probes predictable SQL-dump filenames. Proof requires
+    at least two independent SQL-dump-shaped markers together (a dump
+    header comment AND a real CREATE TABLE/INSERT INTO statement),
+    which essentially never happens outside an actual database export.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in _SQL_DUMP_PATHS:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.text[:5000]
+                matches = [m for m in _SQL_DUMP_MARKERS if m in body]
+                if len(matches) >= 2:
+                    return {
+                        "vuln_type": "exposed_sql_dump_file",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and is a real SQL database "
+                            f"dump (matched {matches}) - full database contents disclosed."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: SQL dump exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 129. Exposed web server access/error log
+# ---------------------------------------------------------------------
+_LOG_FILE_PATHS = ["/access.log", "/error.log", "/logs/access.log", "/debug.log"]
+_ACCESS_LOG_LINE_RE = re.compile(r'^\S+ \S+ \S+ \[[^\]]+\] "[A-Z]+ \S+ HTTP/[\d.]+" \d{3} \d+')
+
+
+async def check_log_file_exposure(host: str) -> dict | None:
+    """
+    Proactively probes predictable web-server log filenames. Proof
+    requires at least one line matching the standard Combined/Common
+    Log Format structure exactly (IP - - [timestamp] "METHOD path
+    HTTP/x.x" status size) - a very specific, low-collision pattern
+    that random text won't produce. Exposed logs disclose internal
+    paths, client IPs, and sometimes session tokens that were logged
+    as part of a URL.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in _LOG_FILE_PATHS:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body = resp.text[:5000]
+                if _ACCESS_LOG_LINE_RE.search(body):
+                    return {
+                        "vuln_type": "exposed_server_log_file",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{base}{path} is publicly accessible and contains real access-"
+                            f"log-formatted entries - internal paths, client IPs, and "
+                            f"potentially session tokens logged in URLs are disclosed."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: log file exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 130. Exposed .htpasswd file
+# ---------------------------------------------------------------------
+_HTPASSWD_LINE_RE = re.compile(r"^[\w.\-]+:(\$apr1\$|\$2y\$|\{SHA\})")
+
+
+async def check_htpasswd_exposure(host: str) -> dict | None:
+    """
+    Checks for a publicly-accessible .htpasswd file (Apache Basic-Auth
+    credential store). Proof requires a line matching the real
+    username:hash format for one of the standard htpasswd hash types
+    (apr1 MD5, bcrypt, or SHA) - offline-crackable credentials for
+    whatever Basic-Auth-protected area this file backs.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(base + "/.htpasswd")
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: .htpasswd exposure check failed for %s: %s", host, exc)
+        return None
+
+    if resp.status_code != 200:
+        return None
+    body = resp.text[:2000]
+    if _HTPASSWD_LINE_RE.search(body):
+        return {
+            "vuln_type": "exposed_htpasswd_file",
+            "severity": "high",
+            "evidence": (
+                f"{base}/.htpasswd is publicly accessible and contains real username:hash "
+                f"credential entries - offline-crackable credentials for whatever Basic-Auth-"
+                f"protected area this file backs."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 131. OAuth authorize URL missing state parameter (recon-only)
+# ---------------------------------------------------------------------
+async def check_oauth_missing_state_parameter(url: str) -> str | None:
+    """
+    Flags an OAuth/authorize-shaped URL (path contains "authorize" or
+    "oauth") whose query string has a response_type parameter but no
+    state parameter. Returns a plain string, NOT a findings dict - the
+    state parameter is the standard CSRF defense for the OAuth
+    authorization-code flow; its absence is a real gap, but confirming
+    actual exploitability needs completing a full OAuth flow with real
+    client credentials, which this scanner doesn't have.
+    """
+    parsed = httpx.URL(url)
+    path_lower = str(parsed.path).lower()
+    if "authorize" not in path_lower and "oauth" not in path_lower:
+        return None
+    params = dict(parsed.params)
+    if "response_type" in params and "state" not in params:
+        return (
+            f"{url}: OAuth authorize-shaped URL has response_type but no state parameter - "
+            f"candidate for OAuth CSRF testing; confirming real impact needs completing a "
+            f"full flow with real client credentials, which this scanner doesn't have"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 132. HTTP Basic Authentication sent over plaintext HTTP
+# ---------------------------------------------------------------------
+async def check_basic_auth_over_http(url: str) -> dict | None:
+    """
+    Checks whether a plain http:// (not https://) URL responds with a
+    WWW-Authenticate: Basic challenge. Basic Auth credentials are only
+    base64-encoded, not encrypted - sending that challenge (and
+    therefore expecting credentials back) over unencrypted HTTP means
+    any network observer between the client and server can trivially
+    recover the plaintext username/password.
+    """
+    if not url.lower().startswith("http://"):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: Basic Auth over HTTP check failed for %s: %s", url, exc)
+        return None
+
+    www_auth = resp.headers.get("www-authenticate", "")
+    if resp.status_code == 401 and "basic" in www_auth.lower():
+        return {
+            "vuln_type": "basic_auth_over_plaintext_http",
+            "severity": "high",
+            "evidence": (
+                f"{url}: server issued a WWW-Authenticate: Basic challenge over plain HTTP "
+                f"(not HTTPS) - Basic Auth credentials are only base64-encoded, not "
+                f"encrypted, so any network observer can trivially recover the plaintext "
+                f"username/password."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 133. Weak/deprecated TLS protocol version accepted
+# ---------------------------------------------------------------------
+async def check_insecure_tls_weak_protocol(host: str) -> dict | None:
+    """
+    Attempts a raw TLS handshake explicitly forcing TLSv1.0 (deprecated
+    since 2021, vulnerable to BEAST and other downgrade-family attacks).
+    If the handshake actually completes, the server still accepts a
+    protocol version modern clients refuse to negotiate by default -
+    real, deterministic (either the handshake completes or it doesn't,
+    no substring matching involved).
+    """
+    hostname = httpx.URL(host).host
+    if not hostname or not host.lower().startswith("https://"):
+        return None
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+        ctx.maximum_version = ssl.TLSVersion.TLSv1
+    except (ValueError, AttributeError):
+        return None  # this Python/OpenSSL build doesn't support enabling TLSv1 at all
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(hostname, 443, ssl=ctx), timeout=5.0
+        )
+    except Exception:
+        return None
+    negotiated = None
+    try:
+        ssl_obj = writer.get_extra_info("ssl_object")
+        if ssl_obj is not None:
+            negotiated = ssl_obj.version()
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    if negotiated == "TLSv1":
+        return {
+            "vuln_type": "insecure_tls_weak_protocol_accepted",
+            "severity": "medium",
+            "evidence": (
+                f"{hostname}:443 completed a TLS handshake when the client offered ONLY "
+                f"TLSv1.0 (deprecated since 2021, vulnerable to BEAST-family downgrade "
+                f"attacks) - modern clients won't negotiate this by default, but the "
+                f"server still accepts it from any client that does."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 134. Cookie missing Secure flag on an HTTPS response (recon-only)
+# ---------------------------------------------------------------------
+async def check_cookie_missing_secure_flag(url: str) -> str | None:
+    """
+    Flags cookies set over HTTPS without the Secure attribute, meaning
+    the same cookie could be sent over a future plain-HTTP connection to
+    the same host if one ever occurs (redirect chains, mixed subdomains,
+    a user manually typing http://). Returns a plain string, NOT a
+    findings dict - same "commonly Informative alone" treatment as
+    check_insecure_cookie_without_samesite; real impact depends on
+    whether an actual HTTP-accessible path to the same host exists.
+    """
+    if not url.lower().startswith("https://"):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: cookie Secure flag check failed for %s: %s", url, exc)
+        return None
+
+    set_cookie_headers = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else []
+    for raw_cookie in set_cookie_headers:
+        cookie_name = raw_cookie.split("=", 1)[0].strip()
+        if _SESSION_COOKIE_NAME_RE.search(cookie_name) and "secure" not in raw_cookie.lower():
+            return (
+                f"{url}: cookie '{cookie_name}' (session/auth-shaped name) set over HTTPS "
+                f"without the Secure attribute - could be sent over a future plain-HTTP "
+                f"connection to the same host if one ever exists; real impact depends on "
+                f"whether an HTTP-accessible path actually exists"
+            )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 135. Firebase Realtime Database open read rules
+# ---------------------------------------------------------------------
+_FIREBASE_PROJECT_RE = re.compile(r"([a-z0-9-]+)\.firebaseio\.com", re.IGNORECASE)
+
+
+async def check_firebase_realtime_db_open_rules(url: str) -> dict | None:
+    """
+    Complements check_firebase_exposure (batch 1, which likely checks
+    for exposed Firebase config in JS) with a direct test of whether
+    the Realtime Database's security rules allow public read: extracts
+    a project name from any firebaseio.com reference on the page, then
+    requests https://PROJECT.firebaseio.com/.json directly. A JSON
+    response containing real data (not null, not a permission-denied
+    error) proves open read rules.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                return None
+            body = resp.text
+
+            match = _FIREBASE_PROJECT_RE.search(body)
+            if not match:
+                return None
+            project = match.group(1)
+            db_url = f"https://{project}.firebaseio.com/.json"
+            try:
+                db_resp = await client.get(db_url)
+            except httpx.HTTPError:
+                return None
+            try:
+                data = db_resp.json()
+            except Exception:
+                return None
+            if db_resp.status_code == 200 and data is not None and not (
+                isinstance(data, dict) and "error" in data
+            ):
+                return {
+                    "vuln_type": "firebase_realtime_db_open_read",
+                    "severity": "high",
+                    "evidence": (
+                        f"{db_url} (project referenced on {url}) returned real, non-null "
+                        f"data with no error - the Realtime Database's security rules allow "
+                        f"public read access to the entire database."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Firebase RTDB check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 136. SSRF targeting GCP metadata (header-gated, evades AWS-style probes)
+# ---------------------------------------------------------------------
+async def check_ssrf_gcp_metadata(url: str) -> dict | None:
+    """
+    GCP's instance metadata endpoint requires a "Metadata-Flavor:
+    Google" header on the REQUEST TO THE METADATA SERVER ITSELF - an
+    app whose outbound SSRF-vulnerable fetch always sends that header
+    (some HTTP client wrappers do, or a metadata-fetching helper
+    function might) would be exploitable via GCP's path even though
+    check_ssrf_reflected's generic AWS-style probes (which target
+    169.254.169.254/latest/meta-data/ without that header) would miss
+    it entirely. Baseline-diffed, same discipline as the fixed
+    check_ssrf_reflected.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_body = baseline_resp.text[:3000]
+            except httpx.HTTPError:
+                return None
+
+            for param_name in _SSRF_PARAM_NAMES:
+                if param_name not in existing_params:
+                    continue
+                test_params = dict(existing_params)
+                test_params[param_name] = "http://169.254.169.254/computeMetadata/v1/instance/hostname"
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                body = resp.text[:3000]
+                if re.search(r"\.c\.[\w-]+\.internal", body) and body not in baseline_body:
+                    return {
+                        "vuln_type": "ssrf_gcp_metadata",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{test_url}: server-side fetch of parameter '{param_name}' "
+                            f"pointed at the GCP metadata endpoint returned what looks like a "
+                            f"GCE internal hostname (absent from baseline) - SSRF reaching "
+                            f"GCP instance metadata, potentially including service account "
+                            f"tokens via a follow-up path."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: GCP metadata SSRF check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 137. SSRF targeting Azure IMDS (header-gated)
+# ---------------------------------------------------------------------
+async def check_ssrf_azure_metadata(url: str) -> dict | None:
+    """
+    Azure's Instance Metadata Service similarly requires a "Metadata:
+    true" header and a specific versioned path
+    (/metadata/instance?api-version=...) - same reasoning as
+    check_ssrf_gcp_metadata, this evades generic AWS-style probes.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_body = baseline_resp.text[:3000]
+            except httpx.HTTPError:
+                return None
+
+            for param_name in _SSRF_PARAM_NAMES:
+                if param_name not in existing_params:
+                    continue
+                test_params = dict(existing_params)
+                test_params[param_name] = (
+                    "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+                )
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                body = resp.text[:3000]
+                if '"compute"' in body and '"compute"' not in baseline_body:
+                    return {
+                        "vuln_type": "ssrf_azure_metadata",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{test_url}: server-side fetch of parameter '{param_name}' "
+                            f"pointed at Azure's IMDS endpoint returned a response containing "
+                            f'\'"compute"\' (absent from baseline) - SSRF reaching Azure '
+                            f"instance metadata."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Azure metadata SSRF check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 138. SSRF targeting DigitalOcean metadata (distinct path, no header gate)
+# ---------------------------------------------------------------------
+async def check_ssrf_digitalocean_metadata(url: str) -> dict | None:
+    """
+    DigitalOcean's metadata endpoint needs no special header, but uses
+    a distinct path (/metadata/v1.json) from the AWS-style
+    /latest/meta-data/ path check_ssrf_reflected already probes - a
+    signature-based WAF rule blocking the AWS-shaped path specifically
+    wouldn't catch this variant.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_body = baseline_resp.text[:3000]
+            except httpx.HTTPError:
+                return None
+
+            for param_name in _SSRF_PARAM_NAMES:
+                if param_name not in existing_params:
+                    continue
+                test_params = dict(existing_params)
+                test_params[param_name] = "http://169.254.169.254/metadata/v1.json"
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                body = resp.text[:3000]
+                if '"droplet_id"' in body and '"droplet_id"' not in baseline_body:
+                    return {
+                        "vuln_type": "ssrf_digitalocean_metadata",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{test_url}: server-side fetch of parameter '{param_name}' "
+                            f'pointed at DigitalOcean\'s metadata endpoint returned '
+                            f'\'"droplet_id"\' (absent from baseline) - SSRF reaching '
+                            f"DigitalOcean instance metadata."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: DigitalOcean metadata SSRF check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 139. Access-control bypass via spoofed X-Forwarded-For
+# ---------------------------------------------------------------------
+_TRUSTED_LOOKING_IPS = ["127.0.0.1", "10.0.0.1", "192.168.1.1", "::1"]
+
+
+async def check_ip_restriction_bypass_via_xff(url: str) -> dict | None:
+    """
+    Third distinct bypass-header technique alongside check_auth_bypass_
+    via_method_override (batch 11) and check_auth_bypass_via_verb_
+    tampering (batch 13), this time for IP-based access restrictions
+    specifically: some apps/proxies trust X-Forwarded-For blindly for
+    "internal only" or "localhost only" checks. Same deterministic
+    status-code-transition proof - a clean 401/403 baseline, then a
+    real 200 with substantial content after spoofing a trusted-looking
+    source IP.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                baseline_resp = await client.get(url)
+            except httpx.HTTPError:
+                return None
+            if baseline_resp.status_code not in (401, 403):
+                return None
+
+            for fake_ip in _TRUSTED_LOOKING_IPS:
+                try:
+                    resp = await client.get(url, headers={"X-Forwarded-For": fake_ip})
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                    return {
+                        "vuln_type": "ip_restriction_bypass_via_xff",
+                        "severity": "high",
+                        "evidence": (
+                            f"{url}: plain request returned {baseline_resp.status_code} "
+                            f"(blocked), but X-Forwarded-For: {fake_ip} returned 200 with a "
+                            f"{len(resp.text)}-byte body - an IP-based access restriction is "
+                            f"trusting a client-supplied header instead of the real "
+                            f"connection source."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: XFF IP restriction bypass check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 140. Access-control bypass via spoofed/omitted Referer
+# ---------------------------------------------------------------------
+async def check_referer_based_access_control_bypass(url: str) -> dict | None:
+    """
+    Fourth bypass-header variant: some apps use Referer presence/value
+    as a weak access-control signal (e.g., only allow a page if it was
+    reached by clicking through from another internal page). Tests
+    whether supplying a same-origin-looking Referer bypasses a block
+    that occurs with no Referer at all. Same deterministic status-code
+    proof bar as the other three bypass checks.
+    """
+    domain = httpx.URL(url).host
+    if not domain:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                baseline_resp = await client.get(url, headers={"Referer": ""})
+            except httpx.HTTPError:
+                return None
+            if baseline_resp.status_code not in (401, 403):
+                return None
+
+            try:
+                resp = await client.get(url, headers={"Referer": f"https://{domain}/"})
+            except httpx.HTTPError:
+                return None
+            if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                return {
+                    "vuln_type": "referer_based_access_control_bypass",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{url}: request with no Referer returned {baseline_resp.status_code} "
+                        f"(blocked), but adding Referer: https://{domain}/ (trivially "
+                        f"spoofable) returned 200 with a {len(resp.text)}-byte body - access "
+                        f"control is keyed off a client-controlled header."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: Referer-based access control bypass check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 141. API key/token transmitted as a URL query parameter (recon-only)
+# ---------------------------------------------------------------------
+_URL_APIKEY_PARAM_RE = re.compile(r"^(api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret)$", re.IGNORECASE)
+
+
+async def check_api_key_in_url_query_param(url: str) -> str | None:
+    """
+    Flags an API key/token-shaped parameter name carried in the URL
+    query string. Returns a plain string, NOT a findings dict - distinct
+    from check_api_key_leak_signature (batch 8, which matches specific
+    key FORMATS anywhere in a response body): this flags the
+    TRANSMISSION PATTERN itself (any key-shaped param name in a URL,
+    regardless of its format), which risks leaking via browser history,
+    server access logs, and the Referer header on any outbound link.
+    """
+    parsed = httpx.URL(url)
+    for param_name in parsed.params:
+        if _URL_APIKEY_PARAM_RE.match(param_name):
+            return (
+                f"{url}: parameter '{param_name}' (API key/token-shaped name) is carried in "
+                f"the URL query string - risks leaking via browser history, server access "
+                f"logs, and the Referer header on any outbound link from this page"
+            )
+    return None
+
+
+# ---------------------------------------------------------------------
+# 142. Password-reset endpoint user-enumeration candidate (recon-only)
+# ---------------------------------------------------------------------
+async def check_password_reset_user_enumeration_candidate(url: str) -> str | None:
+    """
+    Submits two different-looking email addresses to a forgot-password-
+    shaped endpoint and compares response length/status. Returns a
+    plain string, NOT a findings dict - a length/status difference is a
+    real user-enumeration candidate, but this scanner has no ground
+    truth for which (if either) email actually exists on the target, so
+    it can't confirm the difference actually correlates with account
+    existence rather than unrelated input-validation branching (e.g.
+    one address failing a format check the other passes).
+    """
+    path_lower = str(httpx.URL(url).path).lower()
+    if not any(kw in path_lower for kw in ("forgot", "reset-password", "password-reset", "forgot-password")):
+        return None
+
+    probe_email_a = f"swas-probe-{uuid.uuid4().hex[:8]}@swas-nonexistent-domain.test"
+    probe_email_b = "admin@swas-nonexistent-domain.test"
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp_a = await client.post(url, json={"email": probe_email_a})
+                resp_b = await client.post(url, json={"email": probe_email_b})
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: password reset enumeration check failed for %s: %s", url, exc)
+        return None
+
+    if resp_a.status_code != resp_b.status_code or abs(len(resp_a.text) - len(resp_b.text)) > 10:
+        return (
+            f"{url}: submitting two different email addresses produced different responses "
+            f"(status {resp_a.status_code} vs {resp_b.status_code}, length "
+            f"{len(resp_a.text)} vs {len(resp_b.text)}) - candidate for user-enumeration "
+            f"testing; this scanner has no ground truth for which email actually exists, so "
+            f"the difference could also be unrelated input-validation branching"
+        )
     return None

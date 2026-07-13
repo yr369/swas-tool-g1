@@ -80,6 +80,17 @@ _SESSION_ID_URL_CHECK_CAP = 25  # pure pattern match, no extra requests
 _META_REFRESH_CHECK_CAP = 15
 _WSDL_CHECK_CAP = 15
 _UUID_VERSION_CHECK_CAP = 25  # pure pattern match, no extra requests
+_OAUTH_STATE_CHECK_CAP = 15
+_BASIC_AUTH_HTTP_CHECK_CAP = 15
+_COOKIE_SECURE_CHECK_CAP = 15
+_FIREBASE_RTDB_CHECK_CAP = 15
+_SSRF_GCP_CHECK_CAP = 10
+_SSRF_AZURE_CHECK_CAP = 10
+_SSRF_DO_CHECK_CAP = 10
+_XFF_BYPASS_CHECK_CAP = 15
+_REFERER_BYPASS_CHECK_CAP = 15
+_APIKEY_IN_URL_CHECK_CAP = 25  # pure pattern match, no extra requests
+_PW_RESET_ENUM_CHECK_CAP = 10
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -778,6 +789,53 @@ async def _phase_scan(
         serverless_yml_result = await detective.check_serverless_yml_exposure(host)
         if serverless_yml_result is not None:
             await _save_detective_finding(conn, project_id, target_id, serverless_yml_result)
+
+        # ---- Batches 29-33 host-level checks (9 total) ----
+
+        logger.info("detective: running Docker daemon API exposure check for %s", host)
+        docker_daemon_result = await detective.check_exposed_docker_daemon_api(host)
+        if docker_daemon_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, docker_daemon_result)
+
+        logger.info("detective: running Postgres trust-auth exposure check for %s", host)
+        postgres_trust_result = await detective.check_exposed_postgres_trust_auth(host)
+        if postgres_trust_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, postgres_trust_result)
+
+        logger.info("detective: running InfluxDB no-auth exposure check for %s", host)
+        influxdb_result = await detective.check_exposed_influxdb_no_auth(host)
+        if influxdb_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, influxdb_result)
+
+        logger.info("detective: running Kibana no-auth exposure check for %s", host)
+        kibana_result = await detective.check_exposed_kibana_no_auth(host)
+        if kibana_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, kibana_result)
+
+        logger.info("detective: running backup archive exposure check for %s", host)
+        backup_archive_result = await detective.check_backup_archive_exposure(host)
+        if backup_archive_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, backup_archive_result)
+
+        logger.info("detective: running SQL dump file exposure check for %s", host)
+        sql_dump_result = await detective.check_sql_dump_file_exposure(host)
+        if sql_dump_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, sql_dump_result)
+
+        logger.info("detective: running log file exposure check for %s", host)
+        log_file_result = await detective.check_log_file_exposure(host)
+        if log_file_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, log_file_result)
+
+        logger.info("detective: running .htpasswd exposure check for %s", host)
+        htpasswd_result = await detective.check_htpasswd_exposure(host)
+        if htpasswd_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, htpasswd_result)
+
+        logger.info("detective: running weak TLS protocol check for %s", host)
+        weak_tls_result = await detective.check_insecure_tls_weak_protocol(host)
+        if weak_tls_result is not None:
+            await _save_detective_finding(conn, project_id, target_id, weak_tls_result)
 
         # Batch 8 per-host check: prototype pollution via a JSON
         # __proto__ gadget POSTed to the host root. (The other three
@@ -1707,6 +1765,164 @@ async def _phase_scan(
             continue
         if res is not None:
             logger.info("detective: predictable UUID note: %s", res)
+
+    # ---- Batches 29-33 URL-level checks (11 total) ----
+
+    # Detective check: OAuth missing state parameter. Recon-only.
+    oauth_state_candidates = sane_discovered_urls[:_OAUTH_STATE_CHECK_CAP]
+    logger.info("detective: running OAuth state param check against %d URL(s)", len(oauth_state_candidates))
+    oauth_state_notes = await asyncio.gather(
+        *(detective.check_oauth_missing_state_parameter(url) for url in oauth_state_candidates),
+        return_exceptions=True,
+    )
+    for res in oauth_state_notes:
+        if isinstance(res, Exception):
+            logger.debug("OAuth state param check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: OAuth state param note: %s", res)
+
+    # Detective check: Basic Auth over plaintext HTTP.
+    basic_auth_http_candidates = sane_discovered_urls[:_BASIC_AUTH_HTTP_CHECK_CAP]
+    logger.info("detective: running Basic Auth over HTTP check against %d URL(s)", len(basic_auth_http_candidates))
+    basic_auth_http_results = await asyncio.gather(
+        *(detective.check_basic_auth_over_http(url) for url in basic_auth_http_candidates),
+        return_exceptions=True,
+    )
+    for res in basic_auth_http_results:
+        if isinstance(res, Exception):
+            logger.debug("Basic Auth over HTTP check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: cookie missing Secure flag over HTTPS. Recon-only.
+    cookie_secure_candidates = sane_discovered_urls[:_COOKIE_SECURE_CHECK_CAP]
+    logger.info("detective: running cookie Secure flag check against %d URL(s)", len(cookie_secure_candidates))
+    cookie_secure_notes = await asyncio.gather(
+        *(detective.check_cookie_missing_secure_flag(url) for url in cookie_secure_candidates),
+        return_exceptions=True,
+    )
+    for res in cookie_secure_notes:
+        if isinstance(res, Exception):
+            logger.debug("cookie Secure flag check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: cookie Secure flag note: %s", res)
+
+    # Detective check: Firebase Realtime DB open read rules.
+    firebase_rtdb_candidates = sane_discovered_urls[:_FIREBASE_RTDB_CHECK_CAP]
+    logger.info("detective: running Firebase RTDB open rules check against %d URL(s)", len(firebase_rtdb_candidates))
+    firebase_rtdb_results = await asyncio.gather(
+        *(detective.check_firebase_realtime_db_open_rules(url) for url in firebase_rtdb_candidates),
+        return_exceptions=True,
+    )
+    for res in firebase_rtdb_results:
+        if isinstance(res, Exception):
+            logger.debug("Firebase RTDB check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: SSRF targeting GCP metadata (header-gated).
+    ssrf_gcp_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_GCP_CHECK_CAP]
+    logger.info("detective: running GCP metadata SSRF check against %d candidate URL(s)", len(ssrf_gcp_candidates))
+    ssrf_gcp_results = await asyncio.gather(
+        *(detective.check_ssrf_gcp_metadata(url) for url in ssrf_gcp_candidates),
+        return_exceptions=True,
+    )
+    for res in ssrf_gcp_results:
+        if isinstance(res, Exception):
+            logger.debug("GCP metadata SSRF check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: SSRF targeting Azure IMDS (header-gated).
+    ssrf_azure_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_AZURE_CHECK_CAP]
+    logger.info("detective: running Azure metadata SSRF check against %d candidate URL(s)", len(ssrf_azure_candidates))
+    ssrf_azure_results = await asyncio.gather(
+        *(detective.check_ssrf_azure_metadata(url) for url in ssrf_azure_candidates),
+        return_exceptions=True,
+    )
+    for res in ssrf_azure_results:
+        if isinstance(res, Exception):
+            logger.debug("Azure metadata SSRF check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: SSRF targeting DigitalOcean metadata.
+    ssrf_do_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_DO_CHECK_CAP]
+    logger.info("detective: running DigitalOcean metadata SSRF check against %d candidate URL(s)", len(ssrf_do_candidates))
+    ssrf_do_results = await asyncio.gather(
+        *(detective.check_ssrf_digitalocean_metadata(url) for url in ssrf_do_candidates),
+        return_exceptions=True,
+    )
+    for res in ssrf_do_results:
+        if isinstance(res, Exception):
+            logger.debug("DigitalOcean metadata SSRF check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: IP restriction bypass via spoofed X-Forwarded-For.
+    xff_bypass_candidates = sane_discovered_urls[:_XFF_BYPASS_CHECK_CAP]
+    logger.info("detective: running XFF IP restriction bypass check against %d URL(s)", len(xff_bypass_candidates))
+    xff_bypass_results = await asyncio.gather(
+        *(detective.check_ip_restriction_bypass_via_xff(url) for url in xff_bypass_candidates),
+        return_exceptions=True,
+    )
+    for res in xff_bypass_results:
+        if isinstance(res, Exception):
+            logger.debug("XFF IP restriction bypass check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: Referer-based access control bypass.
+    referer_bypass_candidates = sane_discovered_urls[:_REFERER_BYPASS_CHECK_CAP]
+    logger.info("detective: running Referer-based access control bypass check against %d URL(s)", len(referer_bypass_candidates))
+    referer_bypass_results = await asyncio.gather(
+        *(detective.check_referer_based_access_control_bypass(url) for url in referer_bypass_candidates),
+        return_exceptions=True,
+    )
+    for res in referer_bypass_results:
+        if isinstance(res, Exception):
+            logger.debug("Referer-based access control bypass check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding(conn, project_id, target_id, res)
+
+    # Detective check: API key/token in URL query param. Recon-only,
+    # pure pattern match - no extra requests, capped higher.
+    apikey_url_candidates = sane_discovered_urls[:_APIKEY_IN_URL_CHECK_CAP]
+    logger.info("detective: running API key in URL check against %d URL(s)", len(apikey_url_candidates))
+    apikey_url_notes = await asyncio.gather(
+        *(detective.check_api_key_in_url_query_param(url) for url in apikey_url_candidates),
+        return_exceptions=True,
+    )
+    for res in apikey_url_notes:
+        if isinstance(res, Exception):
+            logger.debug("API key in URL check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: API key in URL note: %s", res)
+
+    # Detective check: password-reset user-enumeration candidate.
+    # Recon-only.
+    pw_reset_enum_candidates = sane_discovered_urls[:_PW_RESET_ENUM_CHECK_CAP]
+    logger.info("detective: running password reset enumeration check against %d URL(s)", len(pw_reset_enum_candidates))
+    pw_reset_enum_notes = await asyncio.gather(
+        *(detective.check_password_reset_user_enumeration_candidate(url) for url in pw_reset_enum_candidates),
+        return_exceptions=True,
+    )
+    for res in pw_reset_enum_notes:
+        if isinstance(res, Exception):
+            logger.debug("password reset enumeration check raised: %s", res)
+            continue
+        if res is not None:
+            logger.info("detective: password reset enumeration note: %s", res)
 
 
 # A hostname like "aem-prod.example.com" or a tech-stack detection
