@@ -8,7 +8,7 @@
 # temporarily to build them, then remove Go afterward to keep the final
 # image smaller - this is a common pattern called a "multi-stage build."
 
-FROM golang:1.25-bookworm AS tools-builder
+FROM golang:1.26-bookworm AS tools-builder
 
 # GOARCH gets set automatically by Docker based on the target platform
 # (arm64 on your OCI server), so `go install` below produces the correct
