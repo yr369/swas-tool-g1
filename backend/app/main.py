@@ -146,6 +146,12 @@ async def _finalize_scan_status(pool, project_id: int, tasks: list) -> None:
     results = await asyncio.gather(*tasks, return_exceptions=True)
     failures = [r for r in results if isinstance(r, Exception)]
     if failures:
+        for i, exc in enumerate(failures):
+            logger.error(
+                "scan failure detail (%d/%d) for project %s: %r",
+                i + 1, len(failures), project_id, exc,
+                exc_info=exc,
+            )
         logger.warning(
             "scan for project %s: %d of %d target(s) raised an error - "
             "project status still resolves to 'completed' (no 'error' "
@@ -1219,7 +1225,7 @@ async def generate_markdown_report(project_id: int):
             lines.append(f"### {sev.title()} ({len(rows_for_sev)})")
             lines.append("")
             for f in rows_for_sev:
-                lines.append(f"- **{f['target']}** — `{f['tool_name']}` / {f['vuln_type']} _{f['status']}_")
+                lines.append(f"- **{f['target']}** â€” `{f['tool_name']}` / {f['vuln_type']} _{f['status']}_")
                 if f["evidence"]:
                     # Indent so it renders as a nested code block under
                     # the bullet, rather than breaking out to top level.
