@@ -2011,13 +2011,15 @@ async def _save_nuclei_findings(
             unparsed_lines.append(line)
             continue
 
-        await conn.execute(
+        finding_id = await conn.fetchval(
             """
             INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
             VALUES ($1, $2, 'nuclei', $3, $4, $5)
+            RETURNING id
             """,
             project_id, target_id, vuln_type, severity, line[:1000],
         )
+        await _upsert_finding_cluster(conn, target_id, finding_id, 'nuclei')
         saved_count += 1
 
     if unparsed_lines:
@@ -2028,6 +2030,35 @@ async def _save_nuclei_findings(
 
     logger.info("nuclei: saved %d individual findings, %d unparsed line(s) bundled separately",
                 saved_count, len(unparsed_lines))
+
+
+async def _upsert_finding_cluster(
+    conn: asyncpg.Connection, target_id: int, finding_id: int, source: str
+) -> None:
+    """
+    Links a newly-saved finding into its target's cluster row, creating
+    the cluster row on first insert for that target. This is what
+    populates finding_clusters / finding_cluster_members so the
+    correlation layer (high_potential_clusters view) actually has data
+    instead of sitting empty.
+    """
+    cluster_id = await conn.fetchval(
+        """
+        INSERT INTO finding_clusters (target_id)
+        VALUES ($1)
+        ON CONFLICT (target_id) DO UPDATE SET updated_at = now()
+        RETURNING id
+        """,
+        target_id,
+    )
+    await conn.execute(
+        """
+        INSERT INTO finding_cluster_members (cluster_id, finding_id, source)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (cluster_id, finding_id) DO NOTHING
+        """,
+        cluster_id, finding_id, source,
+    )
 
 
 async def _save_finding(
@@ -2053,10 +2084,11 @@ async def _save_finding(
         logger.info("fp_filter: all %s output was noise, skipping finding", tool_name)
         return
 
-    await conn.execute(
+    finding_id = await conn.fetchval(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
         VALUES ($1, $2, $3, $4, 'unknown', $5)
+        RETURNING id
         """,
         project_id,
         target_id,
@@ -2064,6 +2096,7 @@ async def _save_finding(
         tool_name,  # Phase 1: vuln_type defaults to the tool name until triage exists
         cleaned_output[:5000],  # cap stored evidence length
     )
+    await _upsert_finding_cluster(conn, target_id, finding_id, tool_name)
 
 
 async def _save_detective_finding(
@@ -2092,16 +2125,18 @@ async def _save_detective_finding(
     model as context (see triage._extract_self_declared_severity).
     """
     self_declared_prefix = f"[self-declared-severity: {result['severity']}]\n"
-    await conn.execute(
+    finding_id = await conn.fetchval(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
         VALUES ($1, $2, 'detective', $3, 'unknown', $4)
+        RETURNING id
         """,
         project_id,
         target_id,
         result["vuln_type"],
         (self_declared_prefix + result["evidence"])[:5000],
     )
+    await _upsert_finding_cluster(conn, target_id, finding_id, 'detective')
     logger.info(
         "detective: saved %s finding (self-declared severity=%s, pending triage) for target_id=%s",
         result["vuln_type"], result["severity"], target_id,
