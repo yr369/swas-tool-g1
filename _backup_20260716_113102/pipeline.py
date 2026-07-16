@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, gate, logic_hunter, tools, triage
+from . import checkpoint, detective, fp_filter, tools, triage
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -94,7 +94,7 @@ _PW_RESET_ENUM_CHECK_CAP = 10
 
 logger = logging.getLogger("swas.pipeline")
 
-PHASES = ["recon", "probe", "fuzz", "scan", "gate", "logic_hunter", "triage", "notify"]
+PHASES = ["recon", "probe", "fuzz", "scan", "triage", "notify"]
 
 
 async def run_target_pipeline(
@@ -259,12 +259,6 @@ async def _execute_phase(
 
     elif phase_name == "scan":
         await _phase_scan(conn, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
-
-    elif phase_name == "gate":
-        await _phase_gate(conn, project_id)
-
-    elif phase_name == "logic_hunter":
-        await _phase_logic_hunter(conn, project_id)
 
     elif phase_name == "triage":
         await _phase_triage(conn, project_id)
@@ -2149,39 +2143,6 @@ async def _save_detective_finding(
     )
 
 
-async def _phase_gate(conn: asyncpg.Connection, project_id: int) -> None:
-    """
-    Runs the cheap 7-Question Gate (see gate.py) on every 'unknown'-
-    severity finding in this project, right after scan and before the
-    more expensive logic_hunter/triage phases. Findings that fail the
-    gate are never deleted - they stay in the table with
-    gate_status='failed' for visibility - but triage.py skips them, so
-    a scan full of scanner noise doesn't burn a full triage call per
-    line. Checkpointed/retried like every other phase; a gate failure
-    itself fails open per-finding (see gate.run_gate), so this can only
-    ever cost extra triage calls, never silently drop a real finding.
-    """
-    gated = await gate.gate_project_findings(conn, project_id)
-    logger.info("gate: reviewed %s finding(s) for project_id=%s", gated, project_id)
-
-
-async def _phase_logic_hunter(conn: asyncpg.Connection, project_id: int) -> None:
-    """
-    Runs logic_hunter.py's LLM business-logic/auth-bypass reasoning
-    over this project's high-potential clusters (see
-    high_potential_clusters) - the targets where correlation already
-    found 2+ findings or 2+ distinct sources, which is where a chained
-    logic bug is actually likely to be findable from existing evidence.
-    Runs after gate (so it's reasoning over signal, not raw noise) and
-    before triage (so any hypothesis it saves gets the same independent
-    triage review every other finding gets). Idempotent to re-run: each
-    cluster is only hunted once (finding_clusters.logic_hunter_status),
-    so this never double-spends the expensive reasoning call.
-    """
-    hunted = await logic_hunter.hunt_project(conn, project_id)
-    logger.info("logic_hunter: saved %s hypothesis/hypotheses for project_id=%s", hunted, project_id)
-
-
 async def _phase_triage(conn: asyncpg.Connection, project_id: int) -> None:
     """
     Runs AI triage on every 'unknown'-severity finding in this project -
@@ -2203,22 +2164,9 @@ async def _phase_triage(conn: asyncpg.Connection, project_id: int) -> None:
     Failures inside triage_finding() itself are already caught per-
     finding (falls back to severity='unknown' with a logged reason,
     see triage.py) so one bad finding can't take down the whole batch.
-
-    After individual findings are scored, also runs cluster-aware
-    triage (triage.triage_project_clusters) - this is the second pass
-    that reasons about the COMBINATION of findings per target (e.g.
-    info disclosure + weak auth = higher severity than either alone),
-    reading from high_potential_clusters. It runs second on purpose:
-    cluster reasoning is more meaningful once each member finding
-    already has a real severity to reason on top of, rather than a
-    placeholder 'unknown'.
     """
     triaged = await triage.triage_project_findings(conn, project_id)
-    clustered = await triage.triage_project_clusters(conn, project_id)
-    logger.info(
-        "triage: reviewed %s finding(s), scored %s cluster(s) for project_id=%s",
-        triaged, clustered, project_id,
-    )
+    logger.info("triage: reviewed %s finding(s) for project_id=%s", triaged, project_id)
 
 
 async def _phase_notify(target: str) -> None:

@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import os
 
-from . import checkpoint, database, gate, logic_hunter, pipeline, readiness, scope_parser, triage, vrt, ws_manager
+from . import checkpoint, database, pipeline, readiness, scope_parser, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -819,53 +819,6 @@ async def triage_all_findings(project_id: int):
         triaged = await triage.triage_project_findings(conn, project_id)
 
     return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
-
-
-@app.post("/api/projects/{project_id}/gate-all")
-async def gate_all_findings(project_id: int):
-    """
-    Runs the 7-Question Gate on-demand for every finding still pending
-    gate review. Also runs automatically as the "gate" phase right
-    after scan - this stays for re-running after tuning gate.py's
-    prompt. Shares gate.gate_project_findings with the automatic phase.
-    """
-    pool = database.get_pool()
-    async with pool.acquire() as conn:
-        gated = await gate.gate_project_findings(conn, project_id)
-
-    return {"message": f"Gated {gated} finding(s)", "count": gated}
-
-
-@app.post("/api/projects/{project_id}/logic-hunter-all")
-async def logic_hunter_all(project_id: int):
-    """
-    Runs logic_hunter's business-logic/auth-bypass reasoning on-demand
-    over every not-yet-hunted high-potential cluster in a project. Also
-    runs automatically as the "logic_hunter" phase. Shares
-    logic_hunter.hunt_project with the automatic phase.
-    """
-    pool = database.get_pool()
-    async with pool.acquire() as conn:
-        hunted = await logic_hunter.hunt_project(conn, project_id)
-
-    return {"message": f"Saved {hunted} hypothesis/hypotheses", "count": hunted}
-
-
-@app.post("/api/projects/{project_id}/cluster-triage-all")
-async def cluster_triage_all(project_id: int):
-    """
-    Runs cluster-aware triage on-demand over every not-yet-scored high-
-    potential cluster in a project (reasons about the COMBINATION of a
-    target's findings, not each in isolation - see
-    triage.triage_project_clusters). Also runs automatically as the
-    second half of the "triage" phase, after individual findings are
-    scored.
-    """
-    pool = database.get_pool()
-    async with pool.acquire() as conn:
-        scored = await triage.triage_project_clusters(conn, project_id)
-
-    return {"message": f"Scored {scored} cluster(s)", "count": scored}
 
 
 # ---------- Outcome tracking (the learning loop) ----------
