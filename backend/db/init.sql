@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS scope_targets (
     in_scope        BOOLEAN NOT NULL DEFAULT true,
     reward_range    TEXT,
     notes           TEXT,
+    last_scanned_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
