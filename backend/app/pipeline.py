@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, gate, logic_hunter, tools, triage
+from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, tools, triage
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -496,6 +496,30 @@ async def _phase_scan(
         git_result = await detective.check_git_exposure(host)
         if git_result is not None:
             await _save_detective_finding(conn, project_id, target_id, git_result)
+
+            # Confirmed-exposed .git directory - worth the extra time/
+            # disk I/O to actually reconstruct the source, not just flag
+            # that it's exposed. Gated behind a confirmed exposure so
+            # this never runs speculatively on every host.
+            logger.info("detective: .git exposure confirmed on %s, attempting full reconstruction", host)
+            dump_result = await git_dumper.dump_git_repository(host, project_id, target_id)
+            if dump_result.success:
+                secret_note = (
+                    f" {len(dump_result.secret_candidates)} recovered file(s) matched "
+                    f"hardcoded-secret patterns: {'; '.join(dump_result.secret_candidates[:5])}"
+                    if dump_result.secret_candidates else ""
+                )
+                await _save_detective_finding(conn, project_id, target_id, {
+                    "vuln_type": "exposed_git_directory_reconstructed",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{host}: full source reconstruction from the exposed .git directory "
+                        f"succeeded via {dump_result.method} - {dump_result.file_count} file(s) "
+                        f"recovered to {dump_result.dump_path}. {dump_result.note}{secret_note}"
+                    ),
+                })
+            else:
+                logger.info("detective: git reconstruction did not succeed for %s: %s", host, dump_result.note)
 
         # Batch 4 per-host checks: exposed Elasticsearch, Prometheus/
         # Spring Actuator, NoSQL DB ports, and Swagger/OpenAPI docs.
