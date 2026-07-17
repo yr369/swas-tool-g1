@@ -326,6 +326,8 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
+from . import secret_verifier
+
 logger = logging.getLogger("swas.detective")
 
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -2426,13 +2428,33 @@ async def check_api_key_leak_signature(url: str) -> dict | None:
     for pattern, provider, severity in _API_KEY_SIGNATURES:
         match = pattern.search(body)
         if match:
-            secret_preview = match.group(0)[:8] + "…" + match.group(0)[-4:]
+            raw_secret = match.group(0)  # only ever held in memory, never persisted
+            secret_preview = raw_secret[:8] + "…" + raw_secret[-4:]
+
+            # Live-verify while the full value is still in scope, for the
+            # subset of providers where the matched string is a complete,
+            # usable credential on its own (see secret_verifier.py's
+            # module docstring for why AWS/Twilio are excluded here).
+            verdict = await secret_verifier.verify_secret(provider, raw_secret)
+            if verdict is None:
+                verify_note = " (not independently verifiable from this match alone - needs a paired secret)"
+                effective_severity = severity
+            elif verdict.get("valid") is True:
+                verify_note = f" VERIFIED LIVE: {verdict['note']}"
+                effective_severity = "critical"  # a confirmed-live credential always outranks the format's default
+            elif verdict.get("valid") is False:
+                verify_note = f" VERIFIED DEAD: {verdict['note']}"
+                effective_severity = "low"  # keep the finding, don't silently drop it - let triage.py make the final call
+            else:
+                verify_note = f" (verification inconclusive: {verdict.get('note', 'unknown')})"
+                effective_severity = severity
+
             return {
                 "vuln_type": "exposed_api_key",
-                "severity": severity,
+                "severity": effective_severity,
                 "evidence": (
                     f"{url}: found a live-looking {provider} matching its known format "
-                    f"({secret_preview}) directly in the response body."
+                    f"({secret_preview}) directly in the response body.{verify_note}"
                 ),
             }
     return None
