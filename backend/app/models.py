@@ -78,6 +78,7 @@ class ScopeTarget(BaseModel):
     in_scope: bool
     reward_range: Optional[str]
     notes: Optional[str]
+    last_scanned_at: Optional[datetime] = None
     created_at: datetime
 
 

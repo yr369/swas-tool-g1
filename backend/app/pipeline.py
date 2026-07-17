@@ -172,6 +172,16 @@ async def run_target_pipeline(
                     )
                 break
 
+        # Stamped unconditionally here (not per-phase) - this marks "a scan
+    # attempt happened and finished" for the host, regardless of whether
+    # every phase succeeded, some were skipped as a dead target, or scope
+    # drifted mid-run. That is what "last scanned" should mean to an
+    # operator glancing at the host list - not "last fully clean run".
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE scope_targets SET last_scanned_at = now() WHERE id = $1", target_id
+        )
+    
     logger.info("Finished pipeline for target_id=%s", target_id)
 
 

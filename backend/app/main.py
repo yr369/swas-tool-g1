@@ -416,7 +416,7 @@ async def add_scope_target(project_id: int, payload: ScopeTargetCreate):
                 (project_id, target, target_type, in_scope, reward_range, notes)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, project_id, target, target_type, in_scope,
-                      reward_range, notes, created_at
+                      reward_range, notes, last_scanned_at, created_at
             """,
             project_id,
             payload.target,
@@ -435,7 +435,7 @@ async def list_scope_targets(project_id: int):
         rows = await conn.fetch(
             """
             SELECT id, project_id, target, target_type, in_scope,
-                   reward_range, notes, created_at
+                   reward_range, notes, last_scanned_at, created_at
             FROM scope_targets
             WHERE project_id = $1
             ORDER BY created_at ASC
@@ -467,7 +467,7 @@ async def update_scope_target(project_id: int, target_id: int, payload: ScopeTar
         if not updates:
             row = await conn.fetchrow(
                 """
-                SELECT id, project_id, target, target_type, in_scope, reward_range, notes, created_at
+                SELECT id, project_id, target, target_type, in_scope, reward_range, notes, last_scanned_at, created_at
                 FROM scope_targets WHERE id = $1
                 """,
                 target_id,
@@ -490,11 +490,68 @@ async def update_scope_target(project_id: int, target_id: int, payload: ScopeTar
             UPDATE scope_targets
             SET {", ".join(set_clauses)}
             WHERE id = ${len(params)}
-            RETURNING id, project_id, target, target_type, in_scope, reward_range, notes, created_at
+            RETURNING id, project_id, target, target_type, in_scope, reward_range, notes, last_scanned_at, created_at
             """,
             *params,
         )
     return dict(row)
+
+@app.post("/api/projects/{project_id}/scope/{target_id}/rescan")
+async def rescan_target(project_id: int, target_id: int):
+    """
+    Reruns the pipeline for exactly one host, without touching recon or
+    any other host in the project - for when a fix just went out and
+    you want to confirm it, or a host errored/timed out and you want to
+    retry just that one instead of rerunning the whole project.
+
+    Deliberately does NOT flip projects.status to 'scanning' the way a
+    full project scan does - that status/the scheduler loop are about
+    whole-project runs, and a single-host rescan is a lighter-weight,
+    independent action that shouldn't block or interact with either.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        target_row = await conn.fetchrow(
+            "SELECT id, target, in_scope FROM scope_targets WHERE id = $1 AND project_id = $2",
+            target_id, project_id,
+        )
+        if target_row is None:
+            raise HTTPException(status_code=404, detail="Scope target not found")
+        if not target_row["in_scope"]:
+            raise HTTPException(
+                status_code=400,
+                detail="This target is marked out-of-scope - flip it back in-scope before rescanning",
+            )
+
+        denylist_raw = os.environ.get("DENYLIST_DOMAINS", "")
+        denylist = [d.strip().lower() for d in denylist_raw.split(",") if d.strip()]
+        if denylist and any(d in target_row["target"].lower() for d in denylist):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Refusing to scan: {target_row['target']} matches DENYLIST_DOMAINS. "
+                    f"This is explicitly excluded even if marked in-scope."
+                ),
+            )
+
+        in_progress = await conn.fetchval(
+            "SELECT 1 FROM phase_runs WHERE target_id = $1 AND status = 'in_progress' LIMIT 1",
+            target_id,
+        )
+        if in_progress:
+            raise HTTPException(
+                status_code=409,
+                detail="This host already has a scan in progress - wait for it to finish before rescanning",
+            )
+
+    asyncio.create_task(
+        pipeline.run_target_pipeline(pool, project_id, target_id, target_row["target"])
+    )
+
+    return {
+        "message": f"Rescan started for {target_row['target']}",
+        "target_id": target_id,
+    }
 
 
 @app.delete("/api/projects/{project_id}/scope/{target_id}")
@@ -577,7 +634,7 @@ async def bulk_add_scope_targets(project_id: int, payload: BulkScopeTargetsCreat
                 INSERT INTO scope_targets
                     (project_id, target, target_type, in_scope, reward_range, notes)
                 VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, project_id, target, target_type, in_scope, reward_range, notes, created_at
+                RETURNING id, project_id, target, target_type, in_scope, reward_range, notes, last_scanned_at, created_at
                 """,
                 project_id, t, payload.target_type, payload.in_scope, payload.reward_range, payload.notes,
             )
