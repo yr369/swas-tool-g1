@@ -41,6 +41,8 @@ export const api = {
     request("/projects/bulk-action", { method: "POST", body: JSON.stringify({ project_ids: projectIds, action }) }),
   deleteProject: (id, confirmName) =>
     request(`/projects/${id}`, { method: "DELETE", body: JSON.stringify({ confirm_name: confirmName }) }),
+  listScanNotes: (projectId) => request(`/projects/${projectId}/notes`),
+  dismissScanNote: (noteId) => request(`/notes/${noteId}/dismiss`, { method: "PATCH" }),
 
   // Scope
   listScope: (projectId) => request(`/projects/${projectId}/scope`),

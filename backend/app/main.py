@@ -32,6 +32,7 @@ from .models import (
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
     ProjectDeleteRequest,
+    ScanNote,
     QueueEnqueueRequest,
     QueueReorderRequest,
     ScanQueueItem,
@@ -959,12 +960,40 @@ async def list_findings(project_id: int):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, project_id, target_id, tool_name, vuln_type, severity,
-                   evidence, raw_output_path, status,
-                   likely_program_outcome, triage_reasoning, triage_confidence,
-                   created_at
-            FROM findings
-            WHERE project_id = $1
+            SELECT f.id, f.project_id, f.target_id, f.tool_name, f.vuln_type, f.severity,
+                   f.evidence, f.raw_output_path, f.status,
+                   f.likely_program_outcome, f.triage_reasoning, f.triage_confidence,
+                   f.created_at,
+                   EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id) AS has_logged_outcome
+            FROM findings f
+            WHERE f.project_id = $1
+            ORDER BY f.created_at DESC
+            """,
+            project_id,
+        )
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/projects/{project_id}/notes", response_model=List[ScanNote])
+async def list_scan_notes(project_id: int, include_dismissed: bool = False):
+    """
+    Detective checks that were deliberately not auto-filed as findings -
+    unconfirmed pattern matches needing a manual look (hardcoded
+    secrets, excessive data exposure field names, IDOR candidates, ...)
+    or confirmed-but-usually-informative-alone gaps (clickjacking,
+    missing SRI/HSTS, ...). Separate from GET /findings on purpose - see
+    add_scan_notes.sql - so these don't affect severity counts or
+    trigger AI triage calls on speculative matches. Previously these
+    were computed and immediately discarded to a log line; this is what
+    actually surfaces them.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT id, project_id, target_id, check_name, note, dismissed, created_at
+            FROM scan_notes
+            WHERE project_id = $1 {"" if include_dismissed else "AND NOT dismissed"}
             ORDER BY created_at DESC
             """,
             project_id,
@@ -972,7 +1001,17 @@ async def list_findings(project_id: int):
     return [dict(row) for row in rows]
 
 
-@app.patch("/api/findings/bulk", response_model=FindingBulkStatusResult)
+@app.patch("/api/notes/{note_id}/dismiss")
+async def dismiss_scan_note(note_id: int):
+    """Marks a scan note reviewed/not useful - hides it from the default
+    list without deleting the row (matches findings.status's
+    non-destructive pattern)."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("UPDATE scan_notes SET dismissed = true WHERE id = $1", note_id)
+        if result == "UPDATE 0":
+            raise HTTPException(status_code=404, detail="Scan note not found")
+    return {"dismissed": True, "id": note_id}
 async def bulk_update_finding_status(payload: FindingBulkStatusRequest):
     """
     Sets the status field (new/reviewed/submitted/dismissed) on many
@@ -1752,7 +1791,8 @@ async def list_all_findings(
                    f.evidence, f.raw_output_path, f.status,
                    f.likely_program_outcome, f.triage_reasoning, f.triage_confidence,
                    f.created_at,
-                   p.name AS project_name, p.platform AS project_platform
+                   p.name AS project_name, p.platform AS project_platform,
+                   EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id) AS has_logged_outcome
             FROM findings f
             JOIN projects p ON p.id = f.project_id
             {where_clause}

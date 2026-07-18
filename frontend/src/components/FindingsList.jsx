@@ -62,6 +62,40 @@ export function SeverityBadge({ severity }) {
   );
 }
 
+// The scope-risk tag - the actual point of Batch 5. triage.py already
+// flags categories most programs auto-close (DoS, self-XSS, rate-limit,
+// unauthenticated cache purge, etc.) as likely "informative" or
+// "out_of_scope" BEFORE you spend time writing a report - this makes
+// that judgment visible at findings-view time instead of buried in an
+// API response nobody's looking at.
+const OUTCOME_TAG = {
+  accepted: { color: "var(--status-success)", label: "Likely accepted" },
+  informative: { color: "var(--sev-medium)", label: "Likely informative" },
+  out_of_scope: { color: "var(--status-fail)", label: "Likely out of scope" },
+  duplicate: { color: "var(--text-muted)", label: "Likely duplicate" },
+};
+
+export function OutcomeTag({ outcome }) {
+  const tag = OUTCOME_TAG[outcome];
+  if (!tag) return null;
+  return (
+    <span
+      className="mono"
+      style={{
+        display: "inline-block",
+        fontSize: 11,
+        padding: "2px 7px",
+        borderRadius: "var(--radius)",
+        color: tag.color,
+        border: `1px solid ${tag.color}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {tag.label}
+    </span>
+  );
+}
+
 function ReadinessSummary({ readiness }) {
   if (!readiness) return null;
   const failedChecks = readiness.checks.filter((c) => !c.passed);
@@ -185,6 +219,11 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
         <div style={{ minWidth: 90, color: "var(--text-secondary)" }} className="mono">
           {finding.tool_name}
         </div>
+        {finding.likely_program_outcome && (
+          <div style={{ minWidth: 0 }}>
+            <OutcomeTag outcome={finding.likely_program_outcome} />
+          </div>
+        )}
         <div style={{ flex: 1, minWidth: 0 }}>
           <pre
             className="mono"
@@ -201,6 +240,15 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
             {finding.evidence}
           </pre>
         </div>
+        {finding.status === "submitted" && !finding.has_logged_outcome && (
+          <span
+            className="mono"
+            style={{ fontSize: 11, color: "var(--signal)", whiteSpace: "nowrap" }}
+            title="Submitted but no real-world outcome logged yet - log it once the program responds so future triage can learn from it"
+          >
+            ⏳ awaiting outcome
+          </span>
+        )}
         {finding.status !== "new" && (
           <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>
             {finding.status}
@@ -219,7 +267,7 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
             </button>
           </div>
 
-          {triageResult && (
+          {triageResult ? (
             <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 8 }}>
               <div>
                 <strong style={{ color: "var(--text-primary)" }}>Confidence:</strong>{" "}
@@ -234,6 +282,21 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
                 </div>
               )}
             </div>
+          ) : (
+            finding.triage_reasoning && (
+              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 8 }}>
+                {finding.likely_program_outcome && (
+                  <div>
+                    <strong style={{ color: "var(--text-primary)" }}>Likely outcome:</strong>{" "}
+                    <OutcomeTag outcome={finding.likely_program_outcome} />
+                  </div>
+                )}
+                <div>
+                  <strong style={{ color: "var(--text-primary)" }}>Reasoning:</strong> {finding.triage_reasoning}
+                  {finding.triage_confidence != null && ` (${(finding.triage_confidence * 100).toFixed(0)}% confidence)`}
+                </div>
+              </div>
+            )
           )}
 
           <ReadinessSummary readiness={readiness} />
@@ -272,6 +335,12 @@ export function FindingsList({ findings, onTriaged }) {
   const [sortBy, setSortBy] = useState("severity");
   const [selected, setSelected] = useState(() => new Set());
   const [bulkUpdating, setBulkUpdating] = useState(false);
+  const [onlyAwaitingOutcome, setOnlyAwaitingOutcome] = useState(false);
+
+  const awaitingOutcomeCount = useMemo(
+    () => findings.filter((f) => f.status === "submitted" && !f.has_logged_outcome).length,
+    [findings]
+  );
 
   const counts = useMemo(() => {
     const c = Object.fromEntries(SEVERITY_ORDER.map((s) => [s, 0]));
@@ -324,6 +393,7 @@ export function FindingsList({ findings, onTriaged }) {
       const sev = f.severity in counts ? f.severity : "unknown";
       if (!activeSeverities.has(sev)) return false;
       if (toolFilter !== "all" && f.tool_name !== toolFilter) return false;
+      if (onlyAwaitingOutcome && !(f.status === "submitted" && !f.has_logged_outcome)) return false;
       if (q && !(f.evidence || "").toLowerCase().includes(q) && !(f.vuln_type || "").toLowerCase().includes(q)) {
         return false;
       }
@@ -342,7 +412,7 @@ export function FindingsList({ findings, onTriaged }) {
     });
 
     return list;
-  }, [findings, activeSeverities, toolFilter, search, sortBy, counts]);
+  }, [findings, activeSeverities, toolFilter, search, sortBy, counts, onlyAwaitingOutcome]);
 
   if (findings.length === 0) {
     return (
@@ -361,6 +431,26 @@ export function FindingsList({ findings, onTriaged }) {
 
   return (
     <div>
+      {awaitingOutcomeCount > 0 && (
+        <div
+          style={{
+            display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", marginBottom: 12,
+            background: "var(--signal-dim)", border: "1px solid var(--signal)", borderRadius: "var(--radius)",
+            fontSize: 12, color: "var(--signal)",
+          }}
+        >
+          <span>
+            ⏳ {awaitingOutcomeCount} submitted finding{awaitingOutcomeCount === 1 ? "" : "s"} with no outcome logged
+            yet - logging real results is what lets future triage learn from past submissions.
+          </span>
+          <button
+            onClick={() => setOnlyAwaitingOutcome((v) => !v)}
+            style={{ ...smallButtonStyle, color: "var(--signal)", borderColor: "var(--signal)", marginLeft: "auto" }}
+          >
+            {onlyAwaitingOutcome ? "Show all" : "Show these"}
+          </button>
+        </div>
+      )}
       <div
         style={{
           display: "flex",

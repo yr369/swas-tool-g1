@@ -3,6 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { PipelineTracker } from "../components/PipelineTracker";
 import { FindingsList } from "../components/FindingsList";
+import { ScanNotesPanel } from "../components/ScanNotesPanel";
 import { DiffPanel } from "../components/DiffPanel";
 import { ScopeManager } from "../components/ScopeManager";
 
@@ -18,6 +19,7 @@ export function ProjectDetail() {
   const [scope, setScope] = useState([]);
   const [phaseRuns, setPhaseRuns] = useState([]);
   const [findings, setFindings] = useState([]);
+  const [scanNotes, setScanNotes] = useState([]);
   const [scanStarting, setScanStarting] = useState(false);
   const [triagingAll, setTriagingAll] = useState(false);
   const [schedulingBusy, setSchedulingBusy] = useState(false);
@@ -33,16 +35,18 @@ export function ProjectDetail() {
 
   const loadAll = useCallback(async () => {
     try {
-      const [proj, scopeList, runs, findingsList] = await Promise.all([
+      const [proj, scopeList, runs, findingsList, notesList] = await Promise.all([
         api.getProject(id),
         api.listScope(id),
         api.listPhaseRuns(id),
         api.listFindings(id),
+        api.listScanNotes(id),
       ]);
       setProject(proj);
       setScope(scopeList);
       setPhaseRuns(runs);
       setFindings(findingsList);
+      setScanNotes(notesList);
     } catch (err) {
       setError(err.message);
     }
@@ -296,6 +300,10 @@ export function ProjectDetail() {
           </div>
         )}
         <FindingsList findings={findings} onTriaged={loadAll} />
+      </Section>
+
+      <Section title="Notes for manual review">
+        <ScanNotesPanel projectId={id} notes={scanNotes} onDismissed={loadAll} />
       </Section>
 
       <Section title="Danger zone">

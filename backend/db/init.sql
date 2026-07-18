@@ -69,6 +69,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_queue_one_active_per_project
     ON scan_queue (project_id)
     WHERE status IN ('queued', 'running');
 
+-- Detective checks that are deliberately not auto-filed as findings
+-- (unconfirmed pattern matches, or confirmed-but-low-value-alone gaps
+-- like clickjacking/missing SRI) - previously just logged and
+-- discarded, now persisted here so they're actually visible.
+CREATE TABLE IF NOT EXISTS scan_notes (
+    id          SERIAL PRIMARY KEY,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    target_id   INTEGER REFERENCES scope_targets(id) ON DELETE SET NULL,
+    check_name  TEXT NOT NULL,
+    note        TEXT NOT NULL,
+    dismissed   BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_notes_project ON scan_notes(project_id) WHERE NOT dismissed;
+
 -- A candidate vulnerability found by a scanning tool, pending human review
 CREATE TABLE IF NOT EXISTS findings (
     id              SERIAL PRIMARY KEY,
