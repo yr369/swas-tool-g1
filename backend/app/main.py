@@ -919,7 +919,9 @@ async def list_findings(project_id: int):
         rows = await conn.fetch(
             """
             SELECT id, project_id, target_id, tool_name, vuln_type, severity,
-                   evidence, raw_output_path, status, created_at
+                   evidence, raw_output_path, status,
+                   likely_program_outcome, triage_reasoning, triage_confidence,
+                   created_at
             FROM findings
             WHERE project_id = $1
             ORDER BY created_at DESC
@@ -989,10 +991,21 @@ async def triage_one_finding(finding_id: int):
             outcome_stats=outcome_stats, vrt_entries=vrt_entries,
         )
 
+        outcome = result.get("likely_program_outcome")
         await conn.execute(
-            "UPDATE findings SET severity = $1 WHERE id = $2",
+            """
+            UPDATE findings
+            SET severity = $1,
+                likely_program_outcome = $2,
+                triage_reasoning = $3,
+                triage_confidence = $4
+            WHERE id = $5
+            """,
             result["severity"] if result["severity"] in
             ("critical", "high", "medium", "low", "info") else "unknown",
+            outcome if outcome in ("accepted", "informative", "out_of_scope", "duplicate") else None,
+            result.get("reasoning"),
+            result.get("confidence"),
             finding_id,
         )
 
@@ -1642,6 +1655,7 @@ async def list_all_findings(
     severity: Optional[str] = None,
     tool_name: Optional[str] = None,
     q: Optional[str] = None,
+    likely_program_outcome: Optional[str] = None,
     limit: int = 500,
 ):
     """
@@ -1649,6 +1663,11 @@ async def list_all_findings(
     per-project view (GET /api/projects/{id}/findings) stays as-is for
     the project detail page. Filters are all optional and combine with
     AND. `q` does a simple substring search over evidence and vuln_type.
+
+    likely_program_outcome (Batch 5): filter by triage's predicted
+    program outcome - e.g. ?likely_program_outcome=out_of_scope to see
+    (and skip) everything triage already flagged as a policy-exclusion
+    risk, or =accepted to focus on the findings most worth writing up.
     """
     pool = database.get_pool()
     conditions = []
@@ -1663,6 +1682,9 @@ async def list_all_findings(
     if q:
         params.append(f"%{q}%")
         conditions.append(f"(f.evidence ILIKE ${len(params)} OR f.vuln_type ILIKE ${len(params)})")
+    if likely_program_outcome:
+        params.append(likely_program_outcome)
+        conditions.append(f"f.likely_program_outcome = ${len(params)}")
 
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     params.append(min(limit, 2000))  # hard ceiling regardless of what's requested
@@ -1671,7 +1693,9 @@ async def list_all_findings(
         rows = await conn.fetch(
             f"""
             SELECT f.id, f.project_id, f.target_id, f.tool_name, f.vuln_type, f.severity,
-                   f.evidence, f.raw_output_path, f.status, f.created_at,
+                   f.evidence, f.raw_output_path, f.status,
+                   f.likely_program_outcome, f.triage_reasoning, f.triage_confidence,
+                   f.created_at,
                    p.name AS project_name, p.platform AS project_platform
             FROM findings f
             JOIN projects p ON p.id = f.project_id

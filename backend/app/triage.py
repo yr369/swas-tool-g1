@@ -309,10 +309,21 @@ async def triage_project_findings(conn, project_id: int) -> int:
             outcome_stats=outcome_stats, vrt_entries=vrt_entries,
             self_declared_severity=self_declared_severity,
         )
+        outcome = result.get("likely_program_outcome")
         await conn.execute(
-            "UPDATE findings SET severity = $1 WHERE id = $2",
+            """
+            UPDATE findings
+            SET severity = $1,
+                likely_program_outcome = $2,
+                triage_reasoning = $3,
+                triage_confidence = $4
+            WHERE id = $5
+            """,
             result["severity"] if result["severity"] in
             ("critical", "high", "medium", "low", "info") else "unknown",
+            outcome if outcome in ("accepted", "informative", "out_of_scope", "duplicate") else None,
+            result.get("reasoning"),
+            result.get("confidence"),
             row["id"],
         )
         triaged += 1

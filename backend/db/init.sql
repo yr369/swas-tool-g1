@@ -85,12 +85,17 @@ CREATE TABLE IF NOT EXISTS findings (
     gate_status     TEXT NOT NULL DEFAULT 'pending'
                     CHECK (gate_status IN ('pending', 'passed', 'failed')),
     gate_reasoning  TEXT,
+    likely_program_outcome TEXT
+                    CHECK (likely_program_outcome IN ('accepted', 'informative', 'out_of_scope', 'duplicate')),
+    triage_reasoning TEXT,
+    triage_confidence REAL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Indexes for the lookups we'll actually do often
 CREATE INDEX IF NOT EXISTS idx_scope_targets_project ON scope_targets(project_id);
 CREATE INDEX IF NOT EXISTS idx_phase_runs_project ON phase_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_findings_likely_program_outcome ON findings(likely_program_outcome);
 CREATE INDEX IF NOT EXISTS idx_phase_runs_status ON phase_runs(status);
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
