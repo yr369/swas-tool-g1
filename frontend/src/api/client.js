@@ -87,6 +87,8 @@ export const api = {
     if (filters.severity) params.set("severity", filters.severity);
     if (filters.tool_name) params.set("tool_name", filters.tool_name);
     if (filters.q) params.set("q", filters.q);
+    if (filters.likely_program_outcome) params.set("likely_program_outcome", filters.likely_program_outcome);
+    if (filters.limit) params.set("limit", filters.limit);
     const qs = params.toString();
     return request(`/findings${qs ? `?${qs}` : ""}`);
   },

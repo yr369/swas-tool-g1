@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { Donut } from "../components/charts/Donut";
+import { AttackSurfaceGraph } from "../components/AttackSurfaceGraph";
 
 const STATUS_LABEL = { created: "Created", scanning: "Scanning", completed: "Completed", archived: "Archived" };
 const STATUS_ORDER = ["scanning", "created", "completed", "archived"];
@@ -12,6 +13,11 @@ export function ProjectList() {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkResult, setBulkResult] = useState(null);
+  // "list" is the default/original view - the graph is additive (Batch
+  // 7), not a replacement, so nothing about the existing bulk-select
+  // workflow below changes or is at risk of regressing.
+  const [view, setView] = useState("list");
+  const [findings, setFindings] = useState([]);
 
   function load() {
     return api
@@ -28,6 +34,12 @@ export function ProjectList() {
   useEffect(() => {
     load();
   }, []);
+
+  useEffect(() => {
+    if (view === "graph" && findings.length === 0) {
+      api.listAllFindings({ limit: 2000 }).then(setFindings).catch((err) => setError(err.message));
+    }
+  }, [view]); // eslint-disable-line react-hooks/exhaustive-deps -- findings intentionally excluded, loaded once and cached
 
   const statusCounts = useMemo(() => {
     if (!projects) return null;
@@ -91,9 +103,15 @@ export function ProjectList() {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
         <h1 style={{ fontSize: 22, fontWeight: 600, margin: 0 }}>Projects</h1>
-        <Link to="/new" style={newButtonStyle}>
-          + New project
-        </Link>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
+            <button onClick={() => setView("list")} style={toggleButtonStyle(view === "list")}>List</button>
+            <button onClick={() => setView("graph")} style={toggleButtonStyle(view === "graph")}>Graph</button>
+          </div>
+          <Link to="/new" style={newButtonStyle}>
+            + New project
+          </Link>
+        </div>
       </div>
 
       {projects.length === 0 ? (
@@ -114,100 +132,106 @@ export function ProjectList() {
             <Donut segments={donutSegments} centerLabel="projects by status" />
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
-              <input
-                type="checkbox"
-                checked={selected.size === projects.length}
-                onChange={toggleAll}
-                ref={(el) => {
-                  if (el) el.indeterminate = selected.size > 0 && selected.size < projects.length;
-                }}
-              />
-              Select all
-            </label>
+          {view === "graph" ? (
+            <AttackSurfaceGraph projects={projects} findings={findings} />
+          ) : (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+                  <input
+                    type="checkbox"
+                    checked={selected.size === projects.length}
+                    onChange={toggleAll}
+                    ref={(el) => {
+                      if (el) el.indeterminate = selected.size > 0 && selected.size < projects.length;
+                    }}
+                  />
+                  Select all
+                </label>
 
-            {selected.size > 0 && (
-              <>
-                <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{selected.size} selected</span>
-                <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
-                  {bulkRunning ? "…" : "Archive selected"}
-                </button>
-                <button
-                  onClick={() => handleBulkAction("delete")}
-                  disabled={bulkRunning}
-                  style={{ ...secondaryButtonStyle, color: "var(--status-fail)" }}
-                >
-                  {bulkRunning ? "…" : "Delete selected"}
-                </button>
-              </>
-            )}
-          </div>
+                {selected.size > 0 && (
+                  <>
+                    <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{selected.size} selected</span>
+                    <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
+                      {bulkRunning ? "…" : "Archive selected"}
+                    </button>
+                    <button
+                      onClick={() => handleBulkAction("delete")}
+                      disabled={bulkRunning}
+                      style={{ ...secondaryButtonStyle, color: "var(--status-fail)" }}
+                    >
+                      {bulkRunning ? "…" : "Delete selected"}
+                    </button>
+                  </>
+                )}
+              </div>
 
-          {bulkResult && (
-            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-              {bulkResult.action === "archive" ? (
-                <span style={{ color: "var(--status-success)" }}>Archived {bulkResult.succeeded.length}.</span>
-              ) : (
-                <span style={{ color: "var(--status-success)" }}>Deleted {bulkResult.succeeded.length}.</span>
-              )}
-              {bulkResult.blocked.length > 0 && (
-                <div style={{ color: "var(--sev-medium)", marginTop: 4 }}>
-                  Skipped {bulkResult.blocked.length} (has findings - set to archived instead if you want it out of the active list):{" "}
-                  {bulkResult.blocked.map((b) => `${b.name} (${b.reason})`).join(", ")}
+              {bulkResult && (
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
+                  {bulkResult.action === "archive" ? (
+                    <span style={{ color: "var(--status-success)" }}>Archived {bulkResult.succeeded.length}.</span>
+                  ) : (
+                    <span style={{ color: "var(--status-success)" }}>Deleted {bulkResult.succeeded.length}.</span>
+                  )}
+                  {bulkResult.blocked.length > 0 && (
+                    <div style={{ color: "var(--sev-medium)", marginTop: 4 }}>
+                      Skipped {bulkResult.blocked.length} (has findings - set to archived instead if you want it out of the active list):{" "}
+                      {bulkResult.blocked.map((b) => `${b.name} (${b.reason})`).join(", ")}
+                    </div>
+                  )}
                 </div>
               )}
-            </div>
-          )}
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {projects.map((p) => (
-              <div
-                key={p.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                  padding: "14px 16px",
-                  background: "var(--bg-surface)",
-                  border: "1px solid var(--border)",
-                  borderRadius: "var(--radius-lg)",
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={selected.has(p.id)}
-                  onChange={() => toggleOne(p.id)}
-                  onClick={(e) => e.stopPropagation()}
-                />
-                <Link
-                  to={`/projects/${p.id}`}
-                  style={{
-                    flex: 1,
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    textDecoration: "none",
-                    color: "var(--text-primary)",
-                    minWidth: 0,
-                  }}
-                >
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontWeight: 500 }}>{p.name}</span>
-                      <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                        #{p.id}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-                      {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
-                    </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {projects.map((p) => (
+                  <div
+                    key={p.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                      padding: "14px 16px",
+                      background: "var(--bg-surface)",
+                      border: "1px solid var(--border)",
+                      borderRadius: "var(--radius-lg)",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected.has(p.id)}
+                      onChange={() => toggleOne(p.id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                    <Link
+                      to={`/projects/${p.id}`}
+                      style={{
+                        flex: 1,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        textDecoration: "none",
+                        color: "var(--text-primary)",
+                        minWidth: 0,
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ fontWeight: 500 }}>{p.name}</span>
+                          <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                            #{p.id}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                          {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
+                        </div>
+                      </div>
+                      <StatusPill status={p.status} />
+                    </Link>
                   </div>
-                  <StatusPill status={p.status} />
-                </Link>
+                ))}
               </div>
-            ))}
-          </div>
+            </>
+          )}
         </>
       )}
     </div>
@@ -269,3 +293,14 @@ const secondaryButtonStyle = {
   fontSize: 12,
   cursor: "pointer",
 };
+
+function toggleButtonStyle(active) {
+  return {
+    background: active ? "var(--accent-dim)" : "transparent",
+    color: active ? "var(--accent)" : "var(--text-secondary)",
+    border: "none",
+    padding: "6px 14px",
+    fontSize: 12,
+    cursor: "pointer",
+  };
+}
