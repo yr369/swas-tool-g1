@@ -31,7 +31,26 @@ async def connect_db() -> None:
     _pool = await asyncpg.create_pool(
         dsn=database_url,
         min_size=2,
-        max_size=10,
+        # Was 10 - too low for a project with many scope targets scanning
+        # concurrently. Each target's pipeline task holds ONE connection
+        # for its entire run (recon + every detective check, many of
+        # which are slow outbound network calls), not per-query - so
+        # more than ~10 concurrently-scanning targets on a single
+        # project saturates the pool and blocks everything else in the
+        # app, including /api/health, until a target pipeline finishes.
+        # Confirmed live on OCI: a project with 7+ concurrent scope
+        # targets held all 10 connections idle-but-checked-out for
+        # minutes. 30 gives real headroom without approaching Postgres's
+        # own default max_connections=100 (no override set in
+        # docker-compose.yml, so there's plenty of room).
+        #
+        # This doesn't fix the underlying pattern (holding a connection
+        # for a whole pipeline run instead of acquiring per-query) - it
+        # just raises the ceiling enough that a large project doesn't
+        # starve the rest of the app. The real fix is a bigger change
+        # (acquire/release per query inside pipeline.py) worth doing as
+        # its own pass, not a one-line config tweak.
+        max_size=30,
         # If the database is briefly unreachable (e.g. restarting), don't
         # fail immediately - give it a few seconds to come back.
         timeout=10,
