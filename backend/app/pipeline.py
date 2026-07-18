@@ -465,7 +465,7 @@ async def _phase_scan(
         # this deliberately never becomes a findings-table row.
         csp_note = await detective.check_csp_weakness(host)
         if csp_note is not None:
-            logger.info("detective: CSP recon note: %s", csp_note)
+            await _save_scan_note(conn, project_id, target_id, "csp_weakness", csp_note)
 
         # Batch 3 per-host checks: GraphQL introspection, exposed
         # container control APIs, exposed .git directory.
@@ -497,7 +497,7 @@ async def _phase_scan(
         logger.info("detective: running GraphQL GET query check for %s", host)
         graphql_get_note = await detective.check_graphql_query_via_get(host.rstrip("/") + "/graphql")
         if graphql_get_note is not None:
-            logger.info("detective: GraphQL GET query note: %s", graphql_get_note)
+            await _save_scan_note(conn, project_id, target_id, "graphql_query_via_get", graphql_get_note)
 
         container_api_result = await detective.check_exposed_container_api(host)
         if container_api_result is not None:
@@ -529,7 +529,7 @@ async def _phase_scan(
                     ),
                 })
             else:
-                logger.info("detective: git reconstruction did not succeed for %s: %s", host, dump_result.note)
+                await _save_scan_note(conn, project_id, target_id, "git_exposure", f"{host}: {dump_result.note}")
 
         # Batch 4 per-host checks: exposed Elasticsearch, Prometheus/
         # Spring Actuator, NoSQL DB ports, and Swagger/OpenAPI docs.
@@ -554,7 +554,7 @@ async def _phase_scan(
         # WebSocket CSWSH.
         waf_note = await detective.check_waf_fingerprint(host)
         if waf_note is not None:
-            logger.info("detective: WAF recon note: %s", waf_note)
+            await _save_scan_note(conn, project_id, target_id, "waf_fingerprint", waf_note)
 
         heapdump_result = await detective.check_heapdump_exposure(host)
         if heapdump_result is not None:
@@ -601,7 +601,7 @@ async def _phase_scan(
         logger.info("detective: running JWT kid injection check for %s", host)
         jwt_kid_note = await detective.check_jwt_kid_header_injection_candidate(host)
         if jwt_kid_note is not None:
-            logger.info("detective: JWT kid injection note: %s", jwt_kid_note)
+            await _save_scan_note(conn, project_id, target_id, "jwt_kid_header_injection_candidate", jwt_kid_note)
 
         logger.info("detective: running host header injection check for %s", host)
         hhi_result = await detective.check_host_header_injection(host)
@@ -619,13 +619,13 @@ async def _phase_scan(
         logger.info("detective: running admin panel exposure check for %s", host)
         admin_panel_note = await detective.check_exposed_admin_panel(host)
         if admin_panel_note is not None:
-            logger.info("detective: admin panel note: %s", admin_panel_note)
+            await _save_scan_note(conn, project_id, target_id, "exposed_admin_panel", admin_panel_note)
 
         # Batches 15/17: infra-level checks grouped together.
         logger.info("detective: running SPF/DMARC check for %s", host)
         spf_dmarc_note = await detective.check_missing_spf_dmarc(host)
         if spf_dmarc_note is not None:
-            logger.info("detective: SPF/DMARC note: %s", spf_dmarc_note)
+            await _save_scan_note(conn, project_id, target_id, "missing_spf_dmarc", spf_dmarc_note)
 
         logger.info("detective: running origin IP WAF bypass check for %s", host)
         origin_ip_result = await detective.check_origin_ip_waf_bypass(host)
@@ -647,12 +647,12 @@ async def _phase_scan(
         logger.info("detective: running Swagger path enumeration check for %s", host)
         swagger_enum_note = await detective.check_swagger_path_enumeration_unauth(host)
         if swagger_enum_note is not None:
-            logger.info("detective: Swagger path enumeration note: %s", swagger_enum_note)
+            await _save_scan_note(conn, project_id, target_id, "swagger_exposure_enum", swagger_enum_note)
 
         logger.info("detective: running TRACE method check for %s", host)
         trace_method_note = await detective.check_http_trace_method_enabled(host)
         if trace_method_note is not None:
-            logger.info("detective: TRACE method note: %s", trace_method_note)
+            await _save_scan_note(conn, project_id, target_id, "http_trace_method_enabled", trace_method_note)
 
         logger.info("detective: running docker-compose exposure check for %s", host)
         docker_compose_result = await detective.check_exposed_docker_compose_file(host)
@@ -1035,7 +1035,7 @@ async def _phase_scan(
             logger.debug("HTTP parameter pollution check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: HPP recon note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "http_param_pollution", res)
 
     # Detective check: reflected SSRF (batch 7) - non-blind only,
     # requires an existing query parameter to redirect at cloud
@@ -1107,7 +1107,7 @@ async def _phase_scan(
             logger.debug("IDOR candidate check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: IDOR candidate note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "idor_candidate", res)
 
     # Detective check: reflected XSS (batch 9).
     xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]
@@ -1181,7 +1181,7 @@ async def _phase_scan(
             logger.debug("deserialization signature check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: deserialization signature note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "insecure_deserialization_signature", res)
 
     # Detective check: path traversal / LFI (batch 10).
     path_traversal_candidates = [url for url in sane_discovered_urls if "=" in url][:_PATH_TRAVERSAL_CHECK_CAP]
@@ -1253,7 +1253,7 @@ async def _phase_scan(
             logger.debug("DOM XSS sink check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: DOM XSS sink note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "dom_xss_sink_flagging", res)
 
     # Detective check: auth bypass via method/path override headers
     # (batch 11). Runs against any discovered URL, not just
@@ -1328,7 +1328,7 @@ async def _phase_scan(
             logger.debug("missing SRI check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: missing SRI note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "missing_sri", res)
 
     # ---- Batch 13 (larger batch, 8 checks) ----
 
@@ -1398,7 +1398,7 @@ async def _phase_scan(
             logger.debug("negative number business logic check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: negative number candidate note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "negative_number_business_logic_candidate", res)
 
     # Detective check: predictable/weak token pattern. Recon-only,
     # pure pattern match on URLs already fetched elsewhere - no extra
@@ -1417,7 +1417,7 @@ async def _phase_scan(
             logger.debug("predictable token pattern check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: predictable token note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "predictable_token_pattern", res)
 
     # Detective check: missing clickjacking protection. Recon-only -
     # almost always Informative alone, see the check's own docstring.
@@ -1435,7 +1435,7 @@ async def _phase_scan(
             logger.debug("clickjacking protection check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: clickjacking note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "clickjacking_missing_protection", res)
 
     # Detective check: hardcoded secrets / internal infra disclosure.
     # Recon-only - broader/less format-specific than
@@ -1454,7 +1454,7 @@ async def _phase_scan(
             logger.debug("hardcoded secrets check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: hardcoded secrets note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "hardcoded_secrets_and_internal_disclosure", res)
 
     # ---- Batch 14 (bulkier still, 10 checks) ----
 
@@ -1540,7 +1540,7 @@ async def _phase_scan(
             logger.debug("CSRF token check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: CSRF token note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "csrf_token_missing", res)
 
     # Detective check: file upload form candidate. Recon-only, never
     # attempts an actual upload - see the check's own docstring.
@@ -1557,7 +1557,7 @@ async def _phase_scan(
             logger.debug("file upload form check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: file upload form note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "file_upload_form_candidate", res)
 
     # Detective check: WebSocket loaded over unencrypted ws:// from
     # an HTTPS page.
@@ -1594,7 +1594,7 @@ async def _phase_scan(
             logger.debug("excessive data exposure check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: excessive data exposure note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "excessive_data_exposure_api", res)
 
     # Detective check: API version downgrade bypass.
     api_version_candidates = sane_discovered_urls[:_API_VERSION_DOWNGRADE_CHECK_CAP]
@@ -1644,7 +1644,7 @@ async def _phase_scan(
             logger.debug("SVG upload flagging check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: SVG upload note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "insecure_svg_upload_flagging", res)
 
     # Detective check: JSONP callback XSS.
     jsonp_xss_candidates = sane_discovered_urls[:_JSONP_XSS_CHECK_CAP]
@@ -1725,7 +1725,7 @@ async def _phase_scan(
             logger.debug("HSTS check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: HSTS note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "hsts", res)
 
     # Detective check: session cookie missing SameSite. Recon-only.
     cookie_samesite_candidates = sane_discovered_urls[:_COOKIE_SAMESITE_CHECK_CAP]
@@ -1741,7 +1741,7 @@ async def _phase_scan(
             logger.debug("cookie SameSite check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: cookie SameSite note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "cookie_samesite", res)
 
     # Detective check: session identifier in URL. Recon-only, pure
     # pattern match - no extra requests, capped higher.
@@ -1758,7 +1758,7 @@ async def _phase_scan(
             logger.debug("session ID in URL check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: session ID in URL note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "session_id_in_url", res)
 
     # Detective check: open redirect via meta-refresh.
     meta_refresh_candidates = [url for url in sane_discovered_urls if "=" in url][:_META_REFRESH_CHECK_CAP]
@@ -1807,7 +1807,7 @@ async def _phase_scan(
             logger.debug("predictable UUID version check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: predictable UUID note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "predictable_uuid_version", res)
 
     # ---- Batches 29-33 URL-level checks (11 total) ----
 
@@ -1823,7 +1823,7 @@ async def _phase_scan(
             logger.debug("OAuth state param check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: OAuth state param note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "oauth_missing_state_parameter", res)
 
     # Detective check: Basic Auth over plaintext HTTP.
     basic_auth_http_candidates = sane_discovered_urls[:_BASIC_AUTH_HTTP_CHECK_CAP]
@@ -1851,7 +1851,7 @@ async def _phase_scan(
             logger.debug("cookie Secure flag check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: cookie Secure flag note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "cookie_missing_secure_flag", res)
 
     # Detective check: Firebase Realtime DB open read rules.
     firebase_rtdb_candidates = sane_discovered_urls[:_FIREBASE_RTDB_CHECK_CAP]
@@ -1950,7 +1950,7 @@ async def _phase_scan(
             logger.debug("API key in URL check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: API key in URL note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "api_key_in_url_query_param", res)
 
     # Detective check: password-reset user-enumeration candidate.
     # Recon-only.
@@ -1965,7 +1965,7 @@ async def _phase_scan(
             logger.debug("password reset enumeration check raised: %s", res)
             continue
         if res is not None:
-            logger.info("detective: password reset enumeration note: %s", res)
+            await _save_scan_note(conn, project_id, target_id, "password_reset_user_enumeration_candidate", res)
 
 
 # A hostname like "aem-prod.example.com" or a tech-stack detection
@@ -2137,6 +2137,30 @@ async def _save_finding(
         cleaned_output[:5000],  # cap stored evidence length
     )
     await _upsert_finding_cluster(conn, target_id, finding_id, tool_name)
+
+
+async def _save_scan_note(
+    conn: asyncpg.Connection, project_id: int, target_id: int, check_name: str, note: str
+) -> None:
+    """
+    Persists a detective.py signal that was deliberately NOT auto-filed
+    as a finding (see each check's own docstring, and add_scan_notes.sql
+    for the full reasoning) - candidates for manual review, or confirmed
+    gaps that are almost always Informative alone.
+
+    This replaces what used to be a bare logger.info() call: computed,
+    correctly classified as "worth a human look, not a formal finding,"
+    then thrown away into a Docker log nobody reads. Same classification,
+    same restraint about not treating it as a graded finding - just
+    actually visible now (GET /api/projects/{id}/notes) instead of gone.
+    """
+    await conn.execute(
+        """
+        INSERT INTO scan_notes (project_id, target_id, check_name, note)
+        VALUES ($1, $2, $3, $4)
+        """,
+        project_id, target_id, check_name, note[:2000],
+    )
 
 
 async def _save_detective_finding(

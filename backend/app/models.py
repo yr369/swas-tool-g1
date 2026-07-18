@@ -183,6 +183,22 @@ class PhaseRun(BaseModel):
 
 # ---------- Findings ----------
 
+class ScanNote(BaseModel):
+    """A detective.py signal that's deliberately NOT a formal finding -
+    either an unconfirmed pattern match needing a human look, or a
+    confirmed-but-usually-informative-alone gap (clickjacking, missing
+    SRI, etc.) - see add_scan_notes.sql for the full reasoning. Kept
+    separate from Finding so these don't affect severity counts or
+    trigger AI triage calls on speculative matches."""
+    id: int
+    project_id: int
+    target_id: Optional[int] = None
+    check_name: str
+    note: str
+    dismissed: bool
+    created_at: datetime
+
+
 class Finding(BaseModel):
     id: int
     project_id: int
@@ -196,6 +212,7 @@ class Finding(BaseModel):
     likely_program_outcome: Optional[Literal["accepted", "informative", "out_of_scope", "duplicate"]] = None
     triage_reasoning: Optional[str] = None
     triage_confidence: Optional[float] = None
+    has_logged_outcome: bool = False
     created_at: datetime
 
 
