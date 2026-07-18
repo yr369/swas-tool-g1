@@ -169,6 +169,9 @@ class Finding(BaseModel):
     evidence: Optional[str]
     raw_output_path: Optional[str]
     status: Literal["new", "reviewed", "submitted", "dismissed"]
+    likely_program_outcome: Optional[Literal["accepted", "informative", "out_of_scope", "duplicate"]] = None
+    triage_reasoning: Optional[str] = None
+    triage_confidence: Optional[float] = None
     created_at: datetime
 
 
