@@ -43,11 +43,22 @@ logger = logging.getLogger("swas.gemini_rotation")
 # availability changes on Google's side periodically - if a model here
 # stops existing or stops being free, just edit this list, nothing else
 # needs to change.
+#
+# As of July 2026: gemini-1.5-flash is fully shut down (404s on every
+# call - confirmed live). gemini-2.0-flash passed its own June 1, 2026
+# shutdown date and is on borrowed time (still answering with quota
+# errors as of this edit, but liable to 404 at any point without
+# further notice) - both removed. gemini-3.1-flash-lite and
+# gemini-3.5-flash added: neither has an announced shutdown date yet,
+# per https://ai.google.dev/gemini-api/docs/deprecations. The 2.5
+# family stays in rotation too - it doesn't shut down until Oct 16,
+# 2026, still months out - but don't be surprised if this list needs
+# another pass before then.
 MODEL_ROTATION = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash",
     "gemini-2.5-pro",
 ]
 
