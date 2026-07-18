@@ -60,6 +60,36 @@ class ProjectBulkActionResult(BaseModel):
     blocked: list[ProjectBulkBlocked]
 
 
+# ---------- Scan queue (Batch 4b) ----------
+
+class QueueEnqueueRequest(BaseModel):
+    """priority=True jumps ahead of all normal (non-priority) items, but
+    still queues FIFO behind any other priority items already waiting -
+    it's a separate lane, not a "run this right now" override."""
+    project_id: int
+    priority: bool = False
+
+
+class QueueReorderRequest(BaseModel):
+    """new_position is 1-indexed, counted within the item's own lane
+    (priority items only reorder among priority items, normal items only
+    among normal items) - matches a drag-and-drop list per lane in the UI."""
+    new_position: int
+
+
+class ScanQueueItem(BaseModel):
+    id: int
+    project_id: int
+    project_name: str
+    position: int
+    priority: bool
+    status: Literal["queued", "running", "completed", "cancelled"]
+    queued_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    estimated_start_at: Optional[datetime] = None
+
+
 # ---------- Scope targets ----------
 
 class ScopeTargetCreate(BaseModel):

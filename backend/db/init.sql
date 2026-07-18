@@ -45,6 +45,30 @@ CREATE TABLE IF NOT EXISTS phase_runs (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Batch 4b: ordered queue of projects waiting for a scan slot. The
+-- worker loop runs one project at a time (see _queue_worker_loop in
+-- main.py) - both manual "Scan" clicks and the recurring scheduler add
+-- a row here rather than kicking off _trigger_scan_for_project directly,
+-- so there is exactly one execution path instead of two competing ones.
+CREATE TABLE IF NOT EXISTS scan_queue (
+    id              SERIAL PRIMARY KEY,
+    project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    priority        BOOLEAN NOT NULL DEFAULT false,
+    status          TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued', 'running', 'completed', 'cancelled')),
+    queued_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_queue_next
+    ON scan_queue (status, priority DESC, position ASC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_queue_one_active_per_project
+    ON scan_queue (project_id)
+    WHERE status IN ('queued', 'running');
+
 -- A candidate vulnerability found by a scanning tool, pending human review
 CREATE TABLE IF NOT EXISTS findings (
     id              SERIAL PRIMARY KEY,
