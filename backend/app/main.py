@@ -31,6 +31,9 @@ from .models import (
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
+    QueueEnqueueRequest,
+    QueueReorderRequest,
+    ScanQueueItem,
     ScopeTarget,
     ScopeTargetCreate,
     ScopeTargetUpdate,
@@ -186,12 +189,14 @@ async def _run_due_scheduled_scans() -> None:
     for row in due:
         project_id = row["id"]
         try:
-            await _trigger_scan_for_project(project_id)
-            logger.info("scheduler: kicked off scheduled scan for project %s", project_id)
+            await _enqueue_project(project_id, priority=False)
+            logger.info("scheduler: added scheduled scan for project %s to the queue", project_id)
         except HTTPException as exc:
+            # 409 here just means it's already queued/running from a
+            # previous trigger - not an error, nothing else to do.
             logger.warning("scheduler: skipped project %s (%s)", project_id, exc.detail)
         except Exception:
-            logger.exception("scheduler: unexpected error kicking off project %s", project_id)
+            logger.exception("scheduler: unexpected error enqueueing project %s", project_id)
         finally:
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -218,6 +223,136 @@ async def _scheduler_loop() -> None:
         except Exception:
             logger.exception("scheduler loop iteration failed - will retry in 60s")
         await asyncio.sleep(60)
+
+
+async def _enqueue_project(project_id: int, priority: bool = False) -> dict:
+    """Adds a project to the scan queue instead of triggering it directly.
+    Both the manual POST /scan endpoint and the scheduler loop now call
+    this instead of _trigger_scan_for_project - the queue worker loop
+    below is the ONLY thing that ever calls _trigger_scan_for_project, so
+    there is one execution path, not two competing ones.
+
+    Position is per-lane (priority items are ordered among themselves,
+    normal items among themselves) - the worker always drains all
+    priority items before touching a normal one, regardless of position
+    number, via ORDER BY priority DESC, position ASC.
+
+    Raises HTTPException(409) if this project already has an active
+    (queued or running) queue entry - matches the DB's partial unique
+    index, so this is a friendly pre-check, not the only guard.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        existing = await conn.fetchrow(
+            "SELECT id FROM scan_queue WHERE project_id = $1 AND status IN ('queued', 'running')",
+            project_id,
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="This project already has an active queue entry",
+            )
+
+        next_position = await conn.fetchval(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM scan_queue WHERE priority = $1 AND status = 'queued'",
+            priority,
+        )
+        row = await conn.fetchrow(
+            """
+            INSERT INTO scan_queue (project_id, position, priority)
+            VALUES ($1, $2, $3)
+            RETURNING id, project_id, position, priority, status, queued_at, started_at, completed_at
+            """,
+            project_id, next_position, priority,
+        )
+    return dict(row)
+
+
+async def _run_due_queue_item() -> None:
+    """One pass of the queue worker: first, reconcile any 'running' queue
+    row whose project has already left 'scanning' (the scan finished,
+    but nothing told the queue) - then, if nothing is running, start the
+    next queued item.
+
+    Deliberately serial - only one 'running' row at a time, project-wide,
+    not per-project. This matches the plan's "queue position + estimated
+    start time" requirement, which only makes sense if items actually
+    wait their turn instead of all running concurrently.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        running = await conn.fetchrow(
+            """
+            SELECT sq.id, sq.project_id, p.status AS project_status
+            FROM scan_queue sq JOIN projects p ON p.id = sq.project_id
+            WHERE sq.status = 'running'
+            """
+        )
+        if running is not None:
+            if running["project_status"] != "scanning":
+                await conn.execute(
+                    "UPDATE scan_queue SET status = 'completed', completed_at = now() WHERE id = $1",
+                    running["id"],
+                )
+            else:
+                return  # still running, nothing else to do this pass
+
+        next_item = await conn.fetchrow(
+            """
+            SELECT id, project_id FROM scan_queue
+            WHERE status = 'queued'
+            ORDER BY priority DESC, position ASC
+            LIMIT 1
+            """
+        )
+        if next_item is None:
+            return
+
+    try:
+        await _trigger_scan_for_project(next_item["project_id"])
+    except HTTPException as exc:
+        logger.warning(
+            "queue: skipping project %s (%s) - marking queue entry cancelled",
+            next_item["project_id"], exc.detail,
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE scan_queue SET status = 'cancelled', completed_at = now() WHERE id = $1",
+                next_item["id"],
+            )
+        return
+    except Exception:
+        logger.exception("queue: unexpected error starting project %s", next_item["project_id"])
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE scan_queue SET status = 'cancelled', completed_at = now() WHERE id = $1",
+                next_item["id"],
+            )
+        return
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE scan_queue SET status = 'running', started_at = now() WHERE id = $1",
+            next_item["id"],
+        )
+
+
+async def _queue_worker_loop() -> None:
+    """Runs for the lifetime of the app, checking the queue every 10s.
+    Faster than the 60s scheduler loop since queue turnaround is meant
+    to feel responsive (an operator watching the queue after a manual
+    enqueue shouldn't wait up to a minute for it to start)."""
+    logger.info("scan queue worker started (checks every 10s)")
+    while True:
+        try:
+            await _run_due_queue_item()
+        except Exception:
+            logger.exception("queue worker iteration failed - will retry in 10s")
+        await asyncio.sleep(10)
 
 
 @asynccontextmanager
@@ -256,6 +391,18 @@ async def lifespan(app: FastAPI):
         if stuck_project_rows:
             await conn.execute("UPDATE projects SET status = 'created' WHERE status = 'scanning'")
 
+        # Same orphaning problem, one level up: a queue row left
+        # 'running' from a killed process now points at a project that
+        # was just reset to 'created' above - the worker loop would see
+        # project_status != 'scanning' and mark it 'completed' (a lie,
+        # it never finished). Put it back at the front of its lane
+        # instead so the worker retries it for real.
+        stuck_queue_rows = await conn.fetch("SELECT id, project_id FROM scan_queue WHERE status = 'running'")
+        if stuck_queue_rows:
+            await conn.execute(
+                "UPDATE scan_queue SET status = 'queued', position = 0, started_at = NULL WHERE status = 'running'"
+            )
+
     if recovered_count > 0:
         logger.warning(
             "Found and flagged %d scan phase(s) interrupted by a previous "
@@ -271,11 +418,21 @@ async def lifespan(app: FastAPI):
             ", ".join(f"{r['id']}:{r['name']}" for r in stuck_project_rows),
         )
 
+    if stuck_queue_rows:
+        logger.warning(
+            "Reset %d scan_queue row(s) stuck on 'running' from a previous restart "
+            "back to 'queued' at the front of their lane: %s",
+            len(stuck_queue_rows),
+            ", ".join(f"{r['id']}:project {r['project_id']}" for r in stuck_queue_rows),
+        )
+
     scheduler_task = asyncio.create_task(_scheduler_loop())
+    queue_worker_task = asyncio.create_task(_queue_worker_loop())
 
     yield
     # Runs once when the app shuts down (e.g. container stopping)
     scheduler_task.cancel()
+    queue_worker_task.cancel()
     await database.disconnect_db()
 
 
@@ -1004,22 +1161,153 @@ async def get_signature_stats(signature: str = None):
 # ---------- Scanning pipeline ----------
 
 @app.post("/api/projects/{project_id}/scan")
-async def start_scan(project_id: int):
+async def start_scan(project_id: int, priority: bool = False):
     """
-    Kicks off scanning for every in-scope target in this project. Runs in
-    the background - this endpoint returns immediately rather than
-    making the operator's browser wait for scans that can take a long
-    time. Progress can be checked via GET /api/projects/{id}/phase-runs.
+    Adds this project to the scan queue (Batch 4b) rather than kicking
+    off scanning immediately - the queue worker loop is now the single
+    execution path for both manual and scheduled scans, so a click here
+    behaves identically to a scheduled trigger arriving, just in the
+    "priority" lane by default request or the normal lane depending on
+    the `priority` query param.
 
-    Phase 1 keeps this simple: every in-scope target starts its pipeline
-    concurrently (no queue/concurrency cap yet - that's a later phase).
-
-    The actual kickoff logic lives in _trigger_scan_for_project(), shared
-    with the scheduled-scan background loop so both paths behave
-    identically - this endpoint is now just the HTTP-triggered entry
-    point into that shared logic.
+    Returns the created queue entry rather than a scan-started message -
+    check GET /api/queue for position, or /api/projects/{id}/phase-runs
+    once it actually starts running.
     """
-    return await _trigger_scan_for_project(project_id)
+    return await _enqueue_project(project_id, priority=priority)
+
+
+# ---------- Scan queue (Batch 4b) ----------
+
+async def _queue_row_to_item(conn, row) -> dict:
+    """Attaches project_name and a rough estimated_start_at to a raw
+    scan_queue row - estimated_start_at is (# active items ahead of this
+    one in its lane, including a currently-running item) * the average
+    duration of the last 5 completed queue items, or None if there's no
+    history yet to estimate from."""
+    avg_seconds = await conn.fetchval(
+        """
+        SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at)))
+        FROM (
+            SELECT completed_at, started_at FROM scan_queue
+            WHERE status = 'completed' AND started_at IS NOT NULL
+            ORDER BY completed_at DESC LIMIT 5
+        ) recent
+        """
+    )
+    estimated_start_at = None
+    if row["status"] == "queued" and avg_seconds:
+        ahead = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM scan_queue
+            WHERE status = 'running'
+               OR (status = 'queued' AND priority = $1 AND position < $2)
+               OR (status = 'queued' AND priority = true AND $1 = false)
+            """,
+            row["priority"], row["position"],
+        )
+        estimated_start_at = datetime.now(timezone.utc).timestamp() + ahead * avg_seconds
+        estimated_start_at = datetime.fromtimestamp(estimated_start_at, tz=timezone.utc)
+
+    item = dict(row)
+    item["estimated_start_at"] = estimated_start_at
+    return item
+
+
+@app.get("/api/queue", response_model=List[ScanQueueItem])
+async def list_queue():
+    """Everything still queued or running, in the order the worker will
+    (or is) process them: priority lane fully drained first, each lane
+    FIFO by position."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT sq.id, sq.project_id, p.name AS project_name, sq.position,
+                   sq.priority, sq.status, sq.queued_at, sq.started_at, sq.completed_at
+            FROM scan_queue sq JOIN projects p ON p.id = sq.project_id
+            WHERE sq.status IN ('queued', 'running')
+            ORDER BY sq.status = 'running' DESC, sq.priority DESC, sq.position ASC
+            """
+        )
+        return [await _queue_row_to_item(conn, row) for row in rows]
+
+
+@app.post("/api/queue", response_model=ScanQueueItem)
+async def enqueue(payload: QueueEnqueueRequest):
+    """Manual enqueue, separate from POST /scan's convenience shortcut -
+    useful for the UI's queue view (e.g. an "add to queue" action that
+    doesn't live on the project page itself)."""
+    pool = database.get_pool()
+    row = await _enqueue_project(payload.project_id, priority=payload.priority)
+    async with pool.acquire() as conn:
+        full_row = await conn.fetchrow(
+            """
+            SELECT sq.id, sq.project_id, p.name AS project_name, sq.position,
+                   sq.priority, sq.status, sq.queued_at, sq.started_at, sq.completed_at
+            FROM scan_queue sq JOIN projects p ON p.id = sq.project_id
+            WHERE sq.id = $1
+            """,
+            row["id"],
+        )
+        return await _queue_row_to_item(conn, full_row)
+
+
+@app.patch("/api/queue/{queue_id}/reorder", response_model=ScanQueueItem)
+async def reorder_queue_item(queue_id: int, payload: QueueReorderRequest):
+    """Drag-to-reorder within a queued item's own lane (priority items
+    only reorder among priority items, same for normal). Only 'queued'
+    items can move - a 'running' item is, by definition, already first."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        item = await conn.fetchrow("SELECT * FROM scan_queue WHERE id = $1", queue_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Queue entry not found")
+        if item["status"] != "queued":
+            raise HTTPException(status_code=400, detail="Only queued (not running/completed) entries can be reordered")
+
+        lane_ids = [
+            r["id"] for r in await conn.fetch(
+                "SELECT id FROM scan_queue WHERE status = 'queued' AND priority = $1 ORDER BY position ASC",
+                item["priority"],
+            )
+        ]
+        lane_ids.remove(queue_id)
+        new_index = max(0, min(payload.new_position - 1, len(lane_ids)))
+        lane_ids.insert(new_index, queue_id)
+
+        for i, row_id in enumerate(lane_ids, start=1):
+            await conn.execute("UPDATE scan_queue SET position = $1 WHERE id = $2", i, row_id)
+
+        full_row = await conn.fetchrow(
+            """
+            SELECT sq.id, sq.project_id, p.name AS project_name, sq.position,
+                   sq.priority, sq.status, sq.queued_at, sq.started_at, sq.completed_at
+            FROM scan_queue sq JOIN projects p ON p.id = sq.project_id
+            WHERE sq.id = $1
+            """,
+            queue_id,
+        )
+        return await _queue_row_to_item(conn, full_row)
+
+
+@app.delete("/api/queue/{queue_id}")
+async def cancel_queue_item(queue_id: int):
+    """Cancels a queued (not yet running) item. A running item can't be
+    cancelled through this endpoint - there's no scan-abort mechanism
+    yet, so 'cancel' would be a lie for anything already in flight."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        item = await conn.fetchrow("SELECT status FROM scan_queue WHERE id = $1", queue_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Queue entry not found")
+        if item["status"] != "queued":
+            raise HTTPException(status_code=400, detail="Only queued (not yet running) entries can be cancelled")
+        await conn.execute(
+            "UPDATE scan_queue SET status = 'cancelled', completed_at = now() WHERE id = $1",
+            queue_id,
+        )
+    return {"message": "Cancelled", "id": queue_id}
 
 
 @app.put("/api/projects/{project_id}/schedule", response_model=Project)
