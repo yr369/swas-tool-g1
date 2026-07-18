@@ -35,8 +35,32 @@ class Project(BaseModel):
 
 class ScheduleUpdateRequest(BaseModel):
     """interval_hours=None disables the recurring schedule for this
-    project - it goes back to manual-only scanning."""
+    project - it goes back to manual-only scanning.
+
+    run_at (Batch 6, optional): schedules a single one-time scan at a
+    specific future timestamp, using the SAME scheduler loop as the
+    recurring path (_run_due_scheduled_scans) rather than a second
+    mechanism - it just sets next_scheduled_scan_at directly instead of
+    deriving it from now() + interval_hours. Can be combined with
+    interval_hours (the one-time run becomes the FIRST run, recurrence
+    continues normally after); or given alone for a single scan with no
+    recurrence, in which case next_scheduled_scan_at is cleared (not
+    recomputed) once that one run fires - see _run_due_scheduled_scans.
+    """
     interval_hours: Optional[int] = None
+    run_at: Optional[datetime] = None
+
+
+class ProjectDeleteRequest(BaseModel):
+    """confirm_name must exactly match the project's current name -
+    the same typed-confirmation friction GitHub uses for repo deletion.
+    This is deliberately a stronger, less-guarded delete than
+    ProjectBulkActionRequest's: bulk-action silently blocks deleting any
+    project with findings (a safety net for an accidental bulk click),
+    but THIS endpoint allows it, on the theory that correctly typing the
+    full project name out is itself informed, deliberate intent - the
+    same tradeoff GitHub makes for repos with commit history."""
+    confirm_name: str
 
 
 class ProjectBulkActionRequest(BaseModel):

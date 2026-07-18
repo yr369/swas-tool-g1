@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { PipelineTracker } from "../components/PipelineTracker";
 import { FindingsList } from "../components/FindingsList";
@@ -13,6 +13,7 @@ const POLL_INTERVAL_MS = 5000;
 
 export function ProjectDetail() {
   const { id } = useParams();
+  const navigate = useNavigate();
   const [project, setProject] = useState(null);
   const [scope, setScope] = useState([]);
   const [phaseRuns, setPhaseRuns] = useState([]);
@@ -20,6 +21,11 @@ export function ProjectDetail() {
   const [scanStarting, setScanStarting] = useState(false);
   const [triagingAll, setTriagingAll] = useState(false);
   const [schedulingBusy, setSchedulingBusy] = useState(false);
+  const [runAtValue, setRunAtValue] = useState("");
+  const [archiving, setArchiving] = useState(false);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [deleteTypedName, setDeleteTypedName] = useState("");
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState(null);
   const [liveConnected, setLiveConnected] = useState(false);
   const pollRef = useRef(null);
@@ -114,6 +120,50 @@ export function ProjectDetail() {
     }
   }
 
+  async function handleScheduleOnce() {
+    if (!runAtValue) return;
+    setSchedulingBusy(true);
+    setError(null);
+    try {
+      // datetime-local gives a value with no timezone - the browser
+      // interprets it as local time when building a Date, and toISOString()
+      // converts that to UTC for the backend, which is what run_at expects.
+      const isoRunAt = new Date(runAtValue).toISOString();
+      await api.setSchedule(id, project.scan_interval_hours ?? null, isoRunAt);
+      setRunAtValue("");
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSchedulingBusy(false);
+    }
+  }
+
+  async function handleArchive() {
+    setArchiving(true);
+    setError(null);
+    try {
+      await api.bulkProjectAction([Number(id)], "archive");
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setArchiving(false);
+    }
+  }
+
+  async function handleConfirmDelete() {
+    setDeleting(true);
+    setError(null);
+    try {
+      await api.deleteProject(id, deleteTypedName);
+      navigate("/projects");
+    } catch (err) {
+      setError(err.message);
+      setDeleting(false);
+    }
+  }
+
   async function handleTriageAll() {
     setTriagingAll(true);
     setError(null);
@@ -196,6 +246,21 @@ export function ProjectDetail() {
                 next {formatDate(project.next_scheduled_scan_at)}
               </span>
             )}
+            <label style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: 8 }}>Run once at:</label>
+            <input
+              type="datetime-local"
+              value={runAtValue}
+              onChange={(e) => setRunAtValue(e.target.value)}
+              disabled={schedulingBusy}
+              style={scheduleSelectStyle}
+            />
+            <button
+              onClick={handleScheduleOnce}
+              disabled={schedulingBusy || !runAtValue}
+              style={secondaryButtonStyle}
+            >
+              Schedule
+            </button>
           </span>
         </div>
       </Section>
@@ -232,6 +297,74 @@ export function ProjectDetail() {
         )}
         <FindingsList findings={findings} onTriaged={loadAll} />
       </Section>
+
+      <Section title="Danger zone">
+        <div style={{ display: "flex", gap: 12 }}>
+          <button onClick={handleArchive} disabled={archiving || project.status === "archived"} style={secondaryButtonStyle}>
+            {project.status === "archived" ? "Archived" : archiving ? "Archiving…" : "Archive project"}
+          </button>
+          <button
+            onClick={() => { setDeleteTypedName(""); setDeleteModalOpen(true); }}
+            style={{ ...secondaryButtonStyle, color: "var(--status-fail)", borderColor: "var(--status-fail)" }}
+          >
+            Delete project…
+          </button>
+        </div>
+        <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 8 }}>
+          Archiving is reversible - it just takes the project off the active
+          list. Deleting is permanent and removes all findings, scope, and
+          scan history for this project.
+        </p>
+      </Section>
+
+      {deleteModalOpen && (
+        <div
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
+            display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100,
+          }}
+          onClick={() => !deleting && setDeleteModalOpen(false)}
+        >
+          <div
+            style={{
+              background: "var(--bg-surface-raised)", border: "1px solid var(--border)",
+              borderRadius: "var(--radius)", padding: 24, width: 420, maxWidth: "90vw",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ margin: "0 0 8px", fontSize: 16 }}>Delete “{project.name}”?</h3>
+            <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "0 0 16px" }}>
+              This permanently deletes this project and every finding, scope
+              target, and scan run attached to it. This cannot be undone. Type
+              the project name exactly to confirm.
+            </p>
+            <input
+              type="text"
+              value={deleteTypedName}
+              onChange={(e) => setDeleteTypedName(e.target.value)}
+              placeholder={project.name}
+              autoFocus
+              style={{ ...scheduleSelectStyle, width: "100%", boxSizing: "border-box", padding: "8px 10px", fontSize: 13, marginBottom: 16 }}
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => setDeleteModalOpen(false)} disabled={deleting} style={secondaryButtonStyle}>
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmDelete}
+                disabled={deleting || deleteTypedName !== project.name}
+                style={{
+                  ...primaryButtonStyle,
+                  background: "var(--status-fail)",
+                  opacity: deleteTypedName !== project.name ? 0.5 : 1,
+                }}
+              >
+                {deleting ? "Deleting…" : "Delete permanently"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{error}</p>}
     </div>

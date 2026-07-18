@@ -31,6 +31,7 @@ from .models import (
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
+    ProjectDeleteRequest,
     QueueEnqueueRequest,
     QueueReorderRequest,
     ScanQueueItem,
@@ -169,18 +170,20 @@ async def _finalize_scan_status(pool, project_id: int, tasks: list) -> None:
 
 
 async def _run_due_scheduled_scans() -> None:
-    """One pass of the scheduler: find every project whose recurring
-    schedule is due, kick each one off, and push its next-run time
-    forward regardless of whether the kickoff succeeded - a project
-    that's misconfigured (e.g. its scope got cleared) shouldn't be
-    retried every 60 seconds forever, just tried again next interval."""
+    """One pass of the scheduler: find every project whose schedule is
+    due - recurring (scan_interval_hours set) OR one-time (Batch 6:
+    run_at was set with no interval) - kick each one off, and push its
+    next-run time forward (recurring) or clear it (one-time) regardless
+    of whether the kickoff succeeded - a project that's misconfigured
+    (e.g. its scope got cleared) shouldn't be retried every 60 seconds
+    forever, just tried again next interval (or, for one-time, not
+    retried at all - it already had its one shot)."""
     pool = database.get_pool()
     async with pool.acquire() as conn:
         due = await conn.fetch(
             """
             SELECT id, scan_interval_hours FROM projects
-            WHERE scan_interval_hours IS NOT NULL
-              AND next_scheduled_scan_at IS NOT NULL
+            WHERE next_scheduled_scan_at IS NOT NULL
               AND next_scheduled_scan_at <= now()
               AND status != 'scanning'
             """
@@ -199,14 +202,23 @@ async def _run_due_scheduled_scans() -> None:
             logger.exception("scheduler: unexpected error enqueueing project %s", project_id)
         finally:
             async with pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE projects
-                    SET next_scheduled_scan_at = now() + make_interval(hours => scan_interval_hours)
-                    WHERE id = $1
-                    """,
-                    project_id,
-                )
+                if row["scan_interval_hours"] is None:
+                    # One-time run_at, no recurrence - clear it so this
+                    # project goes back to manual-only, not an infinite
+                    # "next run is right now" loop firing every pass.
+                    await conn.execute(
+                        "UPDATE projects SET next_scheduled_scan_at = NULL WHERE id = $1",
+                        project_id,
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        UPDATE projects
+                        SET next_scheduled_scan_at = now() + make_interval(hours => scan_interval_hours)
+                        WHERE id = $1
+                        """,
+                        project_id,
+                    )
 
 
 async def _scheduler_loop() -> None:
@@ -551,6 +563,35 @@ async def bulk_project_action(payload: ProjectBulkActionRequest):
             succeeded.append(project_id)
 
     return {"action": payload.action, "succeeded": succeeded, "blocked": blocked}
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: int, payload: ProjectDeleteRequest):
+    """
+    Permanently deletes a single project (Batch 6) - cascades to
+    scope_targets/findings/phase_runs/scan_runs/scan_queue, same as
+    bulk-action's delete path. Unlike bulk-action, this does NOT block
+    on the project having findings attached - typing the exact project
+    name out (checked below) is the deliberate-intent gate here instead,
+    matching GitHub's "type the repo name to delete" pattern. If you
+    want a reversible option instead, use POST /projects/bulk-action
+    with action=archive on this single project id.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        project = await conn.fetchrow("SELECT id, name FROM projects WHERE id = $1", project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        if payload.confirm_name != project["name"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Typed name does not match the project name exactly - nothing was deleted",
+            )
+
+        await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
+
+    return {"deleted": True, "id": project_id}
 
 
 # ---------- Scope targets ----------
@@ -1326,14 +1367,15 @@ async def cancel_queue_item(queue_id: int):
 @app.put("/api/projects/{project_id}/schedule", response_model=Project)
 async def set_project_schedule(project_id: int, payload: ScheduleUpdateRequest):
     """
-    Sets or clears a recurring scan schedule for this project.
-    interval_hours=None (or omitted) disables it and goes back to
-    manual-only scanning. Setting an interval computes the first
-    next_scheduled_scan_at as now() + interval - the scheduler loop
-    (_run_due_scheduled_scans, checked every 60s) picks it up from there.
+    Sets or clears a recurring scan schedule for this project, and/or a
+    one-time run_at (Batch 6 - see ScheduleUpdateRequest's docstring for
+    how the two combine). interval_hours=None with run_at=None disables
+    scheduling entirely and goes back to manual-only scanning.
     """
     if payload.interval_hours is not None and payload.interval_hours < 1:
         raise HTTPException(status_code=400, detail="interval_hours must be at least 1")
+    if payload.run_at is not None and payload.run_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="run_at must be in the future")
 
     pool = database.get_pool()
     async with pool.acquire() as conn:
@@ -1341,7 +1383,7 @@ async def set_project_schedule(project_id: int, payload: ScheduleUpdateRequest):
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
-        if payload.interval_hours is None:
+        if payload.interval_hours is None and payload.run_at is None:
             await conn.execute(
                 """
                 UPDATE projects
@@ -1349,6 +1391,20 @@ async def set_project_schedule(project_id: int, payload: ScheduleUpdateRequest):
                 WHERE id = $1
                 """,
                 project_id,
+            )
+        elif payload.run_at is not None:
+            # One-time run_at wins as the next trigger time regardless of
+            # whether a recurring interval is also set/being set - it's
+            # the FIRST run either way. scan_interval_hours still gets
+            # saved (or cleared) so recurrence after that first run
+            # behaves however the caller asked for.
+            await conn.execute(
+                """
+                UPDATE projects
+                SET scan_interval_hours = $2, next_scheduled_scan_at = $3
+                WHERE id = $1
+                """,
+                project_id, payload.interval_hours, payload.run_at,
             )
         else:
             await conn.execute(

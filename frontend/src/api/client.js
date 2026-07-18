@@ -39,6 +39,8 @@ export const api = {
     request("/projects", { method: "POST", body: JSON.stringify({ name, platform }) }),
   bulkProjectAction: (projectIds, action) =>
     request("/projects/bulk-action", { method: "POST", body: JSON.stringify({ project_ids: projectIds, action }) }),
+  deleteProject: (id, confirmName) =>
+    request(`/projects/${id}`, { method: "DELETE", body: JSON.stringify({ confirm_name: confirmName }) }),
 
   // Scope
   listScope: (projectId) => request(`/projects/${projectId}/scope`),
@@ -62,8 +64,11 @@ export const api = {
 
   // Pipeline
   startScan: (projectId) => request(`/projects/${projectId}/scan`, { method: "POST" }),
-  setSchedule: (projectId, intervalHours) =>
-    request(`/projects/${projectId}/schedule`, { method: "PUT", body: JSON.stringify({ interval_hours: intervalHours }) }),
+  setSchedule: (projectId, intervalHours, runAt = null) =>
+    request(`/projects/${projectId}/schedule`, {
+      method: "PUT",
+      body: JSON.stringify({ interval_hours: intervalHours, run_at: runAt }),
+    }),
   listPhaseRuns: (projectId) => request(`/projects/${projectId}/phase-runs`),
 
   // Live scan progress - returns a plain WebSocket URL (not JSON), for
