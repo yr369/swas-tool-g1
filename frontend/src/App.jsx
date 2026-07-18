@@ -4,10 +4,12 @@ import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Dashboard } from "./pages/Dashboard";
 import { SignatureStats } from "./pages/SignatureStats";
+import { CommandPalette } from "./components/CommandPalette";
 
 export function App() {
   return (
     <BrowserRouter>
+      <CommandPalette />
       <div style={{ minHeight: "100%", display: "flex", flexDirection: "column" }}>
         <header
           style={{
@@ -49,8 +51,9 @@ export function App() {
               Signature Stats
             </Link>
           </div>
-          <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
+          <span className="mono header-tagline" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em", display: "flex", alignItems: "center", gap: 12 }}>
             SECURITY WEB AUTOMATION SYSTEM
+            <span style={{ border: "1px solid var(--border)", borderRadius: 4, padding: "2px 6px" }}>⌘K</span>
           </span>
         </header>
 
