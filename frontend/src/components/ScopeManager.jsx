@@ -12,9 +12,60 @@ const TARGET_TYPES = ["website", "api", "mobile", "hardware", "unknown"];
 
 export function ScopeManager({ projectId, scope, onChange }) {
   const [addingBulk, setAddingBulk] = useState(false);
+  const [addingSingle, setAddingSingle] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkRescanning, setBulkRescanning] = useState(false);
+  const [bulkResult, setBulkResult] = useState(null);
+
+  function toggleSelected(id) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAll() {
+    setSelected((prev) => (prev.size === scope.length ? new Set() : new Set(scope.map((s) => s.id))));
+  }
+
+  async function handleBulkRescan() {
+    setBulkRescanning(true);
+    setBulkResult(null);
+    const ids = [...selected];
+    const results = await Promise.allSettled(ids.map((id) => api.rescanTarget(projectId, id)));
+    const failed = results
+      .map((r, i) => (r.status === "rejected" ? { id: ids[i], reason: r.reason.message } : null))
+      .filter(Boolean);
+    setBulkResult({ started: results.length - failed.length, failed });
+    setSelected(new Set());
+    setBulkRescanning(false);
+  }
 
   return (
     <div>
+      {scope.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-muted)" }}>
+            <input type="checkbox" checked={selected.size === scope.length} onChange={toggleSelectAll} />
+            Select all
+          </label>
+          {selected.size > 0 && (
+            <button onClick={handleBulkRescan} disabled={bulkRescanning} style={secondaryButtonStyle}>
+              {bulkRescanning ? "Starting…" : `Rescan selected (${selected.size})`}
+            </button>
+          )}
+          {bulkResult && (
+            <span style={{ fontSize: 12, color: bulkResult.failed.length ? "var(--sev-medium)" : "var(--status-success)" }}>
+              {bulkResult.started} started
+              {bulkResult.failed.length > 0 &&
+                `, ${bulkResult.failed.length} failed (${bulkResult.failed.map((f) => f.reason).join("; ")})`}
+            </span>
+          )}
+        </div>
+      )}
+
       <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
         {scope.length === 0 ? (
           <div style={{ padding: 16, color: "var(--text-muted)", fontSize: 13 }}>No targets added yet.</div>
@@ -26,12 +77,28 @@ export function ScopeManager({ projectId, scope, onChange }) {
               projectId={projectId}
               isLast={i === scope.length - 1}
               onChange={onChange}
+              selected={selected.has(s.id)}
+              onToggleSelected={() => toggleSelected(s.id)}
             />
           ))
         )}
       </div>
 
-      <div style={{ marginTop: 12 }}>
+      <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {addingSingle ? (
+          <SingleAddForm
+            projectId={projectId}
+            onDone={() => {
+              setAddingSingle(false);
+              onChange();
+            }}
+            onCancel={() => setAddingSingle(false)}
+          />
+        ) : (
+          <button onClick={() => setAddingSingle(true)} style={secondaryButtonStyle}>
+            + Add target
+          </button>
+        )}
         {addingBulk ? (
           <BulkAddForm
             projectId={projectId}
@@ -51,13 +118,113 @@ export function ScopeManager({ projectId, scope, onChange }) {
   );
 }
 
-function ScopeRow({ target, projectId, isLast, onChange }) {
+function SingleAddForm({ projectId, onDone, onCancel }) {
+  const [target, setTarget] = useState("");
+  const [targetType, setTargetType] = useState("unknown");
+  const [inScope, setInScope] = useState(true);
+  const [scanAfter, setScanAfter] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function handleSubmit() {
+    if (!target.trim()) {
+      setError("Enter a URL, domain, or wildcard.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const created = await api.addScopeTarget(projectId, {
+        target: target.trim(),
+        target_type: targetType,
+        in_scope: inScope,
+      });
+      if (scanAfter && inScope) {
+        // Best-effort - if the immediate scan kickoff fails (e.g. a
+        // scan is already running for this host, which can't happen
+        // for a brand-new target but keep it defensive), the target is
+        // still added; it can be rescanned manually from its row.
+        try {
+          await api.rescanTarget(projectId, created.id);
+        } catch (err) {
+          console.error("auto-scan after add failed:", err);
+        }
+      }
+      onDone();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 14, flex: 1, minWidth: 280 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <input
+          className="mono"
+          placeholder="e.g. api.example.com or *.example.com"
+          value={target}
+          onChange={(e) => setTarget(e.target.value)}
+          style={{ ...inputStyle, flex: 1, minWidth: 200 }}
+          autoFocus
+        />
+        <select value={targetType} onChange={(e) => setTargetType(e.target.value)} style={inputStyle}>
+          {TARGET_TYPES.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div style={{ display: "flex", gap: 14, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+          <input type="checkbox" checked={inScope} onChange={(e) => setInScope(e.target.checked)} />
+          In scope
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+          <input type="checkbox" checked={scanAfter} onChange={(e) => setScanAfter(e.target.checked)} />
+          Scan this target now
+        </label>
+      </div>
+      {error && <p style={{ color: "var(--status-fail)", fontSize: 12, marginTop: 8 }}>{error}</p>}
+      <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+        <button onClick={handleSubmit} disabled={submitting} style={primaryButtonStyle}>
+          {submitting ? "Adding…" : "Add"}
+        </button>
+        <button onClick={onCancel} style={secondaryButtonStyle}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ScopeRow({ target, projectId, isLast, onChange, selected, onToggleSelected }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(target);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanMessage, setScanMessage] = useState(null);
+
+  async function handleScan() {
+    setScanning(true);
+    setScanMessage(null);
+    try {
+      await api.rescanTarget(projectId, target.id);
+      setScanMessage({ ok: true, text: "Scan started" });
+      onChange();
+    } catch (err) {
+      // The backend's 409 ("already scanning")/400 (denylist, out of
+      // scope) messages already explain exactly why - show verbatim.
+      setScanMessage({ ok: false, text: err.message });
+    } finally {
+      setScanning(false);
+    }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -167,6 +334,7 @@ function ScopeRow({ target, projectId, isLast, onChange }) {
       }}
     >
       <div style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px 14px" }}>
+        <input type="checkbox" checked={selected} onChange={onToggleSelected} />
         <span className="mono" style={{ flex: 1, fontSize: 13, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
           {target.target}
         </span>
@@ -174,6 +342,9 @@ function ScopeRow({ target, projectId, isLast, onChange }) {
         <span style={{ fontSize: 12, color: target.in_scope ? "var(--status-success)" : "var(--text-muted)" }}>
           {target.in_scope ? "In scope" : "Out of scope"}
         </span>
+        <button onClick={handleScan} disabled={scanning || !target.in_scope} style={linkButtonStyle}>
+          {scanning ? "Starting…" : "Scan"}
+        </button>
         <button onClick={() => setEditing(true)} style={linkButtonStyle}>
           Edit
         </button>
@@ -193,6 +364,17 @@ function ScopeRow({ target, projectId, isLast, onChange }) {
           </button>
         )}
       </div>
+      {scanMessage && (
+        <div
+          style={{
+            padding: "0 14px 10px",
+            fontSize: 12,
+            color: scanMessage.ok ? "var(--status-success)" : "var(--sev-medium)",
+          }}
+        >
+          {scanMessage.text}
+        </div>
+      )}
       {deleteError && (
         <div style={{ padding: "0 14px 10px", fontSize: 12, color: "var(--sev-medium)" }}>{deleteError}</div>
       )}

@@ -54,6 +54,8 @@ export const api = {
     request(`/projects/${projectId}/scope/${targetId}`, { method: "DELETE" }),
   bulkAddScopeTargets: (projectId, payload) =>
     request(`/projects/${projectId}/scope/bulk`, { method: "POST", body: JSON.stringify(payload) }),
+  rescanTarget: (projectId, targetId) =>
+    request(`/projects/${projectId}/scope/${targetId}/rescan`, { method: "POST" }),
 
   // Scope intake (AI-assisted)
   parseScopeText: (platform, rawText) =>

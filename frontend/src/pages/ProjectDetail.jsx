@@ -255,6 +255,16 @@ export function ProjectDetail() {
               type="datetime-local"
               value={runAtValue}
               onChange={(e) => setRunAtValue(e.target.value)}
+              onClick={(e) => {
+                // Clicking anywhere in the field opens the native
+                // calendar/time picker instead of requiring a precise
+                // click on the small calendar icon - without this,
+                // clicking the text portion just drops you into manual
+                // digit-by-digit typing, which is what felt broken.
+                // showPicker() is Chrome/Edge/Firefox 2023+; falls back
+                // to default browser behavior everywhere else.
+                e.currentTarget.showPicker?.();
+              }}
               disabled={schedulingBusy}
               style={scheduleSelectStyle}
             />

@@ -75,56 +75,80 @@ export function DiffPanel({ projectId }) {
       </p>
 
       {new_findings.length > 0 && (
-        <DiffGroup label={`New (${new_findings.length})`} color="var(--sev-high)" findings={new_findings} />
+        <DiffGroup label="New" color="var(--sev-high)" findings={new_findings} defaultOpen={false} />
       )}
       {resolved_findings.length > 0 && (
-        <DiffGroup label={`Resolved (${resolved_findings.length})`} color="var(--status-success)" findings={resolved_findings} muted />
+        <DiffGroup label="Resolved" color="var(--status-success)" findings={resolved_findings} muted defaultOpen={false} />
       )}
     </div>
   );
 }
 
-function DiffGroup({ label, color, findings, muted }) {
+function DiffGroup({ label, color, findings, muted, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+
   return (
     <div style={{ marginBottom: 12 }}>
-      <div className="mono" style={{ fontSize: 11, color, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
-        {label}
-      </div>
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
-        {findings.map((f, i) => (
-          <div
-            key={f.id}
-            style={{
-              display: "flex",
-              gap: 12,
-              alignItems: "center",
-              padding: "8px 14px",
-              borderBottom: i < findings.length - 1 ? "1px solid var(--border)" : "none",
-              opacity: muted ? 0.6 : 1,
-            }}
-          >
-            <SeverityBadge severity={f.severity} />
-            <span className="mono" style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-              {f.tool_name}
-            </span>
-            <span
-              className="mono"
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="mono"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: 11,
+          color,
+          textTransform: "uppercase",
+          letterSpacing: "0.04em",
+          marginBottom: open ? 6 : 0,
+          background: "none",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+        }}
+      >
+        <span style={{ display: "inline-block", transform: open ? "rotate(90deg)" : "none", transition: "transform 0.1s" }}>
+          ▸
+        </span>
+        {label} ({findings.length})
+      </button>
+      {open && (
+        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
+          {findings.map((f, i) => (
+            <div
+              key={f.id}
               style={{
-                flex: 1,
-                minWidth: 0,
-                fontSize: 12,
-                color: "var(--text-muted)",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                textDecoration: muted ? "line-through" : "none",
+                display: "flex",
+                gap: 12,
+                alignItems: "center",
+                padding: "8px 14px",
+                borderBottom: i < findings.length - 1 ? "1px solid var(--border)" : "none",
+                opacity: muted ? 0.6 : 1,
               }}
             >
-              {f.evidence}
-            </span>
-          </div>
-        ))}
-      </div>
+              <SeverityBadge severity={f.severity} />
+              <span className="mono" style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                {f.tool_name}
+              </span>
+              <span
+                className="mono"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  fontSize: 12,
+                  color: "var(--text-muted)",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  textDecoration: muted ? "line-through" : "none",
+                }}
+              >
+                {f.evidence}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

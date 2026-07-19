@@ -35,6 +35,7 @@ const OUTCOME_OPTIONS = [
   { value: "duplicate", label: "Duplicate" },
   { value: "rejected", label: "Rejected" },
   { value: "informative", label: "Informative" },
+  { value: "false_positive", label: "False positive" },
   { value: "not_applicable", label: "Not applicable" },
   { value: "no_response", label: "No response yet" },
 ];
