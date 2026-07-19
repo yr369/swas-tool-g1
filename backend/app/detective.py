@@ -557,7 +557,11 @@ async def check_cache_deception(url: str) -> dict | None:
     logger.info("detective: checking cache deception for %s", probe_url)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+        # follow_redirects=False on purpose: a 3xx here means the fake
+        # static-extension path isn't actually being served/cached as
+        # its own resource - it's just bouncing to the homepage or a
+        # catch-all, which is normal CDN caching, not deception.
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
             first = await client.get(probe_url)
             if first.status_code != 200:
                 return None
@@ -638,7 +642,11 @@ async def check_file_entropy(url: str) -> dict | None:
 
     logger.info("detective: checking file entropy for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+        # follow_redirects=False on purpose: if this URL 3xx's somewhere
+        # else, we'd otherwise be scanning an unrelated landing page for
+        # entropy and misattributing any hit to this path (the same bug
+        # class that caused false heapdump findings).
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
             resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: entropy check fetch failed for %s: %s", url, exc)
@@ -1502,6 +1510,9 @@ _HEAPDUMP_PATHS = ["/actuator/heapdump", "/heapdump", "/heapdump.json"]
 _HEAPDUMP_MAX_BYTES = 500_000
 
 
+_HPROF_MAGIC = b"JAVA PROFILE"  # real HPROF files start "JAVA PROFILE 1.0.x\0"
+
+
 async def check_heapdump_exposure(host: str) -> dict | None:
     """
     Checks common heapdump paths and, if one is publicly served, samples
@@ -1511,10 +1522,22 @@ async def check_heapdump_exposure(host: str) -> dict | None:
     "heapdump file exists" without visible secrets in the sampled portion
     isn't reported here (consistent with how check_source_map_leak and
     check_swagger_exposure are calibrated elsewhere in this file).
+
+    Redirects are NOT followed here on purpose. A 301/302 away from the
+    heapdump path means the path doesn't actually serve a heapdump -
+    it's a redirect to a login page, SPA catch-all, or custom error page.
+    Previously follow_redirects=True meant those landing pages got
+    fetched, and if the landing page happened to contain any
+    secret-shaped string (a token in a JS bundle, the word "password" in
+    a form, etc.) this fired a false "critical" finding - the reporter
+    manually re-checks the same URL and sees a plain redirect instead.
+    We also require the real HPROF binary signature before trusting
+    keyword/entropy hits, since that's the one thing a false-positive
+    landing page can't fake.
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
             for path in _HEAPDUMP_PATHS:
                 url = base + path
                 logger.info("detective: checking heapdump exposure for %s", url)
@@ -1522,6 +1545,7 @@ async def check_heapdump_exposure(host: str) -> dict | None:
                 try:
                     async with client.stream("GET", url) as resp:
                         if resp.status_code != 200:
+                            # includes 3xx redirects - not a real exposure
                             continue
                         async for data in resp.aiter_bytes():
                             chunk += data
@@ -1532,6 +1556,11 @@ async def check_heapdump_exposure(host: str) -> dict | None:
 
                 if len(chunk) < 1000:
                     continue  # too small to be a real heapdump - likely a 404/error page
+
+                if _HPROF_MAGIC not in chunk[:64]:
+                    # Doesn't look like an actual Java heap dump - skip,
+                    # even if it superficially resembles secret-shaped text.
+                    continue
 
                 # Heapdumps are binary, but Java stores strings as
                 # contiguous readable runs - lenient latin-1 decode lets
