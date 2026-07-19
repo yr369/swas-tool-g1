@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS phase_runs (
     project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     target_id       INTEGER NOT NULL REFERENCES scope_targets(id) ON DELETE CASCADE,
     phase_name      TEXT NOT NULL
-                    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'gate', 'logic_hunter', 'triage', 'notify')),
+                    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'verify', 'gate', 'logic_hunter', 'triage', 'notify')),
     status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'needs_attention')),
     started_at      TIMESTAMPTZ,
@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS findings (
     gate_status     TEXT NOT NULL DEFAULT 'pending'
                     CHECK (gate_status IN ('pending', 'passed', 'failed')),
     gate_reasoning  TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (verification_status IN ('pending', 'confirmed', 'tentative', 'unconfirmed')),
+    verification_evidence TEXT,
     likely_program_outcome TEXT
                     CHECK (likely_program_outcome IN ('accepted', 'informative', 'out_of_scope', 'duplicate')),
     triage_reasoning TEXT,

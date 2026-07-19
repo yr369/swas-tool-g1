@@ -326,7 +326,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
-from . import secret_verifier
+from . import oob, secret_verifier
 
 logger = logging.getLogger("swas.detective")
 
@@ -2205,6 +2205,79 @@ async def check_ssrf_reflected(url: str) -> dict | None:
     except httpx.HTTPError as exc:
         logger.info("detective: SSRF check failed for %s: %s", url, exc)
     return None
+
+
+async def check_ssrf_blind_oob(url: str, oob_domain: str, oob_proc, finding_tag: str) -> dict | None:
+    """
+    The blind-SSRF companion to check_ssrf_reflected above - this is the
+    piece that check_ssrf_reflected's own docstring said this codebase
+    couldn't do without a collaborator server (see oob.py). Instead of
+    looking for internal content reflected back in the HTTP response
+    (which most real SSRF never gives you), this sends the same
+    callback/fetch-style parameters pointed at our own canary domain and
+    waits to see if the TARGET SERVER makes an outbound DNS/HTTP request
+    to it - proof the server-side fetch actually happened, independent
+    of whatever the HTTP response looked like.
+
+    oob_domain/oob_proc come from oob.start_session() - shared across a
+    whole verify run, not created per-call. finding_tag is a short
+    unique string (e.g. the finding id or a random suffix) embedded in
+    the canary hostname so a shared session can attribute the callback
+    to this specific test, not some other finding's.
+
+    Returns None (not "unconfirmed") if oob_domain/oob_proc are None -
+    that means OOB infra wasn't available this run at all, which is a
+    different situation from "we tested and got no callback."
+    """
+    if not oob_domain or not oob_proc:
+        return None
+
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+
+    existing_params = dict(parsed.params)
+    candidate_params = [p for p in _SSRF_PARAM_NAMES if p in existing_params]
+    if not candidate_params:
+        return None
+
+    canary_host = f"{finding_tag}.{oob_domain}"
+    tested_urls = []
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for param_name in candidate_params:
+                test_params = dict(existing_params)
+                test_params[param_name] = f"http://{canary_host}/"
+                test_url = parsed.copy_with(params=test_params)
+                tested_urls.append(str(test_url))
+                try:
+                    await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+    except httpx.HTTPError as exc:
+        logger.info("detective: blind SSRF OOB probe failed for %s: %s", url, exc)
+        return None
+
+    if not tested_urls:
+        return None
+
+    interaction = await oob.wait_for_interaction(oob_proc, finding_tag)
+    if interaction is None:
+        return None  # no callback observed - genuinely inconclusive, not a finding
+
+    protocol = interaction.get("protocol", "unknown")
+    remote_addr = interaction.get("remote-address", "unknown")
+    return {
+        "vuln_type": "ssrf_blind_oob_confirmed",
+        "severity": "critical",
+        "evidence": (
+            f"{url}: sent {canary_host} as a callback/fetch parameter value across "
+            f"{len(tested_urls)} candidate param(s) ({', '.join(candidate_params)}), and the "
+            f"target server itself made an out-of-band {protocol.upper()} request back to that "
+            f"canary domain from {remote_addr} - confirmed server-side request forgery, proven "
+            f"independent of anything in the HTTP response."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------

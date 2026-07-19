@@ -20,7 +20,26 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     go install -v github.com/lc/gau/v2/cmd/gau@latest && \
     go install -v github.com/tomnomnom/waybackurls@latest && \
     go install -v github.com/ffuf/ffuf/v2@latest && \
-    go install -v github.com/hahwul/dalfox/v2@latest
+    go install -v github.com/hahwul/dalfox/v2@latest && \
+    go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+# interactsh-client (also ProjectDiscovery, same family as the tools
+# above) is the out-of-band "collaborator" used by oob.py/verify.py to
+# actively confirm blind SSRF - it talks to the public oast.* interactsh
+# servers by default (no self-hosted infra needed to start), so this is
+# a small binary add, not a new service to run.
+#
+# NOT added here: Playwright, for the headless-browser XSS execution
+# proof in verify.py. Unlike interactsh-client (a few MB Go binary),
+# Playwright needs its Python package AND a full downloaded Chromium
+# build (100s of MB, and ARM64 Chromium binaries are slower to fetch/
+# build than x86), which is a real image-size and build-time cost on
+# this box. verify.py already handles Playwright not being installed by
+# skipping that one technique (XSS stays whatever it already was) - so
+# this is an intentional opt-in, not an oversight. To enable it:
+#   1. add `playwright==1.4x.0` to requirements.txt
+#   2. add `RUN pip install playwright && playwright install --with-deps chromium`
+#      as its own RUN layer (keep it separate so it's cacheable/skippable)
+#   3. rebuild - expect several extra minutes and ~400-600MB extra image size
 
 
 FROM python:3.12-slim

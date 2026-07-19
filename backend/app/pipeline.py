@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, tools, triage
+from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, tools, triage, verify
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -94,7 +94,7 @@ _PW_RESET_ENUM_CHECK_CAP = 10
 
 logger = logging.getLogger("swas.pipeline")
 
-PHASES = ["recon", "probe", "fuzz", "scan", "gate", "logic_hunter", "triage", "notify"]
+PHASES = ["recon", "probe", "fuzz", "scan", "verify", "gate", "logic_hunter", "triage", "notify"]
 
 
 async def run_target_pipeline(
@@ -289,6 +289,10 @@ async def _execute_phase(
 
     elif phase_name == "scan":
         await _phase_scan(pool, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
+
+    elif phase_name == "verify":
+        async with pool.acquire() as conn:
+            await _phase_verify(conn, project_id)
 
     elif phase_name == "gate":
         async with pool.acquire() as conn:
@@ -1077,6 +1081,32 @@ async def _phase_scan(
             continue
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+    # Detective check: blind SSRF via out-of-band callback (see oob.py) -
+    # the companion to check_ssrf_reflected above, covering the case its
+    # own docstring flagged as unsupported (no collaborator server).
+    # One shared interactsh-client session for the whole candidate batch;
+    # skipped entirely (fails open, no findings lost) if the optional
+    # interactsh-client binary isn't installed.
+    if ssrf_candidates:
+        oob_domain, oob_proc = await oob.start_session()
+        if oob_domain and oob_proc:
+            try:
+                blind_ssrf_results = await asyncio.gather(
+                    *(
+                        detective.check_ssrf_blind_oob(url, oob_domain, oob_proc, f"s{i}")
+                        for i, url in enumerate(ssrf_candidates)
+                    ),
+                    return_exceptions=True,
+                )
+                for res in blind_ssrf_results:
+                    if isinstance(res, Exception):
+                        logger.debug("blind SSRF OOB check raised: %s", res)
+                        continue
+                    if res is not None:
+                        await _save_detective_finding_pooled(pool, project_id, target_id, res)
+            finally:
+                await oob.stop_session(oob_proc)
 
     # Detective check: server-side template injection (batch 8).
     ssti_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSTI_CHECK_CAP]
@@ -2265,6 +2295,24 @@ async def _save_detective_finding(
         "detective: saved %s finding (self-declared severity=%s, pending triage) for target_id=%s",
         result["vuln_type"], result["severity"], target_id,
     )
+
+
+async def _phase_verify(conn: asyncpg.Connection, project_id: int) -> None:
+    """
+    Runs verify.py's active-confirmation pass on every finding still
+    pending verification for this project, right after scan and before
+    gate - deliberately before gate/triage so a finding that gets
+    upgraded to 'confirmed' here (OOB-proven SSRF, cache-poisoning-
+    capable host-header injection, browser-executed XSS) carries that
+    proof into the cheaper/more-expensive review stages downstream,
+    instead of being judged on the raw unverified signal alone. Not
+    every finding has a verification technique yet (see verify.py's
+    dispatch table) - those are simply left at verification_status
+    'pending', which is honest: "not yet checked," not "checked and
+    failed."
+    """
+    verified = await verify.verify_project_findings(conn, project_id)
+    logger.info("verify: actively re-confirmed %s finding(s) for project_id=%s", verified, project_id)
 
 
 async def _phase_gate(conn: asyncpg.Connection, project_id: int) -> None:
