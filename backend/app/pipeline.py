@@ -211,19 +211,24 @@ async def _run_phase_with_retry(
             phase_run_id = await checkpoint.create_pending_run(
                 conn, project_id, target_id, phase_name
             )
+        # conn released here, BEFORE the actual scan work starts - the
+        # whole point of this refactor (see checkpoint.run_phase and
+        # _phase_scan/_phase_recon) is that nothing holds a pool
+        # connection across slow outbound network calls anymore.
 
-            try:
-                async with checkpoint.run_phase(conn, phase_run_id, project_id, target_id, phase_name):
-                    await _execute_phase(
-                        conn, project_id, target_id, phase_name, target,
-                        discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
-                    )
-                return True  # checkpoint.run_phase already marked it completed
+        try:
+            async with checkpoint.run_phase(pool, phase_run_id, project_id, target_id, phase_name):
+                await _execute_phase(
+                    pool, project_id, target_id, phase_name, target,
+                    discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
+                )
+            return True  # checkpoint.run_phase already marked it completed
 
-            except Exception:
-                # checkpoint.run_phase already logged this and marked the
-                # row 'failed'. We just decide here whether to retry.
-                if attempt >= max_attempts:
+        except Exception:
+            # checkpoint.run_phase already logged this and marked the
+            # row 'failed'. We just decide here whether to retry.
+            if attempt >= max_attempts:
+                async with pool.acquire() as conn:
                     await checkpoint.mark_needs_attention(
                         conn,
                         phase_run_id,
@@ -232,17 +237,17 @@ async def _run_phase_with_retry(
                         target_id=target_id,
                         phase_name=phase_name,
                     )
-                    return False
-                logger.info(
-                    "Retrying %s for target_id=%s (attempt %s/%s)",
-                    phase_name, target_id, attempt + 1, max_attempts,
-                )
+                return False
+            logger.info(
+                "Retrying %s for target_id=%s (attempt %s/%s)",
+                phase_name, target_id, attempt + 1, max_attempts,
+            )
 
     return False
 
 
 async def _execute_phase(
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     project_id: int,
     target_id: int,
     phase_name: str,
@@ -257,9 +262,24 @@ async def _execute_phase(
     The actual work for each phase. Raises an exception if something
     goes wrong - checkpoint.run_phase (the caller) handles catching,
     logging, and recording that.
+
+    recon and scan take `pool` directly and acquire short-lived
+    connections only at the moment they actually write (see
+    _save_detective_finding_pooled etc.) - these are the two phases
+    that interleave DB writes with many slow outbound HTTP calls
+    (subdomain takeover checks, the ~130 detective.py checks), so
+    holding one connection for the whole phase was starving the rest
+    of the app's pool on any project with several targets scanning at
+    once (confirmed live on OCI - see the pool-exhaustion incident this
+    fixes). gate/logic_hunter/triage each still acquire one connection
+    for their own single call below - smaller, contained version of the
+    same pattern, not touched in this pass since they weren't the
+    confirmed offender, but worth the same treatment in a follow-up if
+    they start showing the same symptom (triage in particular makes an
+    LLM call per finding, which is the same shape of risk).
     """
     if phase_name == "recon":
-        await _phase_recon(conn, project_id, target_id, target, discovered_subdomains)
+        await _phase_recon(pool, project_id, target_id, target, discovered_subdomains)
 
     elif phase_name == "probe":
         await _phase_probe(target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
@@ -268,16 +288,19 @@ async def _execute_phase(
         await _phase_fuzz(live_hosts, params_found)
 
     elif phase_name == "scan":
-        await _phase_scan(conn, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
+        await _phase_scan(pool, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
 
     elif phase_name == "gate":
-        await _phase_gate(conn, project_id)
+        async with pool.acquire() as conn:
+            await _phase_gate(conn, project_id)
 
     elif phase_name == "logic_hunter":
-        await _phase_logic_hunter(conn, project_id)
+        async with pool.acquire() as conn:
+            await _phase_logic_hunter(conn, project_id)
 
     elif phase_name == "triage":
-        await _phase_triage(conn, project_id)
+        async with pool.acquire() as conn:
+            await _phase_triage(conn, project_id)
 
     elif phase_name == "notify":
         await _phase_notify(target)
@@ -287,7 +310,7 @@ async def _execute_phase(
 
 
 async def _phase_recon(
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     project_id: int,
     target_id: int,
     target: str,
@@ -317,7 +340,7 @@ async def _phase_recon(
             logger.debug("takeover check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
 
 async def _phase_probe(
@@ -395,7 +418,7 @@ async def _phase_fuzz(live_hosts: list[str], params_found: dict[str, bool]) -> N
 
 
 async def _phase_scan(
-    conn: asyncpg.Connection,
+    pool: asyncpg.Pool,
     project_id: int,
     target_id: int,
     live_hosts: list[str],
@@ -426,52 +449,52 @@ async def _phase_scan(
 
         nuclei_result = await tools.run_nuclei(host)
         if tools.looks_like_real_output(nuclei_result):
-            await _save_nuclei_findings(conn, project_id, target_id, nuclei_result.stdout)
+            await _save_nuclei_findings_pooled(pool, project_id, target_id, nuclei_result.stdout)
 
         if params_found.get(host):
             dalfox_result = await tools.run_dalfox(host)
             if tools.looks_like_real_output(dalfox_result):
-                await _save_finding(conn, project_id, target_id, "dalfox", dalfox_result.stdout)
+                await _save_finding_pooled(pool, project_id, target_id, "dalfox", dalfox_result.stdout)
 
             sqlmap_result = await tools.run_sqlmap(host)
             if tools.looks_like_real_output(sqlmap_result):
-                await _save_finding(conn, project_id, target_id, "sqlmap", sqlmap_result.stdout)
+                await _save_finding_pooled(pool, project_id, target_id, "sqlmap", sqlmap_result.stdout)
 
         # Detective checks: CORS misconfiguration and web cache deception.
         # Both are pure-Python, no-new-binary checks (see detective.py) -
         # they run per live host alongside the existing tool-based scans.
         cors_result = await detective.check_cors_misconfig(host)
         if cors_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cors_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, cors_result)
 
         # Batch 14: two narrower, deterministic CORS variants grouped
         # with the generic misconfig check above.
         logger.info("detective: running CORS null-origin bypass check for %s", host)
         cors_null_origin_result = await detective.check_cors_null_origin_bypass(host)
         if cors_null_origin_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cors_null_origin_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, cors_null_origin_result)
 
         logger.info("detective: running CORS wildcard+credentials check for %s", host)
         cors_wildcard_creds_result = await detective.check_cors_wildcard_with_credentials(host)
         if cors_wildcard_creds_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cors_wildcard_creds_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, cors_wildcard_creds_result)
 
         cache_result = await detective.check_cache_deception(host)
         if cache_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cache_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, cache_result)
 
         # CSP weakness check is recon-only by design - see detective.py's
         # module docstring and check_csp_weakness's own docstring for why
         # this deliberately never becomes a findings-table row.
         csp_note = await detective.check_csp_weakness(host)
         if csp_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "csp_weakness", csp_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "csp_weakness", csp_note)
 
         # Batch 3 per-host checks: GraphQL introspection, exposed
         # container control APIs, exposed .git directory.
         graphql_result = await detective.check_graphql_introspection(host)
         if graphql_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, graphql_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, graphql_result)
 
         # Batch 11: GraphQL field-suggestion schema leak. Complements
         # the introspection check right above - some APIs disable
@@ -481,7 +504,7 @@ async def _phase_scan(
             host.rstrip("/") + "/graphql"
         )
         if graphql_suggestion_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, graphql_suggestion_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, graphql_suggestion_result)
 
         # Batch 13: unauthenticated GraphQL mutation execution.
         # Grouped with the other GraphQL checks above.
@@ -490,22 +513,22 @@ async def _phase_scan(
             host.rstrip("/") + "/graphql"
         )
         if graphql_mutation_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, graphql_mutation_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, graphql_mutation_result)
 
         # Batch 15: GraphQL query via GET. Recon-only - grouped with
         # the other GraphQL checks above.
         logger.info("detective: running GraphQL GET query check for %s", host)
         graphql_get_note = await detective.check_graphql_query_via_get(host.rstrip("/") + "/graphql")
         if graphql_get_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "graphql_query_via_get", graphql_get_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "graphql_query_via_get", graphql_get_note)
 
         container_api_result = await detective.check_exposed_container_api(host)
         if container_api_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, container_api_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, container_api_result)
 
         git_result = await detective.check_git_exposure(host)
         if git_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, git_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, git_result)
 
             # Confirmed-exposed .git directory - worth the extra time/
             # disk I/O to actually reconstruct the source, not just flag
@@ -519,7 +542,7 @@ async def _phase_scan(
                     f"hardcoded-secret patterns: {'; '.join(dump_result.secret_candidates[:5])}"
                     if dump_result.secret_candidates else ""
                 )
-                await _save_detective_finding(conn, project_id, target_id, {
+                await _save_detective_finding_pooled(pool, project_id, target_id, {
                     "vuln_type": "exposed_git_directory_reconstructed",
                     "severity": "critical",
                     "evidence": (
@@ -529,40 +552,40 @@ async def _phase_scan(
                     ),
                 })
             else:
-                await _save_scan_note(conn, project_id, target_id, "git_exposure", f"{host}: {dump_result.note}")
+                await _save_scan_note_pooled(pool, project_id, target_id, "git_exposure", f"{host}: {dump_result.note}")
 
         # Batch 4 per-host checks: exposed Elasticsearch, Prometheus/
         # Spring Actuator, NoSQL DB ports, and Swagger/OpenAPI docs.
         es_result = await detective.check_elasticsearch_exposure(host)
         if es_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, es_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, es_result)
 
         actuator_result = await detective.check_actuator_exposure(host)
         if actuator_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, actuator_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, actuator_result)
 
         nosql_result = await detective.check_nosql_db_exposure(host)
         if nosql_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, nosql_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, nosql_result)
 
         swagger_result = await detective.check_swagger_exposure(host)
         if swagger_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, swagger_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, swagger_result)
 
         # Batch 5 per-host checks: WAF fingerprint (recon-only, same
         # pattern as CSP - never saved as a finding), exposed heapdump,
         # WebSocket CSWSH.
         waf_note = await detective.check_waf_fingerprint(host)
         if waf_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "waf_fingerprint", waf_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "waf_fingerprint", waf_note)
 
         heapdump_result = await detective.check_heapdump_exposure(host)
         if heapdump_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, heapdump_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, heapdump_result)
 
         cswsh_result = await detective.check_websocket_cswsh(host)
         if cswsh_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, cswsh_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, cswsh_result)
 
         # Batch 6 per-host checks: blind NoSQL injection, JSON type
         # confusion, Apache OptionsBleed. HTTP Parameter Pollution
@@ -570,22 +593,22 @@ async def _phase_scan(
         # not per-host, since it needs a real query parameter to work with.
         nosql_bypass_result = await detective.check_blind_nosql_injection(host)
         if nosql_bypass_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, nosql_bypass_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, nosql_bypass_result)
 
         type_confusion_result = await detective.check_json_type_confusion(host)
         if type_confusion_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, type_confusion_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, type_confusion_result)
 
         optionsbleed_result = await detective.check_apache_optionsbleed(host)
         if optionsbleed_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, optionsbleed_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, optionsbleed_result)
 
         # Batch 7 per-host checks: JWT alg confusion, host header
         # injection, exposed framework debug console.
         logger.info("detective: running JWT alg confusion check for %s", host)
         jwt_result = await detective.check_jwt_alg_confusion(host)
         if jwt_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, jwt_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, jwt_result)
 
         # Batch 12: JWT weak/common HMAC signing secret. Pure local
         # cryptography, no extra network requests - kept right next
@@ -594,24 +617,24 @@ async def _phase_scan(
         logger.info("detective: running JWT weak secret check for %s", host)
         jwt_weak_secret_result = await detective.check_jwt_weak_secret(host)
         if jwt_weak_secret_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, jwt_weak_secret_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, jwt_weak_secret_result)
 
         # Batch 14: JWT 'kid' header injection candidate. Recon-only -
         # grouped with the other JWT checks above.
         logger.info("detective: running JWT kid injection check for %s", host)
         jwt_kid_note = await detective.check_jwt_kid_header_injection_candidate(host)
         if jwt_kid_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "jwt_kid_header_injection_candidate", jwt_kid_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "jwt_kid_header_injection_candidate", jwt_kid_note)
 
         logger.info("detective: running host header injection check for %s", host)
         hhi_result = await detective.check_host_header_injection(host)
         if hhi_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, hhi_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, hhi_result)
 
         logger.info("detective: running debug console exposure check for %s", host)
         debug_console_result = await detective.check_debug_console_exposure(host)
         if debug_console_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, debug_console_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, debug_console_result)
 
         # Batch 12: exposed admin/management panel. Recon-only - see
         # check_exposed_admin_panel's own docstring - never attempts
@@ -619,266 +642,266 @@ async def _phase_scan(
         logger.info("detective: running admin panel exposure check for %s", host)
         admin_panel_note = await detective.check_exposed_admin_panel(host)
         if admin_panel_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "exposed_admin_panel", admin_panel_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "exposed_admin_panel", admin_panel_note)
 
         # Batches 15/17: infra-level checks grouped together.
         logger.info("detective: running SPF/DMARC check for %s", host)
         spf_dmarc_note = await detective.check_missing_spf_dmarc(host)
         if spf_dmarc_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "missing_spf_dmarc", spf_dmarc_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "missing_spf_dmarc", spf_dmarc_note)
 
         logger.info("detective: running origin IP WAF bypass check for %s", host)
         origin_ip_result = await detective.check_origin_ip_waf_bypass(host)
         if origin_ip_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, origin_ip_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, origin_ip_result)
 
         logger.info("detective: running Prometheus metrics exposure check for %s", host)
         prometheus_result = await detective.check_exposed_prometheus_metrics(host)
         if prometheus_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, prometheus_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, prometheus_result)
 
         # ---- Batches 18-22 host-level checks (14 total) ----
 
         logger.info("detective: running dependency manifest exposure check for %s", host)
         dep_manifest_result = await detective.check_dependency_manifest_exposure(host)
         if dep_manifest_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, dep_manifest_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, dep_manifest_result)
 
         logger.info("detective: running Swagger path enumeration check for %s", host)
         swagger_enum_note = await detective.check_swagger_path_enumeration_unauth(host)
         if swagger_enum_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "swagger_exposure_enum", swagger_enum_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "swagger_exposure_enum", swagger_enum_note)
 
         logger.info("detective: running TRACE method check for %s", host)
         trace_method_note = await detective.check_http_trace_method_enabled(host)
         if trace_method_note is not None:
-            await _save_scan_note(conn, project_id, target_id, "http_trace_method_enabled", trace_method_note)
+            await _save_scan_note_pooled(pool, project_id, target_id, "http_trace_method_enabled", trace_method_note)
 
         logger.info("detective: running docker-compose exposure check for %s", host)
         docker_compose_result = await detective.check_exposed_docker_compose_file(host)
         if docker_compose_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, docker_compose_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, docker_compose_result)
 
         logger.info("detective: running WordPress config backup check for %s", host)
         wp_config_result = await detective.check_wordpress_config_backup_exposure(host)
         if wp_config_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, wp_config_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, wp_config_result)
 
         logger.info("detective: running GraphQL error stack trace check for %s", host)
         graphql_stack_trace_result = await detective.check_graphql_error_stack_trace_leak(
             host.rstrip("/") + "/graphql"
         )
         if graphql_stack_trace_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, graphql_stack_trace_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, graphql_stack_trace_result)
 
         logger.info("detective: running DevOps tool panel check for %s", host)
         devops_panel_result = await detective.check_exposed_devops_tool_panel(host)
         if devops_panel_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, devops_panel_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, devops_panel_result)
 
         logger.info("detective: running phpMyAdmin exposure check for %s", host)
         phpmyadmin_result = await detective.check_exposed_phpmyadmin(host)
         if phpmyadmin_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, phpmyadmin_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, phpmyadmin_result)
 
         logger.info("detective: running ELMAH exposure check for %s", host)
         elmah_result = await detective.check_exposed_elmah_axd(host)
         if elmah_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, elmah_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, elmah_result)
 
         logger.info("detective: running Trace.axd exposure check for %s", host)
         trace_axd_result = await detective.check_exposed_trace_axd(host)
         if trace_axd_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, trace_axd_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, trace_axd_result)
 
         logger.info("detective: running Laravel debug mode check for %s", host)
         laravel_debug_result = await detective.check_laravel_debug_mode_exposure(host)
         if laravel_debug_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, laravel_debug_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, laravel_debug_result)
 
         logger.info("detective: running .git/config credentials check for %s", host)
         git_config_creds_result = await detective.check_git_config_credentials_leak(host)
         if git_config_creds_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, git_config_creds_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, git_config_creds_result)
 
         logger.info("detective: running AWS credentials file check for %s", host)
         aws_creds_result = await detective.check_aws_credentials_file_exposure(host)
         if aws_creds_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, aws_creds_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, aws_creds_result)
 
         logger.info("detective: running kubeconfig exposure check for %s", host)
         kubeconfig_result = await detective.check_kubeconfig_exposure(host)
         if kubeconfig_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, kubeconfig_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, kubeconfig_result)
 
         # ---- Batches 23-28 host-level checks (24 total) ----
 
         logger.info("detective: running Nexus/Artifactory exposure check for %s", host)
         nexus_result = await detective.check_exposed_nexus_artifactory(host)
         if nexus_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, nexus_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, nexus_result)
 
         logger.info("detective: running RabbitMQ management exposure check for %s", host)
         rabbitmq_result = await detective.check_exposed_rabbitmq_management(host)
         if rabbitmq_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, rabbitmq_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, rabbitmq_result)
 
         logger.info("detective: running Grafana exposure check for %s", host)
         grafana_result = await detective.check_exposed_grafana(host)
         if grafana_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, grafana_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, grafana_result)
 
         logger.info("detective: running MinIO console exposure check for %s", host)
         minio_result = await detective.check_exposed_minio_console(host)
         if minio_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, minio_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, minio_result)
 
         logger.info("detective: running Redis no-auth exposure check for %s", host)
         redis_result = await detective.check_exposed_redis_no_auth(host)
         if redis_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, redis_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, redis_result)
 
         logger.info("detective: running Memcached no-auth exposure check for %s", host)
         memcached_result = await detective.check_exposed_memcached_no_auth(host)
         if memcached_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, memcached_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, memcached_result)
 
         logger.info("detective: running FTP anonymous login check for %s", host)
         ftp_anon_result = await detective.check_exposed_ftp_anonymous_login(host)
         if ftp_anon_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, ftp_anon_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, ftp_anon_result)
 
         logger.info("detective: running CouchDB Fauxton exposure check for %s", host)
         couchdb_fauxton_result = await detective.check_exposed_couchdb_fauxton(host)
         if couchdb_fauxton_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, couchdb_fauxton_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, couchdb_fauxton_result)
 
         logger.info("detective: running Zookeeper exposure check for %s", host)
         zookeeper_result = await detective.check_exposed_zookeeper(host)
         if zookeeper_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, zookeeper_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, zookeeper_result)
 
         logger.info("detective: running Solr admin exposure check for %s", host)
         solr_result = await detective.check_exposed_solr_admin(host)
         if solr_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, solr_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, solr_result)
 
         logger.info("detective: running Jenkins script console check for %s", host)
         jenkins_script_result = await detective.check_jenkins_script_console_unauth(host)
         if jenkins_script_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, jenkins_script_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, jenkins_script_result)
 
         logger.info("detective: running CouchDB _all_dbs listing check for %s", host)
         couchdb_alldbs_result = await detective.check_couchdb_all_dbs_unauth(host)
         if couchdb_alldbs_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, couchdb_alldbs_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, couchdb_alldbs_result)
 
         logger.info("detective: running Spring Boot env exposure check for %s", host)
         spring_env_result = await detective.check_spring_boot_env_exposure(host)
         if spring_env_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, spring_env_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, spring_env_result)
 
         logger.info("detective: running Django debug mode check for %s", host)
         django_debug_result = await detective.check_django_debug_mode_exposure(host)
         if django_debug_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, django_debug_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, django_debug_result)
 
         logger.info("detective: running ASP.NET debug mode check for %s", host)
         aspnet_debug_result = await detective.check_aspnet_debug_mode_exposure(host)
         if aspnet_debug_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, aspnet_debug_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, aspnet_debug_result)
 
         logger.info("detective: running Express stack trace leak check for %s", host)
         express_stack_result = await detective.check_express_stack_trace_leak(host)
         if express_stack_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, express_stack_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, express_stack_result)
 
         logger.info("detective: running npm-debug.log exposure check for %s", host)
         npm_debug_result = await detective.check_npm_debug_log_exposure(host)
         if npm_debug_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, npm_debug_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, npm_debug_result)
 
         logger.info("detective: running .travis.yml exposure check for %s", host)
         travis_yml_result = await detective.check_travis_yml_exposure(host)
         if travis_yml_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, travis_yml_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, travis_yml_result)
 
         logger.info("detective: running CircleCI config exposure check for %s", host)
         circleci_result = await detective.check_circleci_config_exposure(host)
         if circleci_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, circleci_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, circleci_result)
 
         logger.info("detective: running GitHub workflow exposure check for %s", host)
         github_workflow_result = await detective.check_github_workflow_exposure(host)
         if github_workflow_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, github_workflow_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, github_workflow_result)
 
         logger.info("detective: running Terraform state exposure check for %s", host)
         terraform_state_result = await detective.check_terraform_state_exposure(host)
         if terraform_state_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, terraform_state_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, terraform_state_result)
 
         logger.info("detective: running Ansible Vault exposure check for %s", host)
         ansible_vault_result = await detective.check_ansible_vault_exposure(host)
         if ansible_vault_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, ansible_vault_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, ansible_vault_result)
 
         logger.info("detective: running Helm values.yaml exposure check for %s", host)
         helm_values_result = await detective.check_helm_values_exposure(host)
         if helm_values_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, helm_values_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, helm_values_result)
 
         logger.info("detective: running serverless.yml exposure check for %s", host)
         serverless_yml_result = await detective.check_serverless_yml_exposure(host)
         if serverless_yml_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, serverless_yml_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, serverless_yml_result)
 
         # ---- Batches 29-33 host-level checks (9 total) ----
 
         logger.info("detective: running Docker daemon API exposure check for %s", host)
         docker_daemon_result = await detective.check_exposed_docker_daemon_api(host)
         if docker_daemon_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, docker_daemon_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, docker_daemon_result)
 
         logger.info("detective: running Postgres trust-auth exposure check for %s", host)
         postgres_trust_result = await detective.check_exposed_postgres_trust_auth(host)
         if postgres_trust_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, postgres_trust_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, postgres_trust_result)
 
         logger.info("detective: running InfluxDB no-auth exposure check for %s", host)
         influxdb_result = await detective.check_exposed_influxdb_no_auth(host)
         if influxdb_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, influxdb_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, influxdb_result)
 
         logger.info("detective: running Kibana no-auth exposure check for %s", host)
         kibana_result = await detective.check_exposed_kibana_no_auth(host)
         if kibana_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, kibana_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, kibana_result)
 
         logger.info("detective: running backup archive exposure check for %s", host)
         backup_archive_result = await detective.check_backup_archive_exposure(host)
         if backup_archive_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, backup_archive_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, backup_archive_result)
 
         logger.info("detective: running SQL dump file exposure check for %s", host)
         sql_dump_result = await detective.check_sql_dump_file_exposure(host)
         if sql_dump_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, sql_dump_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, sql_dump_result)
 
         logger.info("detective: running log file exposure check for %s", host)
         log_file_result = await detective.check_log_file_exposure(host)
         if log_file_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, log_file_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, log_file_result)
 
         logger.info("detective: running .htpasswd exposure check for %s", host)
         htpasswd_result = await detective.check_htpasswd_exposure(host)
         if htpasswd_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, htpasswd_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, htpasswd_result)
 
         logger.info("detective: running weak TLS protocol check for %s", host)
         weak_tls_result = await detective.check_insecure_tls_weak_protocol(host)
         if weak_tls_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, weak_tls_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, weak_tls_result)
 
         # Batch 8 per-host check: prototype pollution via a JSON
         # __proto__ gadget POSTed to the host root. (The other three
@@ -888,13 +911,13 @@ async def _phase_scan(
         logger.info("detective: running prototype pollution check for %s", host)
         proto_pollution_result = await detective.check_prototype_pollution(host)
         if proto_pollution_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, proto_pollution_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, proto_pollution_result)
 
         # Batch 10 per-host check: exposed .env file.
         logger.info("detective: running .env exposure check for %s", host)
         env_file_result = await detective.check_env_file_exposure(host)
         if env_file_result is not None:
-            await _save_detective_finding(conn, project_id, target_id, env_file_result)
+            await _save_detective_finding_pooled(pool, project_id, target_id, env_file_result)
 
     # Pre-filter discovered_urls once for all the URL-based checks below.
     # gau/waybackurls output is often messy - malformed concatenated URLs,
@@ -922,7 +945,7 @@ async def _phase_scan(
             logger.debug("entropy check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: leaked source maps. Only worth trying against
     # discovered URLs that look like JS bundles.
@@ -939,7 +962,7 @@ async def _phase_scan(
             logger.debug("source map check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: exposed Firebase database. Reuses the same
     # js_candidates list gathered for the source map check above - both
@@ -955,7 +978,7 @@ async def _phase_scan(
             logger.debug("firebase exposure check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: open redirect. check_open_redirect() itself only
     # acts when a query param name looks redirect-related, so we just
@@ -976,7 +999,7 @@ async def _phase_scan(
             logger.debug("open redirect check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: blind SQL injection via timing. The most
     # expensive check here (each real hit costs several deliberate
@@ -997,7 +1020,7 @@ async def _phase_scan(
             logger.debug("blind SQLi timing check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: CRLF injection / HTTP response splitting. Same
     # candidate source as open redirect - any URL with a query string is
@@ -1016,7 +1039,7 @@ async def _phase_scan(
             logger.debug("CRLF injection check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: HTTP Parameter Pollution. Recon-only (see
     # check_http_param_pollution's own docstring) - logs a note when
@@ -1035,7 +1058,7 @@ async def _phase_scan(
             logger.debug("HTTP parameter pollution check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "http_param_pollution", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "http_param_pollution", res)
 
     # Detective check: reflected SSRF (batch 7) - non-blind only,
     # requires an existing query parameter to redirect at cloud
@@ -1053,7 +1076,7 @@ async def _phase_scan(
             logger.debug("reflected SSRF check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: server-side template injection (batch 8).
     ssti_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSTI_CHECK_CAP]
@@ -1069,7 +1092,7 @@ async def _phase_scan(
             logger.debug("SSTI check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: known API key/secret signature leak (batch 8).
     # Reuses js_candidates - both this and source-map/Firebase checks
@@ -1086,7 +1109,7 @@ async def _phase_scan(
             logger.debug("API key signature check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: IDOR candidate flagging (batch 8). Recon-only -
     # see check_idor_candidate's own docstring - never becomes a
@@ -1107,7 +1130,7 @@ async def _phase_scan(
             logger.debug("IDOR candidate check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "idor_candidate", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "idor_candidate", res)
 
     # Detective check: reflected XSS (batch 9).
     xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]
@@ -1123,7 +1146,7 @@ async def _phase_scan(
             logger.debug("reflected XSS check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: error-based SQL injection (batch 9). Complements
     # the timing-based check above with a higher-confidence signature
@@ -1142,7 +1165,7 @@ async def _phase_scan(
             logger.debug("error-based SQLi check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: XXE, error-based detection only (batch 9). Only
     # worth trying against real endpoints, so this reuses the same "="
@@ -1161,7 +1184,7 @@ async def _phase_scan(
             logger.debug("XXE check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: insecure deserialization signature (batch 9).
     # Recon-only - see check_insecure_deserialization_signature's own
@@ -1181,7 +1204,7 @@ async def _phase_scan(
             logger.debug("deserialization signature check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "insecure_deserialization_signature", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "insecure_deserialization_signature", res)
 
     # Detective check: path traversal / LFI (batch 10).
     path_traversal_candidates = [url for url in sane_discovered_urls if "=" in url][:_PATH_TRAVERSAL_CHECK_CAP]
@@ -1197,7 +1220,7 @@ async def _phase_scan(
             logger.debug("path traversal check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: OS command injection, blind timing-based
     # (batch 10). Same cost profile as the SQLi timing check - each
@@ -1216,7 +1239,7 @@ async def _phase_scan(
             logger.debug("OS command injection check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: publicly-listable cloud storage bucket
     # (batch 10). Runs against any page that might reference a
@@ -1236,7 +1259,7 @@ async def _phase_scan(
             logger.debug("cloud storage bucket exposure check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: DOM XSS sink flagging (batch 11). Recon-only -
     # reuses js_candidates, same "download and inspect" shape as
@@ -1253,7 +1276,7 @@ async def _phase_scan(
             logger.debug("DOM XSS sink check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "dom_xss_sink_flagging", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "dom_xss_sink_flagging", res)
 
     # Detective check: auth bypass via method/path override headers
     # (batch 11). Runs against any discovered URL, not just
@@ -1275,7 +1298,7 @@ async def _phase_scan(
             logger.debug("auth bypass method override check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: sensitive data leaking via Referer (batch 11).
     # Needs an actual query parameter to have anything to check.
@@ -1293,7 +1316,7 @@ async def _phase_scan(
             logger.debug("Referrer-Policy leak check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: open redirect via encoding/parsing bypass
     # (batch 12). Complements the batch-1 open redirect check.
@@ -1311,7 +1334,7 @@ async def _phase_scan(
             logger.debug("open redirect encoding bypass check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: missing Subresource Integrity (batch 12).
     # Recon-only - see check_missing_sri's own docstring.
@@ -1328,7 +1351,7 @@ async def _phase_scan(
             logger.debug("missing SRI check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "missing_sri", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "missing_sri", res)
 
     # ---- Batch 13 (larger batch, 8 checks) ----
 
@@ -1347,7 +1370,7 @@ async def _phase_scan(
             logger.debug("SSRF internal port scan raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: mass assignment / privilege escalation.
     mass_assignment_candidates = sane_discovered_urls[:_MASS_ASSIGNMENT_CHECK_CAP]
@@ -1363,7 +1386,7 @@ async def _phase_scan(
             logger.debug("mass assignment check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: auth bypass via HTTP verb tampering.
     verb_tampering_candidates = sane_discovered_urls[:_VERB_TAMPERING_CHECK_CAP]
@@ -1380,7 +1403,7 @@ async def _phase_scan(
             logger.debug("verb tampering auth bypass check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: negative-number business logic candidate.
     # Recon-only - see the check's own docstring.
@@ -1398,7 +1421,7 @@ async def _phase_scan(
             logger.debug("negative number business logic check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "negative_number_business_logic_candidate", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "negative_number_business_logic_candidate", res)
 
     # Detective check: predictable/weak token pattern. Recon-only,
     # pure pattern match on URLs already fetched elsewhere - no extra
@@ -1417,7 +1440,7 @@ async def _phase_scan(
             logger.debug("predictable token pattern check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "predictable_token_pattern", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "predictable_token_pattern", res)
 
     # Detective check: missing clickjacking protection. Recon-only -
     # almost always Informative alone, see the check's own docstring.
@@ -1435,7 +1458,7 @@ async def _phase_scan(
             logger.debug("clickjacking protection check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "clickjacking_missing_protection", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "clickjacking_missing_protection", res)
 
     # Detective check: hardcoded secrets / internal infra disclosure.
     # Recon-only - broader/less format-specific than
@@ -1454,7 +1477,7 @@ async def _phase_scan(
             logger.debug("hardcoded secrets check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "hardcoded_secrets_and_internal_disclosure", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "hardcoded_secrets_and_internal_disclosure", res)
 
     # ---- Batch 14 (bulkier still, 10 checks) ----
 
@@ -1473,7 +1496,7 @@ async def _phase_scan(
             logger.debug("PHP wrapper LFI check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: LDAP injection, error-based.
     ldap_injection_candidates = [url for url in sane_discovered_urls if "=" in url][:_LDAP_INJECTION_CHECK_CAP]
@@ -1490,7 +1513,7 @@ async def _phase_scan(
             logger.debug("LDAP injection check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: XPath injection, error-based.
     xpath_injection_candidates = [url for url in sane_discovered_urls if "=" in url][:_XPATH_INJECTION_CHECK_CAP]
@@ -1507,7 +1530,7 @@ async def _phase_scan(
             logger.debug("XPath injection check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: web cache poisoning via unkeyed header.
     cache_poisoning_candidates = sane_discovered_urls[:_CACHE_POISONING_CHECK_CAP]
@@ -1523,7 +1546,7 @@ async def _phase_scan(
             logger.debug("cache poisoning check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: missing CSRF token on POST forms. Recon-only -
     # see the check's own docstring.
@@ -1540,7 +1563,7 @@ async def _phase_scan(
             logger.debug("CSRF token check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "csrf_token_missing", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "csrf_token_missing", res)
 
     # Detective check: file upload form candidate. Recon-only, never
     # attempts an actual upload - see the check's own docstring.
@@ -1557,7 +1580,7 @@ async def _phase_scan(
             logger.debug("file upload form check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "file_upload_form_candidate", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "file_upload_form_candidate", res)
 
     # Detective check: WebSocket loaded over unencrypted ws:// from
     # an HTTPS page.
@@ -1575,7 +1598,7 @@ async def _phase_scan(
             logger.debug("WebSocket downgrade check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # ---- Batches 15-17 (built together, 4 checks each) ----
 
@@ -1594,7 +1617,7 @@ async def _phase_scan(
             logger.debug("excessive data exposure check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "excessive_data_exposure_api", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "excessive_data_exposure_api", res)
 
     # Detective check: API version downgrade bypass.
     api_version_candidates = sane_discovered_urls[:_API_VERSION_DOWNGRADE_CHECK_CAP]
@@ -1611,7 +1634,7 @@ async def _phase_scan(
             logger.debug("API version downgrade check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: boolean-based blind SQL injection.
     sqli_boolean_candidates = [url for url in sane_discovered_urls if "=" in url][:_SQLI_BOOLEAN_CHECK_CAP]
@@ -1628,7 +1651,7 @@ async def _phase_scan(
             logger.debug("boolean-based SQLi check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: SVG upload flagging. Recon-only.
     svg_upload_candidates = sane_discovered_urls[:_SVG_UPLOAD_CHECK_CAP]
@@ -1644,7 +1667,7 @@ async def _phase_scan(
             logger.debug("SVG upload flagging check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "insecure_svg_upload_flagging", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "insecure_svg_upload_flagging", res)
 
     # Detective check: JSONP callback XSS.
     jsonp_xss_candidates = sane_discovered_urls[:_JSONP_XSS_CHECK_CAP]
@@ -1660,7 +1683,7 @@ async def _phase_scan(
             logger.debug("JSONP callback XSS check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: backup/temp file disclosure.
     backup_file_candidates = sane_discovered_urls[:_BACKUP_FILE_CHECK_CAP]
@@ -1676,7 +1699,7 @@ async def _phase_scan(
             logger.debug("backup/temp file check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: publicly-listable Azure Blob container.
     azure_blob_candidates = sane_discovered_urls[:_AZURE_BLOB_CHECK_CAP]
@@ -1692,7 +1715,7 @@ async def _phase_scan(
             logger.debug("Azure blob exposure check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: CORS subdomain-suffix bypass.
     cors_subdomain_candidates = sane_discovered_urls[:_CORS_SUBDOMAIN_BYPASS_CHECK_CAP]
@@ -1709,7 +1732,7 @@ async def _phase_scan(
             logger.debug("CORS subdomain suffix bypass check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # ---- Batches 18-22 URL-level checks (6 total) ----
 
@@ -1725,7 +1748,7 @@ async def _phase_scan(
             logger.debug("HSTS check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "hsts", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "hsts", res)
 
     # Detective check: session cookie missing SameSite. Recon-only.
     cookie_samesite_candidates = sane_discovered_urls[:_COOKIE_SAMESITE_CHECK_CAP]
@@ -1741,7 +1764,7 @@ async def _phase_scan(
             logger.debug("cookie SameSite check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "cookie_samesite", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "cookie_samesite", res)
 
     # Detective check: session identifier in URL. Recon-only, pure
     # pattern match - no extra requests, capped higher.
@@ -1758,7 +1781,7 @@ async def _phase_scan(
             logger.debug("session ID in URL check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "session_id_in_url", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "session_id_in_url", res)
 
     # Detective check: open redirect via meta-refresh.
     meta_refresh_candidates = [url for url in sane_discovered_urls if "=" in url][:_META_REFRESH_CHECK_CAP]
@@ -1775,7 +1798,7 @@ async def _phase_scan(
             logger.debug("meta-refresh open redirect check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: exposed WSDL/SOAP service.
     wsdl_candidates = sane_discovered_urls[:_WSDL_CHECK_CAP]
@@ -1789,7 +1812,7 @@ async def _phase_scan(
             logger.debug("WSDL exposure check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: predictable UUIDv1 resource identifier.
     # Recon-only, pure pattern match - no extra requests, capped higher.
@@ -1807,7 +1830,7 @@ async def _phase_scan(
             logger.debug("predictable UUID version check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "predictable_uuid_version", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "predictable_uuid_version", res)
 
     # ---- Batches 29-33 URL-level checks (11 total) ----
 
@@ -1823,7 +1846,7 @@ async def _phase_scan(
             logger.debug("OAuth state param check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "oauth_missing_state_parameter", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "oauth_missing_state_parameter", res)
 
     # Detective check: Basic Auth over plaintext HTTP.
     basic_auth_http_candidates = sane_discovered_urls[:_BASIC_AUTH_HTTP_CHECK_CAP]
@@ -1837,7 +1860,7 @@ async def _phase_scan(
             logger.debug("Basic Auth over HTTP check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: cookie missing Secure flag over HTTPS. Recon-only.
     cookie_secure_candidates = sane_discovered_urls[:_COOKIE_SECURE_CHECK_CAP]
@@ -1851,7 +1874,7 @@ async def _phase_scan(
             logger.debug("cookie Secure flag check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "cookie_missing_secure_flag", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "cookie_missing_secure_flag", res)
 
     # Detective check: Firebase Realtime DB open read rules.
     firebase_rtdb_candidates = sane_discovered_urls[:_FIREBASE_RTDB_CHECK_CAP]
@@ -1865,7 +1888,7 @@ async def _phase_scan(
             logger.debug("Firebase RTDB check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: SSRF targeting GCP metadata (header-gated).
     ssrf_gcp_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_GCP_CHECK_CAP]
@@ -1879,7 +1902,7 @@ async def _phase_scan(
             logger.debug("GCP metadata SSRF check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: SSRF targeting Azure IMDS (header-gated).
     ssrf_azure_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_AZURE_CHECK_CAP]
@@ -1893,7 +1916,7 @@ async def _phase_scan(
             logger.debug("Azure metadata SSRF check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: SSRF targeting DigitalOcean metadata.
     ssrf_do_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSRF_DO_CHECK_CAP]
@@ -1907,7 +1930,7 @@ async def _phase_scan(
             logger.debug("DigitalOcean metadata SSRF check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: IP restriction bypass via spoofed X-Forwarded-For.
     xff_bypass_candidates = sane_discovered_urls[:_XFF_BYPASS_CHECK_CAP]
@@ -1921,7 +1944,7 @@ async def _phase_scan(
             logger.debug("XFF IP restriction bypass check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: Referer-based access control bypass.
     referer_bypass_candidates = sane_discovered_urls[:_REFERER_BYPASS_CHECK_CAP]
@@ -1935,7 +1958,7 @@ async def _phase_scan(
             logger.debug("Referer-based access control bypass check raised: %s", res)
             continue
         if res is not None:
-            await _save_detective_finding(conn, project_id, target_id, res)
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: API key/token in URL query param. Recon-only,
     # pure pattern match - no extra requests, capped higher.
@@ -1950,7 +1973,7 @@ async def _phase_scan(
             logger.debug("API key in URL check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "api_key_in_url_query_param", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "api_key_in_url_query_param", res)
 
     # Detective check: password-reset user-enumeration candidate.
     # Recon-only.
@@ -1965,7 +1988,7 @@ async def _phase_scan(
             logger.debug("password reset enumeration check raised: %s", res)
             continue
         if res is not None:
-            await _save_scan_note(conn, project_id, target_id, "password_reset_user_enumeration_candidate", res)
+            await _save_scan_note_pooled(pool, project_id, target_id, "password_reset_user_enumeration_candidate", res)
 
 
 # A hostname like "aem-prod.example.com" or a tech-stack detection
@@ -2004,6 +2027,43 @@ def _log_aem_pivot_hint(host: str, tech: list[str]) -> None:
 # nuclei's own severity tags map directly onto our schema's severity
 # values - no AI needed to know that nuclei already says "[medium]".
 _NUCLEI_SEVERITY_TAGS = {"critical", "high", "medium", "low", "info"}
+
+
+async def _save_finding_pooled(
+    pool: asyncpg.Pool, project_id: int, target_id: int, tool_name: str, raw_output: str
+) -> None:
+    async with pool.acquire() as conn:
+        await _save_finding(conn, project_id, target_id, tool_name, raw_output)
+
+
+async def _save_nuclei_findings_pooled(
+    pool: asyncpg.Pool, project_id: int, target_id: int, raw_output: str
+) -> None:
+    """Thin pool-based wrapper so callers inside a phase full of slow
+    outbound HTTP calls (_phase_scan) can save without holding a
+    connection across all of them - see checkpoint.run_phase's
+    docstring for the full "why" behind this pattern. The 3 _*_pooled
+    wrappers here exist purely so call sites deep inside _phase_scan
+    could be a one-line mechanical swap (`_save_x(conn, ...)` ->
+    `_save_x_pooled(pool, ...)`) rather than needing an `async with
+    pool.acquire()` block correctly indented at every one of the ~40
+    call sites."""
+    async with pool.acquire() as conn:
+        await _save_nuclei_findings(conn, project_id, target_id, raw_output)
+
+
+async def _save_scan_note_pooled(
+    pool: asyncpg.Pool, project_id: int, target_id: int, check_name: str, note: str
+) -> None:
+    async with pool.acquire() as conn:
+        await _save_scan_note(conn, project_id, target_id, check_name, note)
+
+
+async def _save_detective_finding_pooled(
+    pool: asyncpg.Pool, project_id: int, target_id: int, result: dict
+) -> None:
+    async with pool.acquire() as conn:
+        await _save_detective_finding(conn, project_id, target_id, result)
 
 
 async def _save_nuclei_findings(
