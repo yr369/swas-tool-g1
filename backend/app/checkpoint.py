@@ -56,13 +56,13 @@ async def create_pending_run(
 
 @asynccontextmanager
 async def run_phase(
-    conn: asyncpg.Connection, phase_run_id: int, project_id: int, target_id: int, phase_name: str
+    pool: asyncpg.Pool, phase_run_id: int, project_id: int, target_id: int, phase_name: str
 ):
     """
     A context manager that wraps the ACTUAL scanning work for one phase,
     on one target. Use it like this:
 
-        async with run_phase(conn, phase_run_id, project_id, target_id, phase_name):
+        async with run_phase(pool, phase_run_id, project_id, target_id, phase_name):
             result = await run_subfinder(target)
             ...
 
@@ -83,16 +83,27 @@ async def run_phase(
     This is the single place that implements "never silently lose a
     failure" - every phase, no matter what tool it's running, gets this
     same safety net.
+
+    Takes `pool`, not a pre-acquired `conn` - only acquires a connection
+    for the two brief status-update writes (entry and exit), never while
+    your code is actually running. A previous version held one
+    connection open for the whole yielded block, which for phases doing
+    many slow outbound HTTP calls (subdomain takeover checks, the ~130
+    detective.py checks) meant a connection sat idle-but-checked-out for
+    minutes at a time - confirmed live on OCI to saturate the pool and
+    block the rest of the app, including a plain health check, on any
+    project with several targets scanning concurrently.
     """
-    await conn.execute(
-        """
-        UPDATE phase_runs
-        SET status = 'in_progress', started_at = $2
-        WHERE id = $1
-        """,
-        phase_run_id,
-        datetime.now(timezone.utc),
-    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE phase_runs
+            SET status = 'in_progress', started_at = $2
+            WHERE id = $1
+            """,
+            phase_run_id,
+            datetime.now(timezone.utc),
+        )
     await ws_manager.manager.broadcast(
         project_id,
         {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
@@ -106,19 +117,20 @@ async def run_phase(
         # exception swallowing" bug from earlier versions of this tool.
         logger.exception("Phase run %s failed", phase_run_id)
 
-        await conn.execute(
-            """
-            UPDATE phase_runs
-            SET status = 'failed',
-                completed_at = $2,
-                error_message = $3,
-                retry_count = retry_count + 1
-            WHERE id = $1
-            """,
-            phase_run_id,
-            datetime.now(timezone.utc),
-            str(exc)[:2000],  # cap length so one giant error can't bloat the row
-        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE phase_runs
+                SET status = 'failed',
+                    completed_at = $2,
+                    error_message = $3,
+                    retry_count = retry_count + 1
+                WHERE id = $1
+                """,
+                phase_run_id,
+                datetime.now(timezone.utc),
+                str(exc)[:2000],  # cap length so one giant error can't bloat the row
+            )
         await ws_manager.manager.broadcast(
             project_id,
             {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
@@ -128,15 +140,16 @@ async def run_phase(
         # can apply retry/skip logic. We never swallow the error here.
         raise
     else:
-        await conn.execute(
-            """
-            UPDATE phase_runs
-            SET status = 'completed', completed_at = $2
-            WHERE id = $1
-            """,
-            phase_run_id,
-            datetime.now(timezone.utc),
-        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE phase_runs
+                SET status = 'completed', completed_at = $2
+                WHERE id = $1
+                """,
+                phase_run_id,
+                datetime.now(timezone.utc),
+            )
         await ws_manager.manager.broadcast(
             project_id,
             {"type": "phase_update", "phase_run_id": phase_run_id, "target_id": target_id,
