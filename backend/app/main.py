@@ -59,6 +59,37 @@ from .models import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("swas.main")
 
+# Long-term fix for a real production incident (OCI, this session): a
+# scan kicked off one asyncio task PER scope target with NO limit on how
+# many ran concurrently. A project with dozens of scope targets - not
+# unusual for an org-wide bug bounty scope - would fire off dozens of
+# full pipelines (recon/probe/fuzz/scan, each spawning subfinder,
+# httpx, nuclei, ffuf, dalfox, sqlmap, arjun subprocesses) all at once.
+# Confirmed live: load average of 83 on a 4-OCPU box, one container at
+# 389% CPU with 245 PIDs. This wasn't a database problem at all - the
+# earlier connection-pool fixes were real and worth keeping, but this
+# is the actual root cause of the CPU/host-level meltdown.
+#
+# MAX_CONCURRENT_TARGET_SCANS caps how many scope targets can have an
+# active pipeline running at once, app-wide - not per-project, since
+# the scan queue (Batch 4b) already caps concurrent PROJECTS at one,
+# but a single project's dozens of targets were still all racing each
+# other under that one project slot. Default of 4 matches this OCI
+# instance's OCPU count; override via env var if the instance is
+# resized. Tune down further if load still climbs with the new cap in
+# place - each target's own scan phase also runs its ~130 detective
+# checks with internal concurrency, so total CPU pressure isn't purely
+# linear in this number.
+_TARGET_SCAN_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_TARGET_SCANS", "4")))
+
+
+async def _run_target_pipeline_limited(pool, project_id: int, target_id: int, target: str) -> None:
+    """Wraps pipeline.run_target_pipeline with the app-wide concurrency
+    cap above. ALL calls to run_target_pipeline should go through this,
+    not the pipeline function directly, or the cap does nothing."""
+    async with _TARGET_SCAN_SEMAPHORE:
+        await pipeline.run_target_pipeline(pool, project_id, target_id, target)
+
 
 async def _trigger_scan_for_project(project_id: int) -> dict:
     """
@@ -119,7 +150,7 @@ async def _trigger_scan_for_project(project_id: int) -> dict:
 
     tasks = [
         asyncio.create_task(
-            pipeline.run_target_pipeline(pool, project_id, target_row["id"], target_row["target"])
+            _run_target_pipeline_limited(pool, project_id, target_row["id"], target_row["target"])
         )
         for target_row in targets
     ]
@@ -744,7 +775,7 @@ async def rescan_target(project_id: int, target_id: int):
             )
 
     asyncio.create_task(
-        pipeline.run_target_pipeline(pool, project_id, target_id, target_row["target"])
+        _run_target_pipeline_limited(pool, project_id, target_id, target_row["target"])
     )
 
     return {
