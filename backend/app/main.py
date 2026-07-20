@@ -548,16 +548,22 @@ async def get_project(project_id: int):
 @app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
 async def bulk_project_action(payload: ProjectBulkActionRequest):
     """
-    Archives or deletes several projects at once from the project list -
-    meant for cleaning up test/duplicate projects without clicking into
-    each one individually.
+    Archives or unarchives several projects at once from the project
+    list, or deletes them - meant for cleaning up test/duplicate
+    projects without clicking into each one individually.
 
-    Archive is always safe (just flips status, keeps everything).
-    Delete is guarded the same way scope-target delete is guarded:
-    projects cascade to scope_targets/findings/phase_runs/scan_runs on
-    delete, so any project with at least one finding is skipped rather
-    than silently destroyed - it shows up in "blocked" instead, with the
-    finding count, so a bulk click can't accidentally erase real results.
+    Archive/unarchive are always safe (just flips status, keeps
+    everything). Unarchive sets status back to 'completed' rather than
+    trying to guess whether it should be 'created' or 'scanning' - both
+    of those imply an active/pending scan state that isn't true right
+    after unarchiving, and 'completed' is what every archived project
+    actually was immediately before archiving in practice (you archive
+    finished work, not projects mid-scan). Delete is guarded the same
+    way scope-target delete is guarded: projects cascade to
+    scope_targets/findings/phase_runs/scan_runs on delete, so any
+    project with at least one finding is skipped rather than silently
+    destroyed - it shows up in "blocked" instead, with the finding
+    count, so a bulk click can't accidentally erase real results.
     Nonexistent project ids are silently ignored (already gone is fine).
     """
     pool = database.get_pool()
@@ -575,6 +581,13 @@ async def bulk_project_action(payload: ProjectBulkActionRequest):
             if payload.action == "archive":
                 await conn.execute(
                     "UPDATE projects SET status = 'archived' WHERE id = $1", project_id
+                )
+                succeeded.append(project_id)
+                continue
+
+            if payload.action == "unarchive":
+                await conn.execute(
+                    "UPDATE projects SET status = 'completed' WHERE id = $1", project_id
                 )
                 succeeded.append(project_id)
                 continue

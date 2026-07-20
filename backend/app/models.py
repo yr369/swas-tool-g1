@@ -65,7 +65,7 @@ class ProjectDeleteRequest(BaseModel):
 
 class ProjectBulkActionRequest(BaseModel):
     project_ids: list[int]
-    action: Literal["archive", "delete"]
+    action: Literal["archive", "unarchive", "delete"]
 
 
 class ProjectBulkBlocked(BaseModel):
@@ -79,7 +79,7 @@ class ProjectBulkBlocked(BaseModel):
 
 
 class ProjectBulkActionResult(BaseModel):
-    action: Literal["archive", "delete"]
+    action: Literal["archive", "unarchive", "delete"]
     succeeded: list[int]
     blocked: list[ProjectBulkBlocked]
 

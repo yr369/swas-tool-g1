@@ -18,6 +18,12 @@ export function ProjectList() {
   // workflow below changes or is at risk of regressing.
   const [view, setView] = useState("list");
   const [findings, setFindings] = useState([]);
+  // Archived projects sit in the same table as everything else and
+  // were getting mixed into one flat list with no way to see just them
+  // (or to keep them out of the way while working) - default to hiding
+  // them, with an explicit tab to go look, same as most task trackers
+  // handle a "done"/"archived" bucket.
+  const [statusFilter, setStatusFilter] = useState("active");
 
   function load() {
     return api
@@ -59,8 +65,17 @@ export function ProjectList() {
     });
   }
 
+  const filteredProjects = useMemo(() => {
+    if (!projects) return [];
+    if (statusFilter === "all") return projects;
+    if (statusFilter === "archived") return projects.filter((p) => p.status === "archived");
+    return projects.filter((p) => p.status !== "archived"); // "active"
+  }, [projects, statusFilter]);
+
   function toggleAll() {
-    setSelected((prev) => (prev.size === projects.length ? new Set() : new Set(projects.map((p) => p.id))));
+    setSelected((prev) =>
+      prev.size === filteredProjects.length ? new Set() : new Set(filteredProjects.map((p) => p.id))
+    );
   }
 
   async function handleBulkAction(action) {
@@ -136,14 +151,32 @@ export function ProjectList() {
             <AttackSurfaceGraph projects={projects} findings={findings} />
           ) : (
             <>
+              <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden", width: "fit-content", marginBottom: 12 }}>
+                <button onClick={() => setStatusFilter("active")} style={toggleButtonStyle(statusFilter === "active")}>
+                  Active
+                </button>
+                <button onClick={() => setStatusFilter("archived")} style={toggleButtonStyle(statusFilter === "archived")}>
+                  Archived ({statusCounts.archived})
+                </button>
+                <button onClick={() => setStatusFilter("all")} style={toggleButtonStyle(statusFilter === "all")}>
+                  All
+                </button>
+              </div>
+
+              {filteredProjects.length === 0 ? (
+                <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
+                  {statusFilter === "archived" ? "No archived projects." : "Nothing here."}
+                </div>
+              ) : (
+                <>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
                   <input
                     type="checkbox"
-                    checked={selected.size === projects.length}
+                    checked={selected.size === filteredProjects.length}
                     onChange={toggleAll}
                     ref={(el) => {
-                      if (el) el.indeterminate = selected.size > 0 && selected.size < projects.length;
+                      if (el) el.indeterminate = selected.size > 0 && selected.size < filteredProjects.length;
                     }}
                   />
                   Select all
@@ -152,9 +185,15 @@ export function ProjectList() {
                 {selected.size > 0 && (
                   <>
                     <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{selected.size} selected</span>
-                    <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
-                      {bulkRunning ? "…" : "Archive selected"}
-                    </button>
+                    {statusFilter === "archived" ? (
+                      <button onClick={() => handleBulkAction("unarchive")} disabled={bulkRunning} style={secondaryButtonStyle}>
+                        {bulkRunning ? "…" : "Unarchive selected"}
+                      </button>
+                    ) : (
+                      <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
+                        {bulkRunning ? "…" : "Archive selected"}
+                      </button>
+                    )}
                     <button
                       onClick={() => handleBulkAction("delete")}
                       disabled={bulkRunning}
@@ -170,6 +209,8 @@ export function ProjectList() {
                 <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
                   {bulkResult.action === "archive" ? (
                     <span style={{ color: "var(--status-success)" }}>Archived {bulkResult.succeeded.length}.</span>
+                  ) : bulkResult.action === "unarchive" ? (
+                    <span style={{ color: "var(--status-success)" }}>Unarchived {bulkResult.succeeded.length}.</span>
                   ) : (
                     <span style={{ color: "var(--status-success)" }}>Deleted {bulkResult.succeeded.length}.</span>
                   )}
@@ -183,7 +224,7 @@ export function ProjectList() {
               )}
 
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {projects.map((p) => (
+                {filteredProjects.map((p) => (
                   <div
                     key={p.id}
                     style={{
@@ -230,6 +271,8 @@ export function ProjectList() {
                   </div>
                 ))}
               </div>
+                </>
+              )}
             </>
           )}
         </>

@@ -277,6 +277,23 @@ async def run_ffuf(url: str, wordlist_path: str) -> ToolResult:
 # whose brief explicitly wants these can still opt back in.
 _DEFAULT_NUCLEI_EXCLUDE_TAGS = "ssl,tls"
 
+# Confirmed by pulling real scan data: the overwhelming majority of
+# nuclei output that's pure noise (DNS record fingerprinting, tech-
+# detect, robots.txt/options-method discovery templates, etc.) is
+# nuclei's own severity: "info" tier - and essentially none of it is
+# ever reportable. Rather than maintain a growing, easy-to-miss list of
+# individual noisy tags (dns, tech, headers, misc, ...), this filters by
+# severity directly at the nuclei level via -severity, so nuclei simply
+# never runs (or at least never reports) an info-tier template match in
+# the first place - same "save the cost, not just the noise" reasoning
+# as the tag exclusion above, and it automatically covers any new
+# info-tier template ProjectDiscovery adds later without this file
+# needing an update. "unknown" stays included since that's nuclei's
+# severity for templates that legitimately don't declare one, not a
+# noise signal. Set NUCLEI_MIN_SEVERITY="" to disable and see everything
+# again (e.g. while debugging why a specific template isn't firing).
+_DEFAULT_NUCLEI_MIN_SEVERITY = "low,medium,high,critical,unknown"
+
 
 async def run_nuclei(target: str) -> ToolResult:
     """
@@ -289,9 +306,12 @@ async def run_nuclei(target: str) -> ToolResult:
     against scanme.nmap.org.
 
     -etags excludes noisy, low-value template categories by default (see
-    _DEFAULT_NUCLEI_EXCLUDE_TAGS above). Set NUCLEI_EXCLUDE_TAGS="" in
-    .env to disable and scan everything, or override with a different
-    comma-separated tag list for a specific program's needs.
+    _DEFAULT_NUCLEI_EXCLUDE_TAGS above). -severity additionally drops
+    the whole info tier (see _DEFAULT_NUCLEI_MIN_SEVERITY above) - the
+    two are complementary, not redundant: -etags catches specific
+    categories we never want regardless of severity (SSL/TLS), -severity
+    catches the broad "this is recon, not a finding" tier regardless of
+    category. Both configurable via env, same override pattern.
     """
     args = ["nuclei", "-u", target, "-silent", "-no-color"]
     if header := _research_header():
@@ -300,6 +320,10 @@ async def run_nuclei(target: str) -> ToolResult:
     exclude_tags = os.environ.get("NUCLEI_EXCLUDE_TAGS", _DEFAULT_NUCLEI_EXCLUDE_TAGS)
     if exclude_tags.strip():
         args += ["-etags", exclude_tags.strip()]
+
+    min_severity = os.environ.get("NUCLEI_MIN_SEVERITY", _DEFAULT_NUCLEI_MIN_SEVERITY)
+    if min_severity.strip():
+        args += ["-severity", min_severity.strip()]
 
     return await run_tool("nuclei", args, timeout_seconds=300)
 

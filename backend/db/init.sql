@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS scope_targets (
     reward_range    TEXT,
     notes           TEXT,
     last_scanned_at TIMESTAMPTZ,
+    recon_cache     JSONB,
+    recon_cached_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

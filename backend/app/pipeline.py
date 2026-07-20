@@ -320,14 +320,34 @@ async def _phase_recon(
     target: str,
     discovered_subdomains: list[str],
 ) -> None:
-    """Subdomain enumeration, then check which ones are actually alive."""
-    result = await tools.run_subfinder(target)
-    if not result.success:
-        raise RuntimeError(f"subfinder failed: {result.error}")
+    """
+    Subdomain enumeration, then check which ones are actually alive.
 
-    found = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    discovered_subdomains.extend(found or [target])  # fall back to the target itself
-    logger.info("recon: found %d subdomains for %s", len(discovered_subdomains), target)
+    Reuses a recent subfinder result (see _get_recon_cache_if_fresh)
+    when one exists within RECON_CACHE_HOURS instead of re-querying
+    every OSINT source again - see that function's docstring for why.
+    The takeover check below still runs every single time regardless of
+    cache hit/miss: CNAME state (the thing that check actually cares
+    about) can change independently of the subdomain list itself, and
+    it's cheap enough that skipping it would save little while risking
+    a missed takeover.
+    """
+    cached = await _get_recon_cache_if_fresh(pool, target_id)
+    if cached is not None:
+        discovered_subdomains.extend(cached)
+        logger.info(
+            "recon: reused cached subdomain list (%d found, within %.0fh) for target_id=%s - skipped subfinder",
+            len(cached), _RECON_CACHE_HOURS, target_id,
+        )
+    else:
+        result = await tools.run_subfinder(target)
+        if not result.success:
+            raise RuntimeError(f"subfinder failed: {result.error}")
+
+        found = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        discovered_subdomains.extend(found or [target])  # fall back to the target itself
+        logger.info("recon: found %d subdomains for %s", len(discovered_subdomains), target)
+        await _save_recon_cache_pooled(pool, target_id, discovered_subdomains)
 
     # Detective check: subdomain takeover via CNAME fingerprinting. Cheap
     # (one DoH lookup + one conditional HTTP fetch per host) and among
@@ -2087,6 +2107,50 @@ async def _save_scan_note_pooled(
 ) -> None:
     async with pool.acquire() as conn:
         await _save_scan_note(conn, project_id, target_id, check_name, note)
+
+
+# How long a subfinder result stays reusable before recon re-runs it for
+# real. Subdomain sets for a given root domain rarely change hour to
+# hour, so a target on a 6-hourly schedule (or someone repeatedly
+# clicking manual rescan) was paying full subfinder cost - which hits
+# many external OSINT sources per run - for the same answer every time.
+# Default (12h) means: 6-hourly schedules reuse the cache ~3 of 4 runs,
+# daily/weekly schedules always get fresh recon (their interval already
+# exceeds the cache window), and single-target manual rescans get the
+# same speedup as scheduled ones. Set RECON_CACHE_HOURS=0 to disable and
+# always run fresh subfinder.
+_RECON_CACHE_HOURS = float(os.environ.get("RECON_CACHE_HOURS", "12"))
+
+
+async def _get_recon_cache_if_fresh(pool: asyncpg.Pool, target_id: int) -> list[str] | None:
+    """
+    Returns the cached subdomain list for this target if one exists and
+    is younger than _RECON_CACHE_HOURS, else None (meaning: run subfinder
+    for real). A disabled cache (_RECON_CACHE_HOURS <= 0) always returns
+    None so recon behaves exactly as it did before this feature.
+    """
+    if _RECON_CACHE_HOURS <= 0:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT recon_cache FROM scope_targets "
+            "WHERE id = $1 AND recon_cached_at > now() - ($2 || ' hours')::interval",
+            target_id, str(_RECON_CACHE_HOURS),
+        )
+    if row is None or not row["recon_cache"]:
+        return None
+    try:
+        return json.loads(row["recon_cache"])
+    except (ValueError, TypeError):
+        return None  # corrupt cache row - fail open to a fresh subfinder run, not a crash
+
+
+async def _save_recon_cache_pooled(pool: asyncpg.Pool, target_id: int, subdomains: list[str]) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE scope_targets SET recon_cache = $1, recon_cached_at = now() WHERE id = $2",
+            json.dumps(subdomains), target_id,
+        )
 
 
 async def _save_detective_finding_pooled(
