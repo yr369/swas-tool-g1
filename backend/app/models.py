@@ -172,7 +172,7 @@ class PhaseRun(BaseModel):
     id: int
     project_id: int
     target_id: int
-    phase_name: Literal["recon", "probe", "fuzz", "scan", "gate", "logic_hunter", "triage", "notify"]
+    phase_name: Literal["recon", "probe", "fuzz", "scan", "verify", "gate", "logic_hunter", "triage", "notify"]
     status: Literal["pending", "in_progress", "completed", "failed", "needs_attention"]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
