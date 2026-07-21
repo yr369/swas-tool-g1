@@ -311,6 +311,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -620,6 +621,28 @@ _TOKEN_PATTERN = re.compile(
 )
 
 
+# Paths that are near-certain to hold test fixtures / example code rather
+# than real shipped secrets - open-source repos routinely hardcode
+# high-entropy-looking dummy tokens in exactly these locations (the
+# Vercel sveltejs/kit dead-end: a fake uploadToken sitting in a test
+# fixture, not a live credential).
+_TEST_FIXTURE_PATH_HINTS = re.compile(
+    r"(?:^|/)(?:__tests__|test|tests|testing|spec|specs|fixture|fixtures|"
+    r"example|examples|mock|mocks|__mocks__|sample|samples|demo|playground|"
+    r"e2e|stories)(?:/|$|\.)",
+    re.IGNORECASE,
+)
+
+# Value substrings that mark a token as an obvious placeholder/dummy
+# rather than a real secret, regardless of how "random" it looks by
+# entropy alone (e.g. "sk_test_51H8x...", "fake-upload-token-abc123").
+_PLACEHOLDER_VALUE_HINTS = re.compile(
+    r"(?:^|[_\-])(?:test|dummy|fake|sample|example|placeholder|xxxx|changeme|"
+    r"your[_\-]?)|sk_test_|pk_test_",
+    re.IGNORECASE,
+)
+
+
 def _shannon_entropy(s: str) -> float:
     if not s:
         return 0.0
@@ -638,6 +661,13 @@ async def check_file_entropy(url: str) -> dict | None:
     the evidence so the finding itself doesn't become a leak.
     """
     if not _SENSITIVE_FILE_HINTS.search(url):
+        return None
+
+    if _TEST_FIXTURE_PATH_HINTS.search(url):
+        # Test/fixture/example/mock paths in open-source or public repos
+        # routinely contain hardcoded dummy tokens that are high-entropy
+        # by construction but were never meant to be real credentials -
+        # not worth reporting even if the entropy math looks convincing.
         return None
 
     logger.info("detective: checking file entropy for %s", url)
@@ -663,7 +693,7 @@ async def check_file_entropy(url: str) -> dict | None:
         # Entropy > 4.0 over a >=12-char value reliably separates
         # random-looking secrets from ordinary words/placeholders like
         # "your_api_key_here" (English text sits well under 4.0).
-        if entropy > 4.0:
+        if entropy > 4.0 and not _PLACEHOLDER_VALUE_HINTS.search(value):
             hits.append((key_name, entropy, value[:4] + "..." + value[-2:]))
 
     if not hits:
@@ -4681,6 +4711,19 @@ async def check_sql_injection_boolean_based(url: str) -> dict | None:
                 except httpx.HTTPError:
                     continue
 
+                # A WAF/edge proxy dropping the connection on obvious SQL
+                # syntax (' AND '1'='2 etc.) produces a 4xx/5xx status
+                # that looks exactly like "the query behaved differently"
+                # to a naive status-code diff - but that's the edge layer
+                # talking, not the database. If EITHER probe response is
+                # 4xx/5xx, this is not a trustworthy boolean-SQLi signal;
+                # bail out entirely rather than risk a WAF-block false
+                # positive (matches the real Agoda dead-end: TRUE payload
+                # got 200, FALSE payload got a WAF 502, tool flagged it as
+                # "database responding to boolean conditions").
+                if true_resp.status_code >= 400 or false_resp.status_code >= 400:
+                    continue
+
                 true_matches_baseline = (
                     true_resp.status_code == baseline_resp.status_code
                     and abs(len(true_resp.text) - len(baseline_body)) < max(20, len(baseline_body) * 0.02)
@@ -4917,6 +4960,42 @@ async def check_azure_blob_public_exposure(url: str) -> dict | None:
 # ---------------------------------------------------------------------
 # 76. Origin IP disclosure / WAF-CDN bypass
 # ---------------------------------------------------------------------
+# Publicly documented edge/anycast ranges for the major CDN/WAF
+# providers. If the DNS A record resolves to an address inside one of
+# these blocks, that IP is a CDN edge node - not the true origin - even
+# though it happily serves the real site content. Requesting it directly
+# with a spoofed Host header does NOT bypass anything in that case (it's
+# still hitting the same WAF layer), which is exactly how the Agoda
+# 104.18.79.74 dead-end happened (a Cloudflare edge IP mistaken for the
+# origin). This list is intentionally not exhaustive - it only needs to
+# catch the handful of providers that show up constantly in bounty
+# scopes; ranges change occasionally and should be refreshed periodically.
+_CDN_EDGE_RANGES = [
+    # Cloudflare (ipv4)
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    # Akamai (representative ranges)
+    "23.32.0.0/11", "23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13",
+    "2.16.0.0/13", "95.100.0.0/15",
+    # Fastly
+    "151.101.0.0/16", "199.27.72.0/21", "146.75.0.0/16",
+    # AWS CloudFront
+    "13.32.0.0/15", "13.35.0.0/16", "13.224.0.0/14", "204.246.164.0/22",
+    "204.246.168.0/22", "205.251.192.0/19", "52.222.128.0/17",
+]
+_CDN_EDGE_NETWORKS = [ipaddress.ip_network(cidr) for cidr in _CDN_EDGE_RANGES]
+
+
+def _is_known_cdn_edge_ip(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in net for net in _CDN_EDGE_NETWORKS)
+
+
 async def check_origin_ip_waf_bypass(host: str) -> dict | None:
     """
     Resolves the host's A record via DNS-over-HTTPS, then compares a
@@ -4948,6 +5027,14 @@ async def check_origin_ip_waf_bypass(host: str) -> dict | None:
             if not answers:
                 return None
             origin_ip = answers[0]
+
+            if _is_known_cdn_edge_ip(origin_ip):
+                # The public DNS record points at a CDN edge node, not the
+                # real origin - hitting this IP directly still goes through
+                # the same CDN/WAF layer, so there's nothing to bypass.
+                # (This is expected and correct for any site behind
+                # Cloudflare/Akamai/Fastly/CloudFront - not a finding.)
+                return None
 
             try:
                 hostname_resp = await client.get(host)
@@ -5002,10 +5089,28 @@ async def check_cors_subdomain_suffix_bypass(url: str) -> dict | None:
     domain = httpx.URL(url).host
     if not domain:
         return None
-    attacker_origins = [
+    candidate_origins = [
         f"https://{domain}.evil-swas-probe.test",
         f"https://evil-swas-probe{domain}",
     ]
+
+    # Domain-boundary guard: "evil-swas-probe" + domain concatenated
+    # without a separator can accidentally produce a string that is
+    # itself a REAL subdomain inside the target's own DNS namespace
+    # (e.g. domain="www.agoda.com" -> "evil-swas-probewww.agoda.com",
+    # which literally ends in ".agoda.com"). Nobody but the target can
+    # register or host content at a name under their own apex domain, so
+    # an attacker could never get a victim's browser to send that as a
+    # real Origin - it's not exploitable and isn't a bypass, just a
+    # coincidental namespace collision. Drop any candidate that ends up
+    # inside the target's own domain before testing it.
+    attacker_origins = [
+        origin for origin in candidate_origins
+        if httpx.URL(origin).host != domain
+        and not httpx.URL(origin).host.endswith("." + domain)
+    ]
+    if not attacker_origins:
+        return None
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
