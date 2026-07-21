@@ -123,6 +123,14 @@ _TIER_2_PROVIDERS = [
         "base_url_env": "GLM_BASE_URL",
         "base_url_default": "https://openrouter.ai/api/v1",
     },
+    {
+        "name": "llama-3.3-70b-instruct",
+        "model_env": "LLAMA_MODEL",
+        "model_default": "meta/llama-3.3-70b-instruct",
+        "key_env": "LLAMA_API_KEY",
+        "base_url_env": "LLAMA_BASE_URL",
+        "base_url_default": "https://openrouter.ai/api/v1",
+    },
 ]
 
 _TIER_2_TIMEOUT_SECONDS = 60
