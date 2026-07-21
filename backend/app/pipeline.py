@@ -2245,14 +2245,29 @@ async def _upsert_finding_cluster(
         """,
         target_id,
     )
-    await conn.execute(
+    inserted_id = await conn.fetchval(
         """
         INSERT INTO finding_cluster_members (cluster_id, finding_id, source)
         VALUES ($1, $2, $3)
         ON CONFLICT (cluster_id, finding_id) DO NOTHING
+        RETURNING finding_id
         """,
         cluster_id, finding_id, source,
     )
+    if inserted_id is not None:
+        # Only reset on an actual new member (not a no-op re-insert of the
+        # same finding). Without this, a cluster that was hunted once on
+        # scan #1 with a single boring finding never gets re-examined even
+        # after scan #3 adds three more suspicious findings to the same
+        # target - logic_hunter_status='done' is permanent otherwise.
+        await conn.execute(
+            """
+            UPDATE finding_clusters
+            SET logic_hunter_status = 'pending', updated_at = now()
+            WHERE id = $1 AND logic_hunter_status = 'done'
+            """,
+            cluster_id,
+        )
 
 
 async def _save_finding(

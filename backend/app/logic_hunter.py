@@ -36,6 +36,7 @@ import json
 import logging
 import os
 
+import httpx
 from google import genai
 
 from .gemini_rotation import generate_with_rotation
@@ -75,6 +76,101 @@ human should prioritize this over other manual testing" - most real hypotheses l
 """
 
 
+_VERIFICATION_TIMEOUT = 10.0
+
+# Deliberately the cheap model, same tier as gate.py - this is a narrow
+# extraction task (does the hypothesis contain ONE safely-testable claim),
+# not open-ended reasoning, so it doesn't need gemini-2.5-pro.
+_VERIFICATION_MODEL = "gemini-2.5-flash-lite"
+
+_VERIFICATION_PROMPT = """A security researcher's hypothesis about a target is below. Your \
+ONLY job is to decide whether this specific hypothesis can be partially confirmed or refuted \
+with a SINGLE, unauthenticated, read-only HTTP GET request - nothing else counts as testable.
+
+Hypothesis: {hypothesis}
+
+Mark testable=false for ANYTHING that requires: comparing two different user sessions/accounts, \
+sending a POST/PUT/DELETE/PATCH, needing a valid auth token you don't already have, or any \
+multi-step sequence. Most hypotheses (especially IDOR and most business-logic claims) genuinely \
+require a second authenticated session to confirm and are NOT testable this way - it is correct \
+and expected for testable to be false most of the time.
+
+Only mark testable=true for narrow cases like: "this admin/internal endpoint is reachable with \
+no authentication at all" (a plain GET to that exact URL returning 200 instead of 401/403/404 \
+would confirm it), where the full concrete URL is already stated or directly derivable from the \
+hypothesis text.
+
+Respond with ONLY a JSON object, no other text, no markdown fences:
+{{"testable": false}}
+or
+{{"testable": true, "url": "https://full/concrete/url", "expected_signal": "one short phrase describing what a CONFIRMING response looks like, e.g. 'HTTP 200 with a JSON body' or 'HTTP 200 instead of 401/403'"}}
+"""
+
+
+def _parse_verification_extraction(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:].strip()
+    return json.loads(text)
+
+
+async def _attempt_single_request_verification(hypothesis: str) -> str | None:
+    """
+    Returns a short evidence-appendix string describing the verification
+    outcome, or None if the hypothesis wasn't safely testable this way
+    (the overwhelmingly common case - most hypotheses need a second
+    session and stay pure hypothesis, which is correct and expected).
+
+    Safety: regardless of what the model returns, this only ever issues
+    a single GET. No method, header, or body the model suggests can turn
+    this into a state-changing request - that's enforced in code, not
+    just by the prompt.
+    """
+    client = _get_client()
+    try:
+        response, _ = await generate_with_rotation(
+            client, _VERIFICATION_PROMPT.format(hypothesis=hypothesis[:2000]),
+            preferred_model=_VERIFICATION_MODEL,
+        )
+        extraction = _parse_verification_extraction(response.text or "")
+    except Exception as exc:
+        logger.info("logic_hunter: verification extraction failed, leaving as pure hypothesis: %s", exc)
+        return None
+
+    if not extraction.get("testable") or not extraction.get("url"):
+        return None
+
+    url = extraction["url"]
+    expected_signal = (extraction.get("expected_signal") or "")[:200]
+
+    try:
+        async with httpx.AsyncClient(timeout=_VERIFICATION_TIMEOUT, verify=False, follow_redirects=True) as http_client:
+            resp = await http_client.get(url)  # GET only - hardcoded, never derived from model output
+    except httpx.HTTPError as exc:
+        logger.info("logic_hunter: verification GET failed for %s: %s", url, exc)
+        return f"[auto-verification attempted, request failed: {exc}] no signal either way."
+
+    if resp.status_code in (401, 403, 404):
+        return (
+            f"[auto-verification: GET {url} returned {resp.status_code} - the claimed "
+            f"unauthenticated access does NOT appear to hold; this hypothesis looks weaker "
+            f"than it first read, but confirm manually before dismissing]"
+        )
+    if resp.status_code == 200 and len(resp.text) > 50:
+        return (
+            f"[auto-verification: GET {url} returned 200 with a {len(resp.text)}-byte body "
+            f"with no auth sent - consistent with the hypothesis (expected signal: "
+            f"{expected_signal!r}). Still needs a human to confirm the response body actually "
+            f"contains what's claimed before this is report-ready.]"
+        )
+    return (
+        f"[auto-verification: GET {url} returned {resp.status_code} - inconclusive, "
+        f"doesn't clearly confirm or refute the hypothesis]"
+    )
+
+
 def _get_client() -> genai.Client:
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -97,7 +193,7 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
     client = _get_client()
     findings_block = "\n".join(
         f"- {m['tool_name']}/{m['vuln_type']} (source={m['source']}, severity={m['severity']}): "
-        f"{(m['evidence'] or '')[:400]}"
+        f"{(m['evidence'] or '')[:1600]}"
         for m in members
     )
     prompt = _LOGIC_HUNTER_PROMPT.format(
@@ -126,7 +222,10 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: in
     noise-filter gate that raw scanner/tool output does.
     """
     confidence = result.get("confidence") or 0.0
+    verification_note = await _attempt_single_request_verification(result["hypothesis"] or "")
     evidence = f"[ai-hypothesis: needs manual verification, confidence={confidence:.2f}]\n{result['hypothesis']}"
+    if verification_note:
+        evidence += f"\n{verification_note}"
     finding_id = await conn.fetchval(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence, gate_status)
