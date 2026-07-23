@@ -282,10 +282,10 @@ async def _execute_phase(
         await _phase_recon(pool, project_id, target_id, target, discovered_subdomains)
 
     elif phase_name == "probe":
-        await _phase_probe(target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
+        await _phase_probe(pool, target_id, target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
 
     elif phase_name == "fuzz":
-        await _phase_fuzz(live_hosts, params_found)
+        await _phase_fuzz(pool, target_id, live_hosts, params_found)
 
     elif phase_name == "scan":
         await _phase_scan(pool, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
@@ -368,6 +368,8 @@ async def _phase_recon(
 
 
 async def _phase_probe(
+    pool: asyncpg.Pool,
+    target_id: int,
     target: str,
     discovered_subdomains: list[str],
     live_hosts: list[str],
@@ -381,8 +383,13 @@ async def _phase_probe(
     of a plain hostname string. We parse that here once - this is the
     "fingerprint once, reuse everywhere" behavior: every other tool
     downstream gets tech_stack instead of re-detecting independently.
+
+    Also persists every observed URL into attack_surface_endpoints (see
+    attack_surface_model.sql) - this is the one place that data stops
+    being thrown away at the end of the scan run.
     """
     hosts_to_check = discovered_subdomains or [target]
+    surface_endpoints: list[dict] = []
 
     httpx_result = await tools.run_httpx(hosts_to_check)
     if httpx_result.success:
@@ -396,21 +403,33 @@ async def _phase_probe(
                 if url:
                     live_hosts.append(url)
                     tech_stack[url] = record.get("tech", [])
+                    surface_endpoints.append({
+                        "url": url,
+                        "source": "httpx",
+                        "is_live": True,
+                        "status_code": record.get("status_code"),
+                        "tech_stack": record.get("tech", []),
+                    })
             except json.JSONDecodeError:
                 # Fall back to treating the raw line as a plain host -
                 # never silently drop a live host just because one line
                 # wasn't valid JSON (e.g. a stray log line mixed into
                 # stdout). No tech info for this one, that's fine.
                 live_hosts.append(line)
+                surface_endpoints.append({"url": line, "source": "httpx", "is_live": True})
     # A non-fatal httpx failure shouldn't kill the whole phase - URL
     # discovery below can still proceed even without a live host list.
     # We still raise if BOTH httpx and the URL tools fail (see below).
 
     gau_result = await tools.run_gau(target)
     if gau_result.success:
-        discovered_urls.extend(
-            line.strip() for line in gau_result.stdout.splitlines() if line.strip()
-        )
+        gau_urls = [line.strip() for line in gau_result.stdout.splitlines() if line.strip()]
+        discovered_urls.extend(gau_urls)
+        # is_live intentionally omitted (stays NULL/unknown on first
+        # insert, or whatever a prior scan already determined on
+        # conflict) - gau returns historical archive URLs, not
+        # confirmed-live ones.
+        surface_endpoints.extend({"url": u, "source": "gau"} for u in gau_urls)
 
     if not httpx_result.success and not gau_result.success:
         raise RuntimeError(
@@ -418,22 +437,32 @@ async def _phase_probe(
             f"gau={gau_result.error}"
         )
 
+    await _save_surface_endpoints_pooled(pool, target_id, surface_endpoints)
+
     logger.info(
         "probe: %d live hosts, %d historical URLs for %s",
         len(live_hosts), len(discovered_urls), target,
     )
 
 
-async def _phase_fuzz(live_hosts: list[str], params_found: dict[str, bool]) -> None:
+async def _phase_fuzz(pool: asyncpg.Pool, target_id: int, live_hosts: list[str], params_found: dict[str, bool]) -> None:
     """
     Discover parameters on live hosts. This determines which hosts are
     worth running sqlmap/dalfox against in the scan phase - we don't run
     those expensive tools blindly against every host.
+
+    Also parses arjun's actual output (best-effort - see
+    _parse_arjun_params) and merges the real param names into the
+    matching attack_surface_endpoints row, instead of only recording the
+    yes/no "this host has some params" flag that params_found tracks.
     """
     for host in live_hosts[:10]:  # Phase 1: cap how many hosts get deep-probed
         result = await tools.run_arjun(host)
         if result.success and result.stdout.strip():
             params_found[host] = True
+            param_names = _parse_arjun_params(result.stdout)
+            if param_names:
+                await _save_surface_params_pooled(pool, target_id, host, param_names)
 
     logger.info("fuzz: %d hosts have discoverable parameters", len(params_found))
     # Note: we deliberately don't raise here even if nothing was found -
@@ -2150,6 +2179,117 @@ async def _save_recon_cache_pooled(pool: asyncpg.Pool, target_id: int, subdomain
         await conn.execute(
             "UPDATE scope_targets SET recon_cache = $1, recon_cached_at = now() WHERE id = $2",
             json.dumps(subdomains), target_id,
+        )
+
+
+# 401/403 on an unauthenticated probe is a reasonable (not certain) signal
+# that an endpoint requires auth; 200 is a reasonable (not certain) signal
+# that it doesn't. Anything else (redirects, 5xx, etc.) is genuinely
+# ambiguous and left as NULL/unknown rather than guessed - this mirrors
+# the same "don't manufacture a signal you don't actually have" discipline
+# used in gate.py.
+def _infer_requires_auth(status_code: int | None) -> bool | None:
+    if status_code in (401, 403):
+        return True
+    if status_code == 200:
+        return False
+    return None
+
+
+async def _save_surface_endpoints_pooled(
+    pool: asyncpg.Pool,
+    target_id: int,
+    endpoints: list[dict],
+) -> None:
+    """
+    Upserts a batch of observed endpoints into the persistent attack
+    surface model. Each dict: {url, source, is_live, status_code,
+    tech_stack}. On conflict (same target_id+url seen in an earlier
+    scan), merges rather than overwrites: tech_stack and sources are
+    unioned, times_seen increments, requires_auth only gets set if we
+    don't already have a confident answer from a prior scan (so one
+    ambiguous probe doesn't erase a previously-confirmed 401).
+
+    Short-acquire pattern (acquire only for this one batch write, same
+    as _save_recon_cache_pooled/_save_detective_finding_pooled above) -
+    this is called after all the outbound HTTP probing for the phase is
+    already done, never interleaved with it.
+    """
+    if not endpoints:
+        return
+    async with pool.acquire() as conn:
+        for ep in endpoints:
+            status_code = ep.get("status_code")
+            inferred_auth = _infer_requires_auth(status_code)
+            auth_evidence = f"inferred from status_code={status_code}" if inferred_auth is not None else None
+            await conn.execute(
+                """
+                INSERT INTO attack_surface_endpoints
+                    (target_id, url, is_live, last_status_code, tech_stack, sources, requires_auth, auth_evidence)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
+                ON CONFLICT (target_id, url) DO UPDATE SET
+                    times_seen = attack_surface_endpoints.times_seen + 1,
+                    last_seen_at = now(),
+                    last_status_code = EXCLUDED.last_status_code,
+                    is_live = COALESCE(EXCLUDED.is_live, attack_surface_endpoints.is_live),
+                    tech_stack = (
+                        SELECT jsonb_agg(DISTINCT t)
+                        FROM jsonb_array_elements_text(
+                            attack_surface_endpoints.tech_stack || EXCLUDED.tech_stack
+                        ) AS t
+                    ),
+                    sources = (
+                        SELECT jsonb_agg(DISTINCT s)
+                        FROM jsonb_array_elements_text(
+                            attack_surface_endpoints.sources || EXCLUDED.sources
+                        ) AS s
+                    ),
+                    requires_auth = COALESCE(attack_surface_endpoints.requires_auth, EXCLUDED.requires_auth),
+                    auth_evidence = COALESCE(attack_surface_endpoints.auth_evidence, EXCLUDED.auth_evidence)
+                """,
+                target_id,
+                ep["url"],
+                ep.get("is_live"),
+                status_code,
+                json.dumps(ep.get("tech_stack") or []),
+                json.dumps([ep["source"]] if ep.get("source") else []),
+                inferred_auth,
+                auth_evidence,
+            )
+
+
+_ARJUN_PARAMS_RE = re.compile(r"parameters?\s+found:\s*(.+)", re.IGNORECASE)
+
+
+def _parse_arjun_params(stdout: str) -> list[str]:
+    """
+    Best-effort parse of arjun's human-readable stdout (it doesn't run
+    with a JSON output flag here). If the expected "parameters found:"
+    line isn't there - format changed, or arjun printed something else -
+    this just returns [] rather than raising; the caller still records
+    that arjun ran and found *something* via params_found[host]=True
+    regardless of whether we could parse the actual names out of it.
+    """
+    match = _ARJUN_PARAMS_RE.search(stdout)
+    if not match:
+        return []
+    return [p.strip() for p in match.group(1).split(",") if p.strip()]
+
+
+async def _save_surface_params_pooled(pool: asyncpg.Pool, target_id: int, url: str, params: list[str]) -> None:
+    if not params:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE attack_surface_endpoints
+            SET params = (
+                SELECT jsonb_agg(DISTINCT p)
+                FROM jsonb_array_elements_text(params || $2::jsonb) AS p
+            )
+            WHERE target_id = $1 AND url = $3
+            """,
+            target_id, json.dumps(params), url,
         )
 
 

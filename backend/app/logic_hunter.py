@@ -55,6 +55,11 @@ evidence combination suggests is worth a human manually testing.
 
 Target: {target_name} ({target_type})
 
+What we know about this target's broader attack surface (from recon across all scans, \
+not just this cluster's findings) - use this for context like "most endpoints need auth \
+but this one doesn't", not as findings to repeat:
+{surface_context}
+
 Findings already recorded on this target:
 {findings_block}
 
@@ -184,11 +189,17 @@ def _parse_hunter_response(text: str) -> dict:
     return json.loads(text)
 
 
-async def hunt_cluster(target_name: str, target_type: str | None, members: list[dict]) -> dict:
+async def hunt_cluster(target_name: str, target_type: str | None, members: list[dict], surface_summary: dict | None = None) -> dict:
     """
     members: rows with tool_name, vuln_type, severity, evidence, source
     (severity may still be 'unknown' - logic_hunter runs before triage,
     so it's reasoning over raw findings, not triaged ones).
+
+    surface_summary: one row from attack_surface_summary for this
+    target, or None if the surface model has no data yet (a brand new
+    target on its first scan, or scans predating this feature) - in
+    that case the prompt says so plainly rather than silently omitting
+    the section, so the model doesn't need to guess why it's missing.
     """
     client = _get_client()
     findings_block = "\n".join(
@@ -196,8 +207,20 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
         f"{(m['evidence'] or '')[:1600]}"
         for m in members
     )
+    if surface_summary and surface_summary.get("total_endpoints"):
+        surface_context = (
+            f"{surface_summary['total_endpoints']} endpoints seen total, "
+            f"{surface_summary.get('live_endpoints') or 0} confirmed live. "
+            f"Of endpoints with a known auth requirement: "
+            f"{surface_summary.get('auth_required_endpoints') or 0} require auth, "
+            f"{surface_summary.get('no_auth_endpoints') or 0} don't. "
+            f"Tech stack seen across the target: {surface_summary.get('tech_stack_union') or 'unknown'}."
+        )
+    else:
+        surface_context = "No attack-surface data recorded yet for this target - reason from the findings below alone."
     prompt = _LOGIC_HUNTER_PROMPT.format(
-        target_name=target_name, target_type=target_type or "website", findings_block=findings_block,
+        target_name=target_name, target_type=target_type or "website",
+        surface_context=surface_context, findings_block=findings_block,
     )
 
     try:
@@ -277,8 +300,15 @@ async def hunt_project(conn, project_id: int) -> int:
             row["cluster_id"],
         )
 
+        surface_summary = await conn.fetchrow(
+            "SELECT * FROM attack_surface_summary WHERE target_id = $1", row["target_id"],
+        )
+
         if members:
-            result = await hunt_cluster(row["target_name"], row["target_type"], [dict(m) for m in members])
+            result = await hunt_cluster(
+                row["target_name"], row["target_type"], [dict(m) for m in members],
+                dict(surface_summary) if surface_summary else None,
+            )
             if result.get("has_hypothesis") and result.get("hypothesis"):
                 finding_id = await _save_hypothesis(conn, project_id, row["target_id"], row["cluster_id"], result)
                 hunted += 1
