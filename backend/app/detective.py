@@ -1651,15 +1651,66 @@ def _inject_raw_query_param(url: str, param: str, raw_value: str) -> str:
     return urlunparse(parsed._replace(query="&".join(new_parts)))
 
 
+def _evaluate_crlf_response(resp: "httpx.Response", baseline_header_names: set[str]) -> dict | None:
+    """
+    v2 (2026-07-23, false-positive review from manual bounty triage on
+    verilyme.com/Vercel and shop.whoop.com/Cloudflare - see triage notes):
+
+    The old bar was "marker substring appears anywhere in any header
+    VALUE". That's necessary but NOT sufficient, and it produced two
+    confirmed false positives. Both targets sit behind a modern edge/CDN
+    (Vercel, Cloudflare) that reflected the raw payload back as INERT
+    text embedded inside an *existing* header's value - almost always the
+    Location header's URL, since both test cases were redirect-heavy -
+    or re-encoded it (%0D%0A) before it ever reached header-writing
+    logic. Neither case produced a genuinely new, structurally
+    independent header line, which is the actual definition of response
+    splitting.
+
+    New confirmation bar, all of which must hold:
+      1. Compare against a baseline (unmutated) request's header NAMES.
+         The response to the injected request must contain a header name
+         that did NOT exist in the baseline - i.e. the server emitted an
+         extra header line, not just new text inside a header it always
+         sends (like Location).
+      2. That new header's value must contain the marker.
+      3. The marker must not also appear anywhere re-encoded
+         (%0d%0a / %250d%250a) - that's the signature of an edge layer
+         actively sanitizing the input, which rules out exploitability
+         even if some other check looked promising.
+    """
+    for v in resp.headers.values():
+        lowered = v.lower()
+        if "%0d%0a" in lowered or "%250d%250a" in lowered:
+            return None
+
+    response_header_names = {k.lower() for k in resp.headers.keys()}
+    new_header_names = response_header_names - baseline_header_names
+
+    for name in new_header_names:
+        for value in resp.headers.get_list(name):
+            if _CRLF_MARKER in value:
+                return {
+                    "vuln_type": "crlf_injection",
+                    "severity": "medium",
+                    "evidence": (
+                        f"injecting a CRLF sequence produced a genuinely new response header "
+                        f"('{name}: {value}') absent from the baseline (unmutated) response - "
+                        f"confirmed HTTP response splitting, not a substring reflected inside an "
+                        f"existing header's value (e.g. Location) or the body."
+                    ),
+                }
+    return None
+
+
 async def check_crlf_injection(url: str) -> dict | None:
     """
     Injects a CRLF sequence + a marker Set-Cookie into each of the
-    first 2 query parameters on `url`. The only thing that counts as
-    confirmation is the marker actually showing up in the RAW response
-    headers httpx parsed back out - meaning the server split our input
-    into a real second header line, not just reflected a literal
-    newline character somewhere in the response body (which has no
-    security impact and isn't CRLF injection).
+    first 2 query parameters on `url`. Confirmation requires the marker
+    to land in a genuinely new response header line relative to a
+    baseline request - see `_evaluate_crlf_response` for why a plain
+    substring match on header values was dropped (two confirmed false
+    positives on edge/CDN-fronted targets).
     """
     parsed = urlparse(url)
     query_params = parse_qs(parsed.query)
@@ -1670,6 +1721,15 @@ async def check_crlf_injection(url: str) -> dict | None:
     logger.info("detective: checking CRLF injection for %s", url)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_header_names = {k.lower() for k in baseline_resp.headers.keys()}
+            except httpx.HTTPError:
+                # No baseline available - fall back to "no pre-existing headers",
+                # which is stricter (more headers count as "new") rather than
+                # silently skipping the check.
+                baseline_header_names = set()
+
             for param in param_names:
                 mutated = _inject_raw_query_param(url, param, _CRLF_PAYLOAD)
                 try:
@@ -1677,17 +1737,10 @@ async def check_crlf_injection(url: str) -> dict | None:
                 except httpx.HTTPError:
                     continue
 
-                injected = any(_CRLF_MARKER in v for v in resp.headers.values())
-                if injected:
-                    return {
-                        "vuln_type": "crlf_injection",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{url} param '{param}': injecting a CRLF sequence produced a forged "
-                            f"'{_CRLF_MARKER}' header/cookie in the raw response - confirmed HTTP "
-                            f"response splitting, not just a reflected newline in the body."
-                        ),
-                    }
+                finding = _evaluate_crlf_response(resp, baseline_header_names)
+                if finding:
+                    finding["evidence"] = f"{url} param '{param}': " + finding["evidence"]
+                    return finding
     except httpx.HTTPError as exc:
         logger.info("detective: CRLF injection check failed for %s: %s", url, exc)
     return None
