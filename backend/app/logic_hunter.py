@@ -23,22 +23,37 @@ model on everything but triage.py's escalation and this both spend the
 strong model only where warranted.
 
 IMPORTANT: this phase produces HYPOTHESES, not confirmed findings. An
-LLM reasoning over recon data can be wrong, and unlike detective.py's
-checks (which confirm behavior against a live response before ever
-returning a finding), logic_hunter never sends a single request itself.
-Every finding it saves is prefixed "[ai-hypothesis: needs manual
-verification]" in the evidence, and triage.py sees that same framing -
-it should never be reported to a bounty program off this phase's output
-alone without a human actually testing the hypothesis first.
+LLM reasoning over recon data can be wrong. Every finding it saves is
+prefixed "[ai-hypothesis: needs manual verification]" in the evidence,
+and triage.py sees that same framing - it should never be reported to a
+bounty program off this phase's output alone without a human actually
+testing the hypothesis first.
+
+Investigation step: after a hypothesis is produced, agent_loop.py runs a
+bounded, read-only, anonymous multi-step investigation against it (up to
+6 GET/HEAD/compare probes - see agent_loop.py for the full safety model)
+and appends what it found to the evidence. This replaces the old
+single-shot "can this be confirmed with exactly one unauthenticated GET"
+check, which only ever fired for the narrow slice of hypotheses shaped
+like "is this URL reachable with no auth" - most hypotheses (IDOR, most
+business-logic claims) instantly failed that bar and stayed pure,
+unverified hypothesis. The agentic loop can chase a hypothesis across
+several requests instead, so more hypotheses come out of this phase with
+at least partial, real signal attached rather than "needs manual
+verification" alone. It still can't do anything that genuinely requires
+authentication or a second session - that stays item #3 in the build
+order (authenticated/multi-account testing) - and the loop says so
+explicitly in its conclusion when that's the blocker, rather than
+pretending an anonymous probe settled something it couldn't.
 """
 
 import json
 import logging
 import os
 
-import httpx
 from google import genai
 
+from . import agent_loop
 from .gemini_rotation import generate_with_rotation
 
 logger = logging.getLogger("swas.logic_hunter")
@@ -79,101 +94,6 @@ advice ("test for IDOR", "check for auth bypass") with no specific tie to the ev
 below 0.5 means "worth a quick look if you have time", above 0.75 means "strong enough a \
 human should prioritize this over other manual testing" - most real hypotheses land between.
 """
-
-
-_VERIFICATION_TIMEOUT = 10.0
-
-# Deliberately the cheap model, same tier as gate.py - this is a narrow
-# extraction task (does the hypothesis contain ONE safely-testable claim),
-# not open-ended reasoning, so it doesn't need gemini-2.5-pro.
-_VERIFICATION_MODEL = "gemini-2.5-flash-lite"
-
-_VERIFICATION_PROMPT = """A security researcher's hypothesis about a target is below. Your \
-ONLY job is to decide whether this specific hypothesis can be partially confirmed or refuted \
-with a SINGLE, unauthenticated, read-only HTTP GET request - nothing else counts as testable.
-
-Hypothesis: {hypothesis}
-
-Mark testable=false for ANYTHING that requires: comparing two different user sessions/accounts, \
-sending a POST/PUT/DELETE/PATCH, needing a valid auth token you don't already have, or any \
-multi-step sequence. Most hypotheses (especially IDOR and most business-logic claims) genuinely \
-require a second authenticated session to confirm and are NOT testable this way - it is correct \
-and expected for testable to be false most of the time.
-
-Only mark testable=true for narrow cases like: "this admin/internal endpoint is reachable with \
-no authentication at all" (a plain GET to that exact URL returning 200 instead of 401/403/404 \
-would confirm it), where the full concrete URL is already stated or directly derivable from the \
-hypothesis text.
-
-Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"testable": false}}
-or
-{{"testable": true, "url": "https://full/concrete/url", "expected_signal": "one short phrase describing what a CONFIRMING response looks like, e.g. 'HTTP 200 with a JSON body' or 'HTTP 200 instead of 401/403'"}}
-"""
-
-
-def _parse_verification_extraction(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:].strip()
-    return json.loads(text)
-
-
-async def _attempt_single_request_verification(hypothesis: str) -> str | None:
-    """
-    Returns a short evidence-appendix string describing the verification
-    outcome, or None if the hypothesis wasn't safely testable this way
-    (the overwhelmingly common case - most hypotheses need a second
-    session and stay pure hypothesis, which is correct and expected).
-
-    Safety: regardless of what the model returns, this only ever issues
-    a single GET. No method, header, or body the model suggests can turn
-    this into a state-changing request - that's enforced in code, not
-    just by the prompt.
-    """
-    client = _get_client()
-    try:
-        response, _ = await generate_with_rotation(
-            client, _VERIFICATION_PROMPT.format(hypothesis=hypothesis[:2000]),
-            preferred_model=_VERIFICATION_MODEL,
-        )
-        extraction = _parse_verification_extraction(response.text or "")
-    except Exception as exc:
-        logger.info("logic_hunter: verification extraction failed, leaving as pure hypothesis: %s", exc)
-        return None
-
-    if not extraction.get("testable") or not extraction.get("url"):
-        return None
-
-    url = extraction["url"]
-    expected_signal = (extraction.get("expected_signal") or "")[:200]
-
-    try:
-        async with httpx.AsyncClient(timeout=_VERIFICATION_TIMEOUT, verify=False, follow_redirects=True) as http_client:
-            resp = await http_client.get(url)  # GET only - hardcoded, never derived from model output
-    except httpx.HTTPError as exc:
-        logger.info("logic_hunter: verification GET failed for %s: %s", url, exc)
-        return f"[auto-verification attempted, request failed: {exc}] no signal either way."
-
-    if resp.status_code in (401, 403, 404):
-        return (
-            f"[auto-verification: GET {url} returned {resp.status_code} - the claimed "
-            f"unauthenticated access does NOT appear to hold; this hypothesis looks weaker "
-            f"than it first read, but confirm manually before dismissing]"
-        )
-    if resp.status_code == 200 and len(resp.text) > 50:
-        return (
-            f"[auto-verification: GET {url} returned 200 with a {len(resp.text)}-byte body "
-            f"with no auth sent - consistent with the hypothesis (expected signal: "
-            f"{expected_signal!r}). Still needs a human to confirm the response body actually "
-            f"contains what's claimed before this is report-ready.]"
-        )
-    return (
-        f"[auto-verification: GET {url} returned {resp.status_code} - inconclusive, "
-        f"doesn't clearly confirm or refute the hypothesis]"
-    )
 
 
 def _get_client() -> genai.Client:
@@ -227,14 +147,75 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
         response, model_used = await generate_with_rotation(client, prompt, preferred_model=_MODEL)
         result = _parse_hunter_response(response.text or "")
         result["model_used"] = model_used
+        result["surface_context"] = surface_context
         return result
     except Exception as exc:
         logger.warning("logic_hunter reasoning failed for %s: %s", target_name, exc)
         return {"has_hypothesis": False, "hypothesis": None, "vuln_type": None,
-                "confidence": 0.0, "model_used": "none"}
+                "confidence": 0.0, "model_used": "none", "surface_context": surface_context}
 
 
-async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: int, result: dict) -> int | None:
+def _infer_requires_auth(status_code: int | None) -> bool | None:
+    """
+    Same heuristic as pipeline._infer_requires_auth - duplicated rather
+    than imported for the same reason as everything else in this file:
+    pipeline.py imports logic_hunter, so the reverse import would be
+    circular.
+    """
+    if status_code in (401, 403):
+        return True
+    if status_code == 200:
+        return False
+    return None
+
+
+async def _upsert_surface_endpoints(conn, target_id: int, endpoints: list[dict]) -> None:
+    """
+    conn-scoped counterpart to pipeline._save_surface_endpoints_pooled
+    (which takes a pool, since recon/probe interleave many outbound
+    calls with writes). logic_hunter already holds a single connection
+    for the whole phase - see _phase_logic_hunter in pipeline.py - so
+    this just uses it directly rather than acquiring its own. Same
+    merge-not-overwrite semantics: tech_stack/sources unioned, times_seen
+    incremented, requires_auth only set if not already confidently known.
+    """
+    if not endpoints:
+        return
+    for ep in endpoints:
+        status_code = ep.get("status_code")
+        inferred_auth = _infer_requires_auth(status_code)
+        auth_evidence = f"inferred from status_code={status_code}" if inferred_auth is not None else None
+        await conn.execute(
+            """
+            INSERT INTO attack_surface_endpoints
+                (target_id, url, is_live, last_status_code, sources, requires_auth, auth_evidence)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+            ON CONFLICT (target_id, url) DO UPDATE SET
+                times_seen = attack_surface_endpoints.times_seen + 1,
+                last_seen_at = now(),
+                last_status_code = EXCLUDED.last_status_code,
+                is_live = COALESCE(EXCLUDED.is_live, attack_surface_endpoints.is_live),
+                sources = (
+                    SELECT jsonb_agg(DISTINCT s)
+                    FROM jsonb_array_elements_text(
+                        attack_surface_endpoints.sources || EXCLUDED.sources
+                    ) AS s
+                ),
+                requires_auth = COALESCE(attack_surface_endpoints.requires_auth, EXCLUDED.requires_auth),
+                auth_evidence = COALESCE(attack_surface_endpoints.auth_evidence, EXCLUDED.auth_evidence)
+            """,
+            target_id,
+            ep["url"],
+            ep.get("is_live"),
+            status_code,
+            json.dumps([ep["source"]] if ep.get("source") else []),
+            inferred_auth,
+            auth_evidence,
+        )
+
+
+async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: str,
+                            target_type: str | None, cluster_id: int, result: dict) -> int | None:
     """
     Saves a logic_hunter hypothesis the same way pipeline._save_finding
     saves everything else (severity='unknown', goes through triage
@@ -243,12 +224,26 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: in
     gate_status is set straight to 'passed' since this already came out
     the far side of an LLM reasoning pass; it doesn't need the cheap
     noise-filter gate that raw scanner/tool output does.
+
+    Investigation: runs the bounded agentic loop (agent_loop.investigate)
+    against the hypothesis - up to a few anonymous, read-only probes,
+    not just the old single "is this one URL reachable" check - and
+    appends its conclusion to the evidence. Every endpoint the loop
+    touched also gets written back into the attack-surface model, so
+    this investigation's own probing accumulates the same way recon's
+    does, per the "write back, not just read" requirement from the
+    build-order notes.
     """
     confidence = result.get("confidence") or 0.0
-    verification_note = await _attempt_single_request_verification(result["hypothesis"] or "")
+    investigation = await agent_loop.investigate(
+        hypothesis=result["hypothesis"] or "",
+        target_name=target_name,
+        target_type=target_type,
+        surface_context=result.get("surface_context") or "No attack-surface context available.",
+    )
     evidence = f"[ai-hypothesis: needs manual verification, confidence={confidence:.2f}]\n{result['hypothesis']}"
-    if verification_note:
-        evidence += f"\n{verification_note}"
+    evidence += f"\n{investigation['summary']}"
+
     finding_id = await conn.fetchval(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence, gate_status)
@@ -265,6 +260,7 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: in
         """,
         cluster_id, finding_id,
     )
+    await _upsert_surface_endpoints(conn, target_id, investigation["endpoints_touched"])
     return finding_id
 
 
@@ -310,7 +306,10 @@ async def hunt_project(conn, project_id: int) -> int:
                 dict(surface_summary) if surface_summary else None,
             )
             if result.get("has_hypothesis") and result.get("hypothesis"):
-                finding_id = await _save_hypothesis(conn, project_id, row["target_id"], row["cluster_id"], result)
+                finding_id = await _save_hypothesis(
+                    conn, project_id, row["target_id"], row["target_name"], row["target_type"],
+                    row["cluster_id"], result,
+                )
                 hunted += 1
                 logger.info(
                     "logic_hunter: hypothesis saved for target_id=%s cluster_id=%s (finding_id=%s)",
