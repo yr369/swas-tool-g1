@@ -49,6 +49,7 @@ from .models import (
     FindingBulkStatusRequest,
     FindingBulkStatusResult,
     PhaseRun,
+    ScanRun,
     OutcomeLogRequest,
     OutcomeRecord,
     SignatureStats,
