@@ -27,6 +27,22 @@ JSON, whatever), the finding passes through to triage anyway. A broken
 gate must never be the reason a real finding gets silently dropped -
 the worst case of failing open is one wasted triage call, the worst
 case of failing closed is a missed bug.
+
+Outcome-history awareness (build-order item #4): triage.py already
+looks up a finding's past-outcome signature history via
+finding_outcomes/fetch_signature_stats and weaves it into its severity
+judgment - the storage and lookup were already built, they just weren't
+reaching this earlier stage. This gate now gets the same lookup, but
+uses it for a narrower, gate-appropriate question: has this EXACT
+signature been submitted before and come back rejected/not_applicable
+EVERY time, with zero accepted or even informative outcomes? That's
+real evidence the underlying detection itself tends to fire on
+something that isn't a genuine signal - squarely within "is there even
+a real signal here", not a severity or policy-exclusion judgment (which
+stays triage's job, unchanged). A signature with any accepted or
+informative history, or with too few data points, gets no extra
+skepticism at all - see `_format_gate_outcome_context` for the exact
+threshold and reasoning.
 """
 
 import json
@@ -53,7 +69,7 @@ Evidence:
 ---
 {evidence}
 ---
-
+{outcome_context}
 1. Does this evidence show a specific, concrete technical signal (not just a tool/template name with no actual detail)?
 2. Is the evidence free of obvious parsing garbage (truncated JSON, binary noise, a generic 404/error page unrelated to any real behavior)?
 3. Does this look like it came from actually hitting the target, not a WAF/CDN block page or captcha page?
@@ -69,8 +85,42 @@ Guidance: default to "pass": true unless this is CLEARLY noise, junk, a parsing 
 or a WAF/block page. Do NOT fail something for being low severity, boring, or likely \
 Informative to a bounty program - that policy call belongs to the next stage, which has \
 the actual scope/exclusion guidance this pass doesn't. This gate only exists to catch \
-garbage before it wastes an expensive call - when in doubt, pass it through.
+garbage before it wastes an expensive call - when in doubt, pass it through. If historical \
+context above shows this exact pattern has repeatedly turned out rejected/not-applicable \
+with zero accepted or informative outcomes, treat that as evidence toward "this detection \
+tends to fire on non-signal" (relevant to Q1/Q4/Q7) - not as a severity judgment.
 """
+
+
+def _format_gate_outcome_context(stats: dict | None) -> str:
+    """
+    Deliberately narrower than triage.py's _format_outcome_context: this
+    only speaks up when a signature has a real sample size and a CLEAN
+    negative history - rejected/not_applicable every single time, zero
+    accepted, zero informative. That specific pattern means the
+    detection itself tends to fire on something that isn't a genuine
+    signal, which is exactly gate.py's mandate. Any accepted or
+    informative outcome at all - even mixed with rejections - means the
+    pattern IS sometimes a real signal, so it says nothing and lets the
+    finding through exactly as before; a low/borderline severity signal
+    is triage's call, not this gate's. Returns "" (no behavior change)
+    for anything short of that clean-negative bar, including a brand-new
+    signature with no history yet.
+    """
+    if not stats or stats.get("total", 0) < 3:
+        return ""
+    total = stats["total"]
+    accepted = stats.get("accepted", 0)
+    informative = stats.get("informative", 0)
+    dead_count = stats.get("rejected", 0) + stats.get("not_applicable", 0)
+    if accepted > 0 or informative > 0 or dead_count != total:
+        return ""
+    return (
+        f"\nHistorical context: this exact pattern has been submitted {total} time(s) before "
+        f"and come back rejected or not-applicable EVERY time, with zero accepted or informative "
+        f"outcomes - that's a signal this detection tends to fire on something that isn't real, "
+        f"worth weighing in Q1/Q4/Q7 above (not a severity judgment).\n"
+    )
 
 
 def _get_client() -> genai.Client:
@@ -86,14 +136,23 @@ def _parse_gate_response(text: str) -> dict:
     return json.loads(text)
 
 
-async def run_gate(tool_name: str, evidence: str) -> dict:
+async def run_gate(tool_name: str, evidence: str, outcome_stats: dict | None = None) -> dict:
     """
     Returns {"pass": bool, "reasoning": str, "model_used": str, ...}.
     Evidence is capped hard - this pass only needs enough to judge
     "is there a real signal here", not the full context triage.py gets.
+
+    outcome_stats (optional): same aggregated finding_outcomes stats
+    triage.py already consumes (see fetch_signature_stats there) - only
+    ever nudges this gate for the narrow "clean rejected/not_applicable
+    history" case, see _format_gate_outcome_context. Absent or mixed
+    history changes nothing.
     """
     client = _get_client()
-    prompt = _GATE_PROMPT.format(tool_name=tool_name, evidence=(evidence or "")[:1500])
+    outcome_context = _format_gate_outcome_context(outcome_stats)
+    prompt = _GATE_PROMPT.format(
+        tool_name=tool_name, evidence=(evidence or "")[:1500], outcome_context=outcome_context,
+    )
 
     try:
         response, model_used = await generate_with_rotation(client, prompt, preferred_model=_GATE_MODEL)
@@ -154,15 +213,19 @@ async def gate_project_findings(conn, project_id: int) -> int:
     pattern as triage.triage_project_findings. Returns the number of
     findings gated.
     """
+    from . import triage as triage_module  # local import avoids a circular import at module load time
+
     rows = await conn.fetch(
-        "SELECT id, tool_name, evidence FROM findings "
+        "SELECT id, tool_name, vuln_type, evidence FROM findings "
         "WHERE project_id = $1 AND severity = 'unknown' AND gate_status = 'pending'",
         project_id,
     )
 
     gated = 0
     for row in rows:
-        result = await run_gate(row["tool_name"], row["evidence"] or "")
+        signature = triage_module.build_signature(row["tool_name"], row["vuln_type"])
+        outcome_stats = await triage_module.fetch_signature_stats(conn, signature)
+        result = await run_gate(row["tool_name"], row["evidence"] or "", outcome_stats=outcome_stats)
         status = "passed" if result["pass"] else "failed"
         await conn.execute(
             "UPDATE findings SET gate_status = $1, gate_reasoning = $2 WHERE id = $3",
