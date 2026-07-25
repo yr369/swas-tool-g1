@@ -226,13 +226,17 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
     noise-filter gate that raw scanner/tool output does.
 
     Investigation: runs the bounded agentic loop (agent_loop.investigate)
-    against the hypothesis - up to a few anonymous, read-only probes,
-    not just the old single "is this one URL reachable" check - and
-    appends its conclusion to the evidence. Every endpoint the loop
-    touched also gets written back into the attack-surface model, so
-    this investigation's own probing accumulates the same way recon's
-    does, per the "write back, not just read" requirement from the
-    build-order notes.
+    against the hypothesis - up to a few read-only probes, not just the
+    old single "is this one URL reachable" check - and appends its
+    conclusion to the evidence. conn/project_id are passed through so
+    the loop can offer authenticated auth_get/auth_compare actions when
+    (and only when) this project is 'approved' in auth_policy and has
+    sessions registered - agent_loop falls back to anonymous-only
+    investigation transparently otherwise, no special-casing needed
+    here. Every endpoint the loop touched also gets written back into
+    the attack-surface model, so this investigation's own probing
+    accumulates the same way recon's does, per the "write back, not
+    just read" requirement from the build-order notes.
     """
     confidence = result.get("confidence") or 0.0
     investigation = await agent_loop.investigate(
@@ -240,6 +244,8 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
         target_name=target_name,
         target_type=target_type,
         surface_context=result.get("surface_context") or "No attack-surface context available.",
+        conn=conn,
+        project_id=project_id,
     )
     evidence = f"[ai-hypothesis: needs manual verification, confidence={confidence:.2f}]\n{result['hypothesis']}"
     evidence += f"\n{investigation['summary']}"
