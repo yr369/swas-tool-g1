@@ -6,6 +6,7 @@ import { FindingsList } from "../components/FindingsList";
 import { ScanNotesPanel } from "../components/ScanNotesPanel";
 import { DiffPanel } from "../components/DiffPanel";
 import { ScopeManager } from "../components/ScopeManager";
+import { platformLabel } from "../constants";
 
 // Fallback polling interval, used ONLY when the WebSocket isn't
 // connected (never established, or dropped). While the socket is live,
@@ -143,6 +144,23 @@ export function ProjectDetail() {
     }
   }
 
+  async function handleCancelSchedule() {
+    setSchedulingBusy(true);
+    setError(null);
+    try {
+      // Clearing both interval and one-off run_at is what actually
+      // cancels everything pending - a recurring interval AND a
+      // one-time run_at can both be set at once, so cancel needs to
+      // wipe both, not just whichever one happens to be displayed.
+      await api.setSchedule(id, null, null);
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSchedulingBusy(false);
+    }
+  }
+
   async function handleArchive() {
     setArchiving(true);
     setError(null);
@@ -191,14 +209,14 @@ export function ProjectDetail() {
     <div>
       <div style={{ marginBottom: 24 }}>
         <div className="eyebrow" style={{ marginBottom: 4 }}>
-          {project.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} target
+          {platformLabel(project.platform)} target
         </div>
         <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
           <h1 style={{ fontSize: 22, fontWeight: 500, margin: "0 0 4px" }}>{project.name}</h1>
           <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>#{project.id}</span>
         </div>
         <p style={{ color: "var(--text-muted)", fontSize: 13, margin: 0 }}>
-          {project.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {inScopeCount} in-scope target
+          {platformLabel(project.platform)} · {inScopeCount} in-scope target
           {inScopeCount === 1 ? "" : "s"} · Created {formatDate(project.created_at)}
         </p>
       </div>
@@ -249,9 +267,18 @@ export function ProjectDetail() {
               <option value="168">Weekly</option>
             </select>
             {project.next_scheduled_scan_at && (
-              <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                next {formatDate(project.next_scheduled_scan_at)}
-              </span>
+              <>
+                <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                  next {formatDate(project.next_scheduled_scan_at)}
+                </span>
+                <button
+                  onClick={handleCancelSchedule}
+                  disabled={schedulingBusy}
+                  style={{ ...secondaryButtonStyle, color: "var(--status-fail)" }}
+                >
+                  Cancel
+                </button>
+              </>
             )}
             <label style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: 8 }}>Run once at:</label>
             <input
@@ -281,6 +308,8 @@ export function ProjectDetail() {
           </span>
         </div>
       </Section>
+
+      <ScanHistorySection projectId={id} />
 
       <Section title="Scope">
         <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
@@ -388,6 +417,50 @@ export function ProjectDetail() {
       )}
 
       {error && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{error}</p>}
+    </div>
+  );
+}
+
+function ScanHistorySection({ projectId }) {
+  const [expanded, setExpanded] = useState(false);
+  const [runs, setRuns] = useState(null);
+  const [err, setErr] = useState(null);
+
+  async function toggle() {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && runs === null) {
+      try {
+        setRuns(await api.listScanRuns(projectId));
+      } catch (e) {
+        setErr(e.message);
+      }
+    }
+  }
+
+  return (
+    <div className="ops-panel" data-label="Scan history" style={{ marginBottom: 24, padding: "20px 20px 18px" }}>
+      <button className="btn" onClick={toggle}>
+        {expanded ? "Hide" : "Show"} scan history{runs !== null ? ` (${runs.length})` : ""}
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 14 }}>
+          {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
+          {runs === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
+          {runs !== null && runs.length === 0 && (
+            <p style={{ color: "var(--text-muted)", fontSize: 13 }}>No scans run yet.</p>
+          )}
+          {runs !== null && runs.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {runs.map((r) => (
+                <div key={r.id} className="mono" style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                  {formatDate(r.started_at)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

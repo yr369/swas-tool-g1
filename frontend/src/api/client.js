@@ -63,6 +63,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ platform, raw_text: rawText }),
     }),
+  parseScopeFile: async (platform, file) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/scope/parse-file?platform=${encodeURIComponent(platform)}`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) {
+      let detail = `Request failed (${res.status})`;
+      try {
+        const body = await res.json();
+        detail = body.detail || detail;
+      } catch {
+        // response wasn't JSON
+      }
+      throw new Error(detail);
+    }
+    return res.json();
+  },
   confirmScope: (payload) =>
     request("/scope/confirm", { method: "POST", body: JSON.stringify(payload) }),
 
@@ -74,6 +93,7 @@ export const api = {
       body: JSON.stringify({ interval_hours: intervalHours, run_at: runAt }),
     }),
   listPhaseRuns: (projectId) => request(`/projects/${projectId}/phase-runs`),
+  listScanRuns: (projectId) => request(`/projects/${projectId}/scan-runs`),
 
   // Live scan progress - returns a plain WebSocket URL (not JSON), for
   // components to open themselves via `new WebSocket(...)`. Derives ws://

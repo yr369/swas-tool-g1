@@ -15,22 +15,41 @@ from datetime import datetime
 from typing import Literal, Optional
 from pydantic import BaseModel
 
+# Program platform the project/target belongs to. "private" covers
+# invite-only or non-listed programs that don't run on any of the named
+# platforms. Kept as one shared alias so every model that references
+# platform stays in sync - see migration 008_platform_target_expansion.sql
+# for the matching DB CHECK constraint update.
+PlatformType = Literal["bugcrowd", "hackerone", "intigriti", "yeswehack", "openbugbounty", "private"]
+
+# Asset/target type. Older rows may still carry the original
+# website/api/mobile/hardware/unknown values (kept valid below, never
+# force-migrated) - new scope entries should use the more specific set.
+TargetType = Literal[
+    "website", "api", "mobile", "hardware", "unknown",  # legacy values, kept valid
+    "domain", "wildcard", "url", "hardware_iot", "other",
+    "android_play_store", "ios_app_store", "smart_contract",
+    "source_code", "executable",
+]
+
 
 # ---------- Projects ----------
 
 class ProjectCreate(BaseModel):
     name: str
-    platform: Literal["bugcrowd", "hackerone"]
+    platform: PlatformType
 
 
 class Project(BaseModel):
     id: int
     name: str
-    platform: Literal["bugcrowd", "hackerone"]
+    platform: PlatformType
     status: Literal["created", "scanning", "completed", "archived"]
     scan_interval_hours: Optional[int] = None
     next_scheduled_scan_at: Optional[datetime] = None
     created_at: datetime
+    last_scan_at: Optional[datetime] = None
+    scan_count: int = 0
 
 
 class ScheduleUpdateRequest(BaseModel):
@@ -118,7 +137,7 @@ class ScanQueueItem(BaseModel):
 
 class ScopeTargetCreate(BaseModel):
     target: str
-    target_type: Literal["website", "api", "mobile", "hardware", "unknown"] = "unknown"
+    target_type: TargetType = "unknown"
     in_scope: bool = True
     reward_range: Optional[str] = None
     notes: Optional[str] = None
@@ -128,7 +147,7 @@ class ScopeTarget(BaseModel):
     id: int
     project_id: int
     target: str
-    target_type: Literal["website", "api", "mobile", "hardware", "unknown"]
+    target_type: TargetType
     in_scope: bool
     reward_range: Optional[str]
     notes: Optional[str]
@@ -143,7 +162,7 @@ class ScopeTargetUpdate(BaseModel):
     typo, changing type, or flipping in_scope) as distinct from the
     "delete" action, which is guarded separately below."""
     target: Optional[str] = None
-    target_type: Optional[Literal["website", "api", "mobile", "hardware", "unknown"]] = None
+    target_type: Optional[TargetType] = None
     in_scope: Optional[bool] = None
     reward_range: Optional[str] = None
     notes: Optional[str] = None
@@ -155,7 +174,7 @@ class BulkScopeTargetsCreate(BaseModel):
     copy-pasted (a block of same-type hosts), rather than needing the
     operator to fill out a form per line."""
     targets: list[str]
-    target_type: Literal["website", "api", "mobile", "hardware", "unknown"] = "unknown"
+    target_type: TargetType = "unknown"
     in_scope: bool = True
     reward_range: Optional[str] = None
     notes: Optional[str] = None
@@ -179,6 +198,12 @@ class PhaseRun(BaseModel):
     error_message: Optional[str]
     retry_count: int
     created_at: datetime
+
+
+class ScanRun(BaseModel):
+    id: int
+    project_id: int
+    started_at: datetime
 
 
 # ---------- Findings ----------
@@ -231,7 +256,7 @@ class FindingBulkStatusResult(BaseModel):
 class ScopeParseRequest(BaseModel):
     """What the operator submits: raw, loosely-structured scope text/notes
     they pasted or extracted from a program brief."""
-    platform: Literal["bugcrowd", "hackerone"]
+    platform: PlatformType
     raw_text: str
 
 
@@ -240,7 +265,7 @@ class ParsedScopeItem(BaseModel):
     BEFORE the operator confirms it. This is the preview shown to the user
     - nothing gets written to the database until they confirm."""
     target: str
-    target_type: Literal["website", "api", "mobile", "hardware", "unknown"]
+    target_type: TargetType
     in_scope: bool
     reward_range: Optional[str] = None
     notes: Optional[str] = None
@@ -250,7 +275,7 @@ class ScopeParsePreview(BaseModel):
     """The full response sent back to the operator after parsing - the
     list of items to review, plus the original platform so the confirm
     step knows what to attach."""
-    platform: Literal["bugcrowd", "hackerone"]
+    platform: PlatformType
     items: list[ParsedScopeItem]
 
 
@@ -261,7 +286,7 @@ class ScopeConfirmRequest(BaseModel):
     are attached to that existing project instead."""
     project_id: Optional[int] = None
     project_name: Optional[str] = None  # required if project_id is omitted
-    platform: Literal["bugcrowd", "hackerone"]
+    platform: PlatformType
     items: list[ParsedScopeItem]
 
 
@@ -273,7 +298,7 @@ class OutcomeLogRequest(BaseModel):
     finding_id: Optional[int] = None
     signature: str  # e.g. "nuclei:CVE-2023-48795:website"
     outcome: Literal["accepted", "duplicate", "rejected", "informative", "not_applicable", "no_response"]
-    platform: Optional[Literal["bugcrowd", "hackerone"]] = None
+    platform: Optional[PlatformType] = None
     notes: Optional[str] = None
 
 
@@ -349,6 +374,6 @@ class DiffResponse(BaseModel):
 
 class FindingWithProject(Finding):
     project_name: str
-    project_platform: Literal["bugcrowd", "hackerone"]
+    project_platform: PlatformType
 
 

@@ -330,7 +330,12 @@ function SeverityChip({ severity, count, active, onToggle }) {
 }
 
 export function FindingsList({ findings, onTriaged }) {
-  const [activeSeverities, setActiveSeverities] = useState(() => new Set(SEVERITY_ORDER));
+  // "info" findings are rarely submittable and tend to bury the signal
+  // in a long scan - hidden by default, one click on the Info chip
+  // (existing severity-filter toggle) brings them back.
+  const [activeSeverities, setActiveSeverities] = useState(
+    () => new Set(SEVERITY_ORDER.filter((s) => s !== "info"))
+  );
   const [toolFilter, setToolFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("severity");

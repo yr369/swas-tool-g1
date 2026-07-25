@@ -7,8 +7,7 @@
 
 import { useState } from "react";
 import { api } from "../api/client";
-
-const TARGET_TYPES = ["website", "api", "mobile", "hardware", "unknown"];
+import { TARGET_TYPES, targetTypeLabel } from "../constants";
 
 export function ScopeManager({ projectId, scope, onChange }) {
   const [addingBulk, setAddingBulk] = useState(false);
@@ -16,6 +15,10 @@ export function ScopeManager({ projectId, scope, onChange }) {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkRescanning, setBulkRescanning] = useState(false);
   const [bulkResult, setBulkResult] = useState(null);
+  // Scope lists get long fast once a program has dozens of subdomains -
+  // collapsed by default keeps the project page scannable; the count
+  // and toggle stay visible either way.
+  const [expanded, setExpanded] = useState(false);
 
   function toggleSelected(id) {
     setSelected((prev) => {
@@ -45,44 +48,49 @@ export function ScopeManager({ projectId, scope, onChange }) {
 
   return (
     <div>
-      {scope.length > 0 && (
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+        <button className="btn" onClick={() => setExpanded((e) => !e)}>
+          {expanded ? "Hide scope" : "Show scope"} ({scope.length})
+        </button>
+        {scope.length > 0 && expanded && (
           <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-muted)" }}>
             <input type="checkbox" checked={selected.size === scope.length} onChange={toggleSelectAll} />
             Select all
           </label>
-          {selected.size > 0 && (
-            <button onClick={handleBulkRescan} disabled={bulkRescanning} style={secondaryButtonStyle}>
-              {bulkRescanning ? "Starting…" : `Rescan selected (${selected.size})`}
-            </button>
-          )}
-          {bulkResult && (
-            <span style={{ fontSize: 12, color: bulkResult.failed.length ? "var(--sev-medium)" : "var(--status-success)" }}>
-              {bulkResult.started} started
-              {bulkResult.failed.length > 0 &&
-                `, ${bulkResult.failed.length} failed (${bulkResult.failed.map((f) => f.reason).join("; ")})`}
-            </span>
+        )}
+        {expanded && selected.size > 0 && (
+          <button onClick={handleBulkRescan} disabled={bulkRescanning} style={secondaryButtonStyle}>
+            {bulkRescanning ? "Starting…" : `Rescan selected (${selected.size})`}
+          </button>
+        )}
+        {expanded && bulkResult && (
+          <span style={{ fontSize: 12, color: bulkResult.failed.length ? "var(--sev-medium)" : "var(--status-success)" }}>
+            {bulkResult.started} started
+            {bulkResult.failed.length > 0 &&
+              `, ${bulkResult.failed.length} failed (${bulkResult.failed.map((f) => f.reason).join("; ")})`}
+          </span>
+        )}
+      </div>
+
+      {expanded && (
+        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
+          {scope.length === 0 ? (
+            <div style={{ padding: 16, color: "var(--text-muted)", fontSize: 13 }}>No targets added yet.</div>
+          ) : (
+            scope.map((s, i) => (
+              <ScopeRow
+                key={s.id}
+                target={s}
+                projectId={projectId}
+                isLast={i === scope.length - 1}
+                onChange={onChange}
+                selected={selected.has(s.id)}
+                onToggleSelected={() => toggleSelected(s.id)}
+              />
+            ))
           )}
         </div>
       )}
-
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
-        {scope.length === 0 ? (
-          <div style={{ padding: 16, color: "var(--text-muted)", fontSize: 13 }}>No targets added yet.</div>
-        ) : (
-          scope.map((s, i) => (
-            <ScopeRow
-              key={s.id}
-              target={s}
-              projectId={projectId}
-              isLast={i === scope.length - 1}
-              onChange={onChange}
-              selected={selected.has(s.id)}
-              onToggleSelected={() => toggleSelected(s.id)}
-            />
-          ))
-        )}
-      </div>
 
       <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
         {addingSingle ? (
@@ -171,8 +179,8 @@ function SingleAddForm({ projectId, onDone, onCancel }) {
         />
         <select value={targetType} onChange={(e) => setTargetType(e.target.value)} style={inputStyle}>
           {TARGET_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
+            <option key={t.value} value={t.value}>
+              {t.label}
             </option>
           ))}
         </select>
@@ -288,8 +296,8 @@ function ScopeRow({ target, projectId, isLast, onChange, selected, onToggleSelec
             style={inputStyle}
           >
             {TARGET_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
+              <option key={t.value} value={t.value}>
+                {t.label}
               </option>
             ))}
           </select>
@@ -338,7 +346,7 @@ function ScopeRow({ target, projectId, isLast, onChange, selected, onToggleSelec
         <span className="mono" style={{ flex: 1, fontSize: 13, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
           {target.target}
         </span>
-        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{target.target_type}</span>
+        <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{targetTypeLabel(target.target_type)}</span>
         <span style={{ fontSize: 12, color: target.in_scope ? "var(--status-success)" : "var(--text-muted)" }}>
           {target.in_scope ? "In scope" : "Out of scope"}
         </span>
@@ -439,8 +447,8 @@ function BulkAddForm({ projectId, onDone, onCancel }) {
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
         <select value={targetType} onChange={(e) => setTargetType(e.target.value)} style={inputStyle}>
           {TARGET_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
+            <option key={t.value} value={t.value}>
+              {t.label}
             </option>
           ))}
         </select>

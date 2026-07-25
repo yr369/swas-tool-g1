@@ -9,10 +9,9 @@
  *         creates the project and saves the scope.
  */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { api } from "../api/client";
-
-const TARGET_TYPES = ["website", "api", "mobile", "hardware", "unknown"];
+import { PLATFORM_LABEL, TARGET_TYPES } from "../constants";
 
 export function ScopeIntake({ onProjectCreated }) {
   const [platform, setPlatform] = useState("bugcrowd");
@@ -21,12 +20,29 @@ export function ScopeIntake({ onProjectCreated }) {
   const [preview, setPreview] = useState(null); // null = not parsed yet
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const fileInputRef = useRef(null);
 
   async function handleParse() {
     setError(null);
     setLoading(true);
     try {
       const result = await api.parseScopeText(platform, rawText);
+      setPreview(result.items);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleFileParse(file) {
+    if (!file) return;
+    setFileName(file.name);
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await api.parseScopeFile(platform, file);
       setPreview(result.items);
     } catch (err) {
       setError(err.message);
@@ -96,11 +112,11 @@ export function ScopeIntake({ onProjectCreated }) {
               <select
                 value={item.target_type}
                 onChange={(e) => updateItem(i, "target_type", e.target.value)}
-                style={{ ...selectStyle, width: 110 }}
+                style={{ ...selectStyle, width: 150 }}
               >
                 {TARGET_TYPES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
+                  <option key={t.value} value={t.value}>
+                    {t.label}
                   </option>
                 ))}
               </select>
@@ -137,20 +153,17 @@ export function ScopeIntake({ onProjectCreated }) {
         Paste the program's scope text below. It'll be parsed automatically - you'll review every target before anything is saved.
       </p>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        {["bugcrowd", "hackerone"].map((p) => (
-          <button
-            key={p}
-            onClick={() => setPlatform(p)}
-            style={{
-              ...secondaryButtonStyle,
-              borderColor: platform === p ? "var(--accent)" : "var(--border)",
-              color: platform === p ? "var(--accent)" : "var(--text-secondary)",
-            }}
-          >
-            {p === "bugcrowd" ? "Bugcrowd" : "HackerOne"}
-          </button>
-        ))}
+      <div style={{ marginBottom: 12 }}>
+        <label style={{ fontSize: 12, color: "var(--text-muted)", display: "block", marginBottom: 4 }}>
+          Platform / folder
+        </label>
+        <select value={platform} onChange={(e) => setPlatform(e.target.value)} style={{ ...inputStyle, width: 220 }}>
+          {Object.entries(PLATFORM_LABEL).map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
       </div>
 
       <textarea
@@ -160,6 +173,26 @@ export function ScopeIntake({ onProjectCreated }) {
         rows={8}
         style={{ ...inputStyle, fontFamily: "var(--font-mono)", fontSize: 13, resize: "vertical" }}
       />
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "10px 0" }}>
+        <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
+        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>OR</span>
+        <div style={{ flex: 1, height: 1, background: "var(--border)" }} />
+      </div>
+
+      <div>
+        <button className="btn" onClick={() => fileInputRef.current?.click()} disabled={loading}>
+          Upload .csv / .txt
+        </button>
+        {fileName && <span style={{ marginLeft: 10, fontSize: 12, color: "var(--text-muted)" }}>{fileName}</span>}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,.txt"
+          style={{ display: "none" }}
+          onChange={(e) => handleFileParse(e.target.files?.[0])}
+        />
+      </div>
 
       {error && <p style={{ color: "var(--status-fail)", fontSize: 13, marginTop: 8 }}>{error}</p>}
 

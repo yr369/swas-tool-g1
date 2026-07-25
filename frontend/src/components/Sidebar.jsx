@@ -34,7 +34,7 @@ export function Sidebar({ collapsed, onToggle }) {
     >
       <div
         style={{
-          padding: collapsed ? "16px 0" : "16px 18px",
+          padding: collapsed ? "16px 0" : "14px 12px 14px 18px",
           display: "flex",
           alignItems: "center",
           justifyContent: collapsed ? "center" : "space-between",
@@ -59,7 +59,27 @@ export function Sidebar({ collapsed, onToggle }) {
             </span>
           )}
         </Link>
+        {!collapsed && (
+          <button
+            className="btn"
+            onClick={onToggle}
+            title="Collapse sidebar ([)"
+            style={{ padding: "4px 7px", minWidth: "auto" }}
+          >
+            «
+          </button>
+        )}
       </div>
+      {collapsed && (
+        <button
+          className="btn"
+          onClick={onToggle}
+          title="Expand sidebar ([)"
+          style={{ margin: "8px auto 0", padding: "4px 7px", minWidth: "auto" }}
+        >
+          »
+        </button>
+      )}
 
       <nav style={{ padding: "12px 8px", display: "flex", flexDirection: "column", gap: 2, flex: 1 }}>
         {NAV.map((item) => {
@@ -99,18 +119,10 @@ export function Sidebar({ collapsed, onToggle }) {
 
       <div style={{ padding: collapsed ? "10px 0" : "10px 12px", borderTop: "1px solid var(--border)" }}>
         {!collapsed && (
-          <div className="mono" style={{ fontSize: 10, color: "var(--text-muted)", letterSpacing: "0.06em", marginBottom: 8 }}>
+          <div className="mono" style={{ fontSize: 10, color: "var(--text-muted)", letterSpacing: "0.06em" }}>
             {time}
           </div>
         )}
-        <button
-          className="btn"
-          onClick={onToggle}
-          title={collapsed ? "Expand sidebar ([)" : "Collapse sidebar ([)"}
-          style={{ width: "100%", justifyContent: "center", padding: "6px 0" }}
-        >
-          {collapsed ? "»" : "« COLLAPSE"}
-        </button>
       </div>
     </aside>
   );

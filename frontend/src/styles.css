@@ -86,27 +86,6 @@ body {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  /* A faint fixed grid, like a scope readout - the one atmospheric
-     touch on an otherwise disciplined surface. Barely visible; it's
-     texture, not a pattern anyone should consciously notice. */
-  background-image:
-    linear-gradient(var(--border) 1px, transparent 1px),
-    linear-gradient(90deg, var(--border) 1px, transparent 1px);
-  background-size: 48px 48px;
-  background-attachment: fixed;
-  background-position: -1px -1px;
-  background-color: var(--bg-canvas);
-  position: relative;
-}
-
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  background: inherit;
-  opacity: 0.35;
-  pointer-events: none;
-  z-index: -1;
 }
 
 a {
@@ -213,14 +192,16 @@ code,
   position: absolute;
   top: -9px;
   left: 22px;
-  background: var(--bg-canvas);
-  padding: 0 8px;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-strong);
+  border-bottom: none;
+  padding: 1px 8px 3px;
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   z-index: 1;
 }
 

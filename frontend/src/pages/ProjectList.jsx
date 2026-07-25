@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { Donut } from "../components/charts/Donut";
-import { AttackSurfaceGraph } from "../components/AttackSurfaceGraph";
+import { platformLabel } from "../constants";
 
 const STATUS_LABEL = { created: "Created", scanning: "Scanning", completed: "Completed", archived: "Archived" };
 const STATUS_ORDER = ["scanning", "created", "completed", "archived"];
@@ -13,17 +13,13 @@ export function ProjectList() {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkResult, setBulkResult] = useState(null);
-  // "list" is the default/original view - the graph is additive (Batch
-  // 7), not a replacement, so nothing about the existing bulk-select
-  // workflow below changes or is at risk of regressing.
-  const [view, setView] = useState("list");
-  const [findings, setFindings] = useState([]);
   // Archived projects sit in the same table as everything else and
   // were getting mixed into one flat list with no way to see just them
   // (or to keep them out of the way while working) - default to hiding
   // them, with an explicit tab to go look, same as most task trackers
   // handle a "done"/"archived" bucket.
   const [statusFilter, setStatusFilter] = useState("active");
+  const [platformFilter, setPlatformFilter] = useState("all");
 
   function load() {
     return api
@@ -41,12 +37,6 @@ export function ProjectList() {
     load();
   }, []);
 
-  useEffect(() => {
-    if (view === "graph" && findings.length === 0) {
-      api.listAllFindings({ limit: 2000 }).then(setFindings).catch((err) => setError(err.message));
-    }
-  }, [view]); // eslint-disable-line react-hooks/exhaustive-deps -- findings intentionally excluded, loaded once and cached
-
   const statusCounts = useMemo(() => {
     if (!projects) return null;
     const c = Object.fromEntries(STATUS_ORDER.map((s) => [s, 0]));
@@ -54,6 +44,11 @@ export function ProjectList() {
       if (p.status in c) c[p.status] += 1;
     }
     return c;
+  }, [projects]);
+
+  const platformsPresent = useMemo(() => {
+    if (!projects) return [];
+    return Array.from(new Set(projects.map((p) => p.platform))).sort();
   }, [projects]);
 
   function toggleOne(id) {
@@ -67,10 +62,12 @@ export function ProjectList() {
 
   const filteredProjects = useMemo(() => {
     if (!projects) return [];
-    if (statusFilter === "all") return projects;
-    if (statusFilter === "archived") return projects.filter((p) => p.status === "archived");
-    return projects.filter((p) => p.status !== "archived"); // "active"
-  }, [projects, statusFilter]);
+    let list = projects;
+    if (statusFilter === "archived") list = list.filter((p) => p.status === "archived");
+    else if (statusFilter === "active") list = list.filter((p) => p.status !== "archived");
+    if (platformFilter !== "all") list = list.filter((p) => p.platform === platformFilter);
+    return list;
+  }, [projects, statusFilter, platformFilter]);
 
   function toggleAll() {
     setSelected((prev) =>
@@ -121,15 +118,9 @@ export function ProjectList() {
           <div className="eyebrow" style={{ marginBottom: 4 }}>Operator console</div>
           <h1 style={{ fontSize: 24, fontWeight: 500, margin: 0 }}>Projects</h1>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
-            <button onClick={() => setView("list")} style={toggleButtonStyle(view === "list")}>List</button>
-            <button onClick={() => setView("graph")} style={toggleButtonStyle(view === "graph")}>Graph</button>
-          </div>
-          <Link to="/new" style={newButtonStyle}>
-            + New project
-          </Link>
-        </div>
+        <Link to="/new" style={newButtonStyle}>
+          + New project
+        </Link>
       </div>
 
       {projects.length === 0 ? (
@@ -138,39 +129,52 @@ export function ProjectList() {
         </div>
       ) : (
         <>
-          <div
-            className="ops-panel"
-            data-label="STATUS"
-            style={{
-              padding: "18px 20px",
-              marginBottom: 20,
-            }}
-          >
+          <div className="ops-panel" data-label="STATUS" style={{ padding: "18px 20px", marginBottom: 20 }}>
             <Donut segments={donutSegments} centerLabel="projects by status" />
           </div>
 
-          {view === "graph" ? (
-            <AttackSurfaceGraph projects={projects} findings={findings} />
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, marginBottom: 16 }}>
+            <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
+              <button onClick={() => setStatusFilter("active")} style={toggleButtonStyle(statusFilter === "active")}>
+                Active
+              </button>
+              <button onClick={() => setStatusFilter("archived")} style={toggleButtonStyle(statusFilter === "archived")}>
+                Archived ({statusCounts.archived})
+              </button>
+              <button onClick={() => setStatusFilter("all")} style={toggleButtonStyle(statusFilter === "all")}>
+                All
+              </button>
+            </div>
+
+            {platformsPresent.length > 1 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                <button
+                  className="chip"
+                  data-active={platformFilter === "all"}
+                  onClick={() => setPlatformFilter("all")}
+                >
+                  All platforms
+                </button>
+                {platformsPresent.map((p) => (
+                  <button
+                    key={p}
+                    className="chip"
+                    data-active={platformFilter === p}
+                    onClick={() => setPlatformFilter(p)}
+                  >
+                    {platformLabel(p)}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {filteredProjects.length === 0 ? (
+            <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
+              {statusFilter === "archived" ? "No archived projects." : "Nothing here."}
+            </div>
           ) : (
             <>
-              <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden", width: "fit-content", marginBottom: 12 }}>
-                <button onClick={() => setStatusFilter("active")} style={toggleButtonStyle(statusFilter === "active")}>
-                  Active
-                </button>
-                <button onClick={() => setStatusFilter("archived")} style={toggleButtonStyle(statusFilter === "archived")}>
-                  Archived ({statusCounts.archived})
-                </button>
-                <button onClick={() => setStatusFilter("all")} style={toggleButtonStyle(statusFilter === "all")}>
-                  All
-                </button>
-              </div>
-
-              {filteredProjects.length === 0 ? (
-                <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
-                  {statusFilter === "archived" ? "No archived projects." : "Nothing here."}
-                </div>
-              ) : (
-                <>
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
                   <input
@@ -227,54 +231,9 @@ export function ProjectList() {
 
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {filteredProjects.map((p) => (
-                  <div
-                    key={p.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 12,
-                      padding: "14px 16px",
-                      background: "var(--bg-surface)",
-                      border: "1px solid var(--border)",
-                      borderRadius: "var(--radius-lg)",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selected.has(p.id)}
-                      onChange={() => toggleOne(p.id)}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                    <Link
-                      to={`/projects/${p.id}`}
-                      style={{
-                        flex: 1,
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        textDecoration: "none",
-                        color: "var(--text-primary)",
-                        minWidth: 0,
-                      }}
-                    >
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <span style={{ fontWeight: 500 }}>{p.name}</span>
-                          <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                            #{p.id}
-                          </span>
-                        </div>
-                        <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-                          {p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} · {formatDate(p.created_at)}
-                        </div>
-                      </div>
-                      <StatusPill status={p.status} />
-                    </Link>
-                  </div>
+                  <ProjectRow key={p.id} p={p} selected={selected.has(p.id)} onToggleSelected={() => toggleOne(p.id)} />
                 ))}
               </div>
-                </>
-              )}
             </>
           )}
         </>
@@ -287,6 +246,91 @@ function formatDate(isoString) {
   const date = new Date(isoString);
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) +
     " · " + date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+function ProjectRow({ p, selected, onToggleSelected }) {
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [runs, setRuns] = useState(null);
+  const [runsError, setRunsError] = useState(null);
+
+  async function toggleHistory(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const next = !historyOpen;
+    setHistoryOpen(next);
+    if (next && runs === null) {
+      try {
+        setRuns(await api.listScanRuns(p.id));
+      } catch (err) {
+        setRunsError(err.message);
+      }
+    }
+  }
+
+  return (
+    <div
+      style={{
+        background: "var(--bg-surface)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-lg)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px" }}>
+        <input type="checkbox" checked={selected} onChange={onToggleSelected} onClick={(e) => e.stopPropagation()} />
+        <Link
+          to={`/projects/${p.id}`}
+          style={{
+            flex: 1,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            textDecoration: "none",
+            color: "var(--text-primary)",
+            minWidth: 0,
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontWeight: 500 }}>{p.name}</span>
+              <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                #{p.id}
+              </span>
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+              {platformLabel(p.platform)} · Created {formatDate(p.created_at)}
+              {p.last_scan_at && <> · Last scan {formatDate(p.last_scan_at)}</>}
+            </div>
+          </div>
+          <StatusPill status={p.status} />
+        </Link>
+        <button
+          className="btn"
+          onClick={toggleHistory}
+          title="Scan history"
+          style={{ minWidth: "auto", padding: "5px 9px", fontSize: 11 }}
+        >
+          ⏱ {p.scan_count ?? 0}
+        </button>
+      </div>
+
+      {historyOpen && (
+        <div style={{ borderTop: "1px solid var(--border)", padding: "10px 16px", fontSize: 12 }}>
+          {runsError && <span style={{ color: "var(--status-fail)" }}>{runsError}</span>}
+          {runs === null && !runsError && <span style={{ color: "var(--text-muted)" }}>Loading…</span>}
+          {runs !== null && runs.length === 0 && <span style={{ color: "var(--text-muted)" }}>Never scanned.</span>}
+          {runs !== null && runs.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {runs.map((r) => (
+                <div key={r.id} className="mono" style={{ color: "var(--text-secondary)" }}>
+                  {formatDate(r.started_at)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function StatusPill({ status }) {

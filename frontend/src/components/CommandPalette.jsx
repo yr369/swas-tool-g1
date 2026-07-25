@@ -37,8 +37,15 @@ export function CommandPalette() {
         setOpen(false);
       }
     }
+    function onExternalOpen() {
+      setOpen(true);
+    }
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("swas:open-palette", onExternalOpen);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("swas:open-palette", onExternalOpen);
+    };
   }, [open]);
 
   useEffect(() => {

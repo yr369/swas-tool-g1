@@ -6,7 +6,7 @@ export function NewProject() {
 
   return (
     <div style={{ maxWidth: 640 }}>
-      <ScopeIntake onProjectCreated={(project) => navigate(`/projects/${project.id}`)} />
+      <ScopeIntake onProjectCreated={() => navigate("/")} />
     </div>
   );
 }

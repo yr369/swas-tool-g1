@@ -527,7 +527,14 @@ async def list_projects():
     pool = database.get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at FROM projects ORDER BY created_at DESC"
+            """
+            SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
+                   p.next_scheduled_scan_at, p.created_at,
+                   (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
+            FROM projects p
+            ORDER BY p.created_at DESC
+            """
         )
     return [dict(row) for row in rows]
 
@@ -537,7 +544,13 @@ async def get_project(project_id: int):
     pool = database.get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, name, platform, status, scan_interval_hours, next_scheduled_scan_at, created_at FROM projects WHERE id = $1",
+            """
+            SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
+                   p.next_scheduled_scan_at, p.created_at,
+                   (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
+            FROM projects p WHERE p.id = $1
+            """,
             project_id,
         )
     if row is None:
@@ -916,8 +929,9 @@ async def parse_scope_from_file(
     the relevant text out and use parse-text instead for those formats).
     Does not touch the database.
     """
-    if platform not in ("bugcrowd", "hackerone"):
-        raise HTTPException(status_code=400, detail="platform must be 'bugcrowd' or 'hackerone'")
+    valid_platforms = ("bugcrowd", "hackerone", "intigriti", "yeswehack", "openbugbounty", "private")
+    if platform not in valid_platforms:
+        raise HTTPException(status_code=400, detail=f"platform must be one of {', '.join(valid_platforms)}")
 
     raw_bytes = await file.read()
     try:
@@ -1534,7 +1548,21 @@ async def list_phase_runs(project_id: int):
     return [dict(row) for row in rows]
 
 
-# ---------- Submission readiness ----------
+@app.get("/api/projects/{project_id}/scan-runs", response_model=List[ScanRun])
+async def list_scan_runs(project_id: int):
+    """
+    Full scan-run history for this project - one row per time a scan was
+    kicked off (manual, scheduled, or recurring). This is what the "scan
+    history" list in the project view shows; phase-runs above is the
+    live per-phase detail, this is the higher-level timeline.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, project_id, started_at FROM scan_runs WHERE project_id = $1 ORDER BY started_at DESC",
+            project_id,
+        )
+    return [dict(row) for row in rows]
 
 @app.get("/api/findings/{finding_id}/readiness", response_model=ReadinessResponse)
 async def get_finding_readiness(finding_id: int):

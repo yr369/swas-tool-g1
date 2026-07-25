@@ -71,17 +71,21 @@ function Shell() {
             padding: "12px 24px",
             display: "flex",
             alignItems: "center",
-            justifyContent: "space-between",
+            justifyContent: "flex-end",
           }}
         >
-          <span className="eyebrow header-tagline">SECURITY WEB AUTOMATION SYSTEM</span>
           <div style={{ display: "flex", gap: 8 }}>
             <button className="btn" onClick={() => setShortcutsOpen(true)} title="Keybind reference (?)">
               ? KEYS
             </button>
-            <span className="kbd" style={{ minWidth: "auto", padding: "2px 8px" }}>
+            <button
+              className="btn"
+              onClick={() => window.dispatchEvent(new Event("swas:open-palette"))}
+              title="Command palette (⌘K)"
+              style={{ minWidth: "auto" }}
+            >
               ⌘K
-            </span>
+            </button>
           </div>
         </header>
 
