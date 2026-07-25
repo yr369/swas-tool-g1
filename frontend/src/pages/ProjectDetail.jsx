@@ -190,8 +190,11 @@ export function ProjectDetail() {
   return (
     <div>
       <div style={{ marginBottom: 24 }}>
+        <div className="eyebrow" style={{ marginBottom: 4 }}>
+          {project.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne"} target
+        </div>
         <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <h1 style={{ fontSize: 20, fontWeight: 600, margin: "0 0 4px" }}>{project.name}</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 500, margin: "0 0 4px" }}>{project.name}</h1>
           <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>#{project.id}</span>
         </div>
         <p style={{ color: "var(--text-muted)", fontSize: 13, margin: 0 }}>
@@ -391,13 +394,12 @@ export function ProjectDetail() {
 
 function Section({ title, aside, children }) {
   return (
-    <div style={{ marginBottom: 32 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <h2 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-secondary)", margin: 0, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-          {title}
-        </h2>
-        {aside}
-      </div>
+    <div className="ops-panel" data-label={title} style={{ marginBottom: 24, padding: "20px 20px 18px" }}>
+      {aside && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+          {aside}
+        </div>
+      )}
       {children}
     </div>
   );

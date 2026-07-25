@@ -40,7 +40,8 @@ export function SignatureStats() {
 
   return (
     <div>
-      <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 4px" }}>Signature Stats</h1>
+      <div className="eyebrow" style={{ marginBottom: 4 }}>Triage learning loop</div>
+      <h1 style={{ fontSize: 24, fontWeight: 500, margin: "0 0 4px" }}>Signature Stats</h1>
       <p style={{ color: "var(--text-muted)", fontSize: 13, margin: "0 0 24px" }}>
         Real outcomes logged per (tool + vuln type) signature - the same history triage checks before scoring a new finding.
       </p>

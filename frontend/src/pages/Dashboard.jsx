@@ -51,8 +51,11 @@ export function Dashboard() {
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 600, margin: 0 }}>Dashboard</h1>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 24 }}>
+        <div>
+          <div className="eyebrow" style={{ marginBottom: 4 }}>Cross-project findings feed</div>
+          <h1 style={{ fontSize: 24, fontWeight: 500, margin: 0 }}>Dashboard</h1>
+        </div>
         <Link to="/" style={{ fontSize: 13, color: "var(--text-secondary)" }}>
           View projects →
         </Link>
@@ -83,7 +86,7 @@ export function Dashboard() {
           No findings match this search.
         </div>
       ) : (
-        <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
+        <div className="ops-panel" data-label={`FINDINGS · ${findings.length}`} style={{ overflow: "hidden" }}>
           {findings.map((f, i) => (
             <div
               key={f.id}

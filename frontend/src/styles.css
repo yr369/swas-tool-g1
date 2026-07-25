@@ -1,33 +1,37 @@
-/* ---------- Design tokens ---------- */
+/* =========================================================================
+   SWAS — Ops Console design system ("Black Ops HUD")
+   Tactical field-equipment aesthetic: gunmetal surfaces, notched/cut-corner
+   panels (like avionics or optics housings), stamped classification labels,
+   condensed stencil display type. Severity colors remain the one place the
+   UI is allowed to be loud, because that's real content, not decoration.
+   ========================================================================= */
 :root {
-  /* Surfaces */
-  --bg-canvas: #14171c;
-  --bg-surface: #1c2128;
-  --bg-surface-raised: #242a33;
-  --border: #2d333d;
-  --border-strong: #3d4654;
+  /* Surfaces — near-black with a faint green-gunmetal undertone, not a
+     neutral black and not a blue-black; reads as hardware, not "hacker". */
+  --bg-canvas: #0a0e0c;
+  --bg-surface: #121613;
+  --bg-surface-raised: #181d19;
+  --border: #232a25;
+  --border-strong: #333d35;
 
   /* Text */
-  --text-primary: #e6e8eb;
-  --text-secondary: #a8b0bb;
-  --text-muted: #6e7681;
+  --text-primary: #e6ebe6;
+  --text-secondary: #93a397;
+  --text-muted: #57645b;
 
-  /* Accent (used sparingly: primary actions, brand chrome) */
-  --accent: #4fd1c5;
-  --accent-dim: #2a4a47;
-  --on-accent: #0a1f1d;
+  /* Accent — dialed-back phosphor teal. Interactive chrome only: links,
+     focus, primary buttons. Never used for severity. */
+  --accent: #49b3a6;
+  --accent-dim: #1c332f;
+  --on-accent: #06120f;
 
-  /* Signal accent: reserved exclusively for "this is live right now" -
-     an active scan, a sweep, a pulsing node. Never used for static UI
-     chrome, so when it appears it actually means something - the one
-     place this app spends its visual boldness. Named for the radar/
-     signal-intelligence vocabulary of the subject (scanning, sweeping,
-     pinging a target), not just "a second bright color". */
+  /* Signal accent — reserved exclusively for "this is live right now":
+     an active scan, a sweep, a pulsing node. Never static UI chrome. */
   --signal: #ffb454;
   --signal-dim: #4a3a1f;
   --on-signal: #1f1400;
 
-  /* Severity - this is the actual content of the tool, not decoration */
+  /* Severity — the actual content of the tool, not decoration */
   --sev-critical: #f85149;
   --sev-critical-bg: #3d1f1d;
   --sev-high: #db6d28;
@@ -39,7 +43,7 @@
   --sev-info: #6e7681;
   --sev-info-bg: #2a2d33;
 
-  /* Status (project lifecycle - distinct from pipeline phase status) */
+  /* Status (project lifecycle) */
   --status-success: #3fb950;
   --status-fail: #f85149;
   --status-pending: #6e7681;
@@ -48,13 +52,17 @@
   --proj-completed: #3fb950;
   --proj-archived: #6e7681;
 
-  /* Layout */
-  --radius: 6px;
-  --radius-lg: 10px;
+  /* Layout — sharp, not soft. Equipment has edges, not app-store corners. */
+  --radius: 3px;
+  --radius-lg: 4px;
+  --notch: 12px;
+  --sidebar-w: 216px;
+  --sidebar-w-collapsed: 56px;
 
-  /* Type: display (headings, big readouts) / ui (body, controls) /
-     mono (data, evidence, anything the tool actually produced) */
-  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  /* Type: display (stenciled, condensed — panel titles, big readouts) /
+     ui (body, controls) / mono (data, evidence, anything the tool
+     actually produced, and all tactical labels/eyebrows) */
+  --font-display: "Oswald", "Space Grotesk", system-ui, sans-serif;
   --font-ui: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
@@ -92,8 +100,6 @@ body {
 }
 
 body::before {
-  /* Grid opacity kept separate from the grid itself so it can be this
-     faint without fighting CSS specificity on background-image. */
   content: "";
   position: fixed;
   inset: 0;
@@ -107,6 +113,9 @@ a {
   color: var(--accent);
   text-decoration: none;
 }
+a:hover {
+  text-decoration: underline;
+}
 
 button {
   font-family: var(--font-ui);
@@ -116,6 +125,8 @@ h1,
 h2,
 h3 {
   font-family: var(--font-display);
+  font-weight: 500;
+  letter-spacing: 0.01em;
 }
 
 /* Visible keyboard focus - accessibility floor, not optional */
@@ -147,6 +158,15 @@ h3 {
   }
 }
 
+@keyframes scan-sweep-move {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -159,6 +179,152 @@ h3 {
 code,
 .mono {
   font-family: var(--font-mono);
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* ---------- Ops panel: the signature element ----------
+   A cut-corner (notched) frame, like an equipment housing or an
+   avionics readout bezel, with an optional stamped label sitting on
+   the top edge. data-label should describe what the panel actually
+   is ("SCOPE", "FINDINGS — LIVE", "ARCHIVED"), not decorate it. */
+.ops-panel {
+  position: relative;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  clip-path: polygon(
+    var(--notch) 0,
+    100% 0,
+    100% calc(100% - var(--notch)),
+    calc(100% - var(--notch)) 100%,
+    0 100%,
+    0 var(--notch)
+  );
+}
+
+.ops-panel[data-label]::before {
+  content: attr(data-label);
+  position: absolute;
+  top: -9px;
+  left: 22px;
+  background: var(--bg-canvas);
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  z-index: 1;
+}
+
+.ops-panel.live[data-label]::before {
+  color: var(--signal);
+}
+
+/* Loading / active sweep — one orchestrated motion, only where it means
+   something (a panel currently pulling live data or mid-scan). */
+.scan-sweep {
+  overflow: hidden;
+}
+.scan-sweep::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 35%;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(73, 179, 166, 0.14), transparent);
+  animation: scan-sweep-move 2.6s ease-in-out infinite;
+}
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-strong);
+  padding: 8px 14px;
+  cursor: pointer;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.btn:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn-primary {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.btn-primary:hover {
+  color: var(--on-accent);
+  background: var(--accent);
+}
+.btn-danger {
+  color: var(--sev-critical);
+  border-color: var(--sev-critical-bg);
+}
+.btn-danger:hover {
+  color: #fff;
+  background: var(--sev-critical);
+  border-color: var(--sev-critical);
+}
+
+/* ---------- Inputs ---------- */
+.input,
+input[type="text"].input,
+input[type="search"].input,
+select.input,
+textarea.input {
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: var(--font-ui);
+}
+.input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* ---------- Keycap ---------- */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  line-height: 1;
 }
 
 /* ---------- Filter chips (findings view) ---------- */

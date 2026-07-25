@@ -113,10 +113,11 @@ export function CommandPalette() {
       onClick={() => setOpen(false)}
     >
       <div
+        className="ops-panel"
+        data-label="COMMAND"
         style={{
-          background: "var(--bg-surface-raised)", border: "1px solid var(--border-strong)",
-          borderRadius: "var(--radius-lg)", width: 560, maxWidth: "90vw",
-          boxShadow: "0 16px 48px rgba(0,0,0,0.4)", overflow: "hidden",
+          background: "var(--bg-surface-raised)", width: 560, maxWidth: "90vw",
+          boxShadow: "0 16px 48px rgba(0,0,0,0.5)", overflow: "hidden",
         }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -130,7 +131,8 @@ export function CommandPalette() {
           style={{
             width: "100%", boxSizing: "border-box", background: "transparent",
             border: "none", borderBottom: "1px solid var(--border)",
-            padding: "16px 18px", fontSize: 15, color: "var(--text-primary)", outline: "none",
+            padding: "18px 18px 14px", fontSize: 15, color: "var(--text-primary)", outline: "none",
+            fontFamily: "var(--font-ui)",
           }}
         />
         <div style={{ maxHeight: "50vh", overflowY: "auto", padding: "6px 0" }}>
@@ -144,25 +146,28 @@ export function CommandPalette() {
               onClick={() => choose(item)}
               style={{
                 display: "flex", justifyContent: "space-between", alignItems: "center",
-                padding: "10px 18px", cursor: "pointer", fontSize: 13,
+                padding: "9px 18px", cursor: "pointer", fontSize: 13,
+                borderLeft: i === activeIndex ? "2px solid var(--accent)" : "2px solid transparent",
                 background: i === activeIndex ? "var(--accent-dim)" : "transparent",
                 color: i === activeIndex ? "var(--accent)" : "var(--text-primary)",
               }}
             >
               <span>{item.label}</span>
-              <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>{item.hint}</span>
+              <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)", letterSpacing: "0.04em" }}>
+                {item.hint?.toUpperCase()}
+              </span>
             </div>
           ))}
         </div>
         <div
           style={{
             display: "flex", gap: 14, padding: "8px 18px", borderTop: "1px solid var(--border)",
-            fontSize: 11, color: "var(--text-muted)",
+            fontSize: 11, color: "var(--text-muted)", fontFamily: "var(--font-mono)",
           }}
         >
-          <span>↑↓ navigate</span>
-          <span>↵ select</span>
-          <span>esc close</span>
+          <span><span className="kbd" style={{ minWidth: "auto", padding: "1px 5px" }}>↑↓</span> navigate</span>
+          <span><span className="kbd" style={{ minWidth: "auto", padding: "1px 5px" }}>↵</span> select</span>
+          <span><span className="kbd" style={{ minWidth: "auto", padding: "1px 5px" }}>esc</span> close</span>
         </div>
       </div>
     </div>

@@ -117,7 +117,10 @@ export function ProjectList() {
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 600, margin: 0 }}>Projects</h1>
+        <div>
+          <div className="eyebrow" style={{ marginBottom: 4 }}>Operator console</div>
+          <h1 style={{ fontSize: 24, fontWeight: 500, margin: 0 }}>Projects</h1>
+        </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden" }}>
             <button onClick={() => setView("list")} style={toggleButtonStyle(view === "list")}>List</button>
@@ -136,10 +139,9 @@ export function ProjectList() {
       ) : (
         <>
           <div
+            className="ops-panel"
+            data-label="STATUS"
             style={{
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-lg)",
-              background: "var(--bg-surface)",
               padding: "18px 20px",
               marginBottom: 20,
             }}
