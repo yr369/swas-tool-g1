@@ -1113,6 +1113,7 @@ async def dismiss_scan_note(note_id: int):
         if result == "UPDATE 0":
             raise HTTPException(status_code=404, detail="Scan note not found")
     return {"dismissed": True, "id": note_id}
+@app.patch("/api/findings/bulk-status", response_model=FindingBulkStatusResult)
 async def bulk_update_finding_status(payload: FindingBulkStatusRequest):
     """
     Sets the status field (new/reviewed/submitted/dismissed) on many
@@ -1866,13 +1867,25 @@ async def list_all_findings(
     tool_name: Optional[str] = None,
     q: Optional[str] = None,
     likely_program_outcome: Optional[str] = None,
+    status: Optional[str] = None,
+    sort: str = "recent",
     limit: int = 500,
 ):
     """
-    Findings across EVERY project, for the cross-project dashboard - the
-    per-project view (GET /api/projects/{id}/findings) stays as-is for
-    the project detail page. Filters are all optional and combine with
-    AND. `q` does a simple substring search over evidence and vuln_type.
+    Findings across EVERY project, for the cross-project dashboard and
+    the triage queue - the per-project view (GET /api/projects/{id}/findings)
+    stays as-is for the project detail page. Filters are all optional
+    and combine with AND. `q` does a simple substring search over
+    evidence and vuln_type.
+
+    status: comma-separated list (e.g. "new,reviewed") - lets the triage
+    queue pull everything actionable in one call instead of one request
+    per status.
+
+    sort: "recent" (default, newest first), "confidence" (lowest
+    triage_confidence first - the ones the AI was least sure about,
+    which is where operator attention matters most), or "severity"
+    (critical first).
 
     likely_program_outcome (Batch 5): filter by triage's predicted
     program outcome - e.g. ?likely_program_outcome=out_of_scope to see
@@ -1895,8 +1908,24 @@ async def list_all_findings(
     if likely_program_outcome:
         params.append(likely_program_outcome)
         conditions.append(f"f.likely_program_outcome = ${len(params)}")
+    if status:
+        status_list = [s.strip() for s in status.split(",") if s.strip()]
+        params.append(status_list)
+        conditions.append(f"f.status = ANY(${len(params)}::text[])")
 
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    order_clause = {
+        "confidence": "f.triage_confidence ASC NULLS FIRST, f.created_at DESC",
+        "severity": """
+            CASE f.severity
+                WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3 WHEN 'info' THEN 4 ELSE 5
+            END, f.created_at DESC
+        """,
+        "recent": "f.created_at DESC",
+    }.get(sort, "f.created_at DESC")
+
     params.append(min(limit, 2000))  # hard ceiling regardless of what's requested
 
     async with pool.acquire() as conn:
@@ -1911,7 +1940,7 @@ async def list_all_findings(
             FROM findings f
             JOIN projects p ON p.id = f.project_id
             {where_clause}
-            ORDER BY f.created_at DESC
+            ORDER BY {order_clause}
             LIMIT ${len(params)}
             """,
             *params,

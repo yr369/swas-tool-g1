@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { BrowserRouter, Routes, Route, useNavigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, useLocation, useNavigate } from "react-router-dom";
 import { ProjectList } from "./pages/ProjectList";
 import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Dashboard } from "./pages/Dashboard";
 import { SignatureStats } from "./pages/SignatureStats";
 import { ScheduledScans } from "./pages/ScheduledScans";
+import { TriageQueue } from "./pages/TriageQueue";
 import { CommandPalette } from "./components/CommandPalette";
 import { Sidebar } from "./components/Sidebar";
 import { ShortcutsModal } from "./components/ShortcutsModal";
@@ -14,8 +15,13 @@ function Shell() {
   const [collapsed, setCollapsed] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
   const gPending = useRef(false);
   const gTimer = useRef(null);
+  // The triage queue is a split-pane workspace, not a document - it
+  // wants the full main area, not the ~960px reading-width column
+  // every other page uses.
+  const isFullBleed = location.pathname === "/triage";
 
   useEffect(() => {
     function isTypingTarget(el) {
@@ -29,7 +35,9 @@ function Shell() {
       if (gPending.current) {
         gPending.current = false;
         clearTimeout(gTimer.current);
-        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new" }[e.key.toLowerCase()];
+        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new", t: "/triage" }[
+          e.key.toLowerCase()
+        ];
         if (dest) {
           e.preventDefault();
           navigate(dest);
@@ -91,12 +99,13 @@ function Shell() {
           </div>
         </header>
 
-        <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "24px 24px" }}>
-          <div style={{ maxWidth: 960, margin: "0 auto" }}>
+        <main style={{ flex: 1, minHeight: 0, overflowY: isFullBleed ? "hidden" : "auto", padding: "24px 24px" }}>
+          <div style={isFullBleed ? { height: "100%" } : { maxWidth: 960, margin: "0 auto" }}>
             <Routes>
               <Route path="/" element={<ProjectList />} />
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/scheduled" element={<ScheduledScans />} />
+              <Route path="/triage" element={<TriageQueue />} />
               <Route path="/signatures" element={<SignatureStats />} />
               <Route path="/new" element={<NewProject />} />
               <Route path="/projects/:id" element={<ProjectDetail />} />

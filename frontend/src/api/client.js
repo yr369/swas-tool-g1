@@ -113,6 +113,8 @@ export const api = {
     if (filters.tool_name) params.set("tool_name", filters.tool_name);
     if (filters.q) params.set("q", filters.q);
     if (filters.likely_program_outcome) params.set("likely_program_outcome", filters.likely_program_outcome);
+    if (filters.status) params.set("status", filters.status);
+    if (filters.sort) params.set("sort", filters.sort);
     if (filters.limit) params.set("limit", filters.limit);
     const qs = params.toString();
     return request(`/findings${qs ? `?${qs}` : ""}`);
@@ -120,7 +122,7 @@ export const api = {
   exportFindingsUrl: (projectId) => `${BASE}/projects/${projectId}/findings/export`,
   reportUrl: (projectId) => `${BASE}/projects/${projectId}/report.md`,
   bulkUpdateFindingStatus: (findingIds, status) =>
-    request("/findings/bulk", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
+    request("/findings/bulk-status", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
 
   // Run-to-run diff
   getDiff: (projectId) => request(`/projects/${projectId}/diff`),

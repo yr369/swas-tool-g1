@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
+import { platformLabel } from "../constants";
 
 /**
  * CommandPalette.jsx - global Cmd+K / Ctrl+K launcher (Batch 7).
@@ -63,7 +64,9 @@ export function CommandPalette() {
   const staticActions = useMemo(
     () => [
       { id: "action:new-project", label: "New project", hint: "Create", go: () => navigate("/new") },
+      { id: "action:triage", label: "Triage queue", hint: "Go to", go: () => navigate("/triage") },
       { id: "action:dashboard", label: "Dashboard", hint: "Go to", go: () => navigate("/dashboard") },
+      { id: "action:scheduled", label: "Scheduled scans", hint: "Go to", go: () => navigate("/scheduled") },
       { id: "action:signatures", label: "Signature stats", hint: "Go to", go: () => navigate("/signatures") },
       { id: "action:projects", label: "All projects", hint: "Go to", go: () => navigate("/") },
     ],
@@ -78,7 +81,7 @@ export function CommandPalette() {
       .map((p) => ({
         id: `project:${p.id}`,
         label: p.name,
-        hint: p.platform === "bugcrowd" ? "Bugcrowd" : "HackerOne",
+        hint: platformLabel(p.platform),
         go: () => navigate(`/projects/${p.id}`),
       }));
     const matchedActions = staticActions.filter((a) => !q || a.label.toLowerCase().includes(q));

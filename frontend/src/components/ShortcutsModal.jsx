@@ -3,10 +3,20 @@ const GROUPS = [
     title: "Navigate",
     items: [
       ["G then P", "Projects"],
+      ["G then T", "Triage queue"],
       ["G then D", "Dashboard"],
       ["G then C", "Scheduled scans"],
       ["G then S", "Signature stats"],
       ["G then N", "New project"],
+    ],
+  },
+  {
+    title: "In the triage queue",
+    items: [
+      ["J / K", "Next / previous finding"],
+      ["A", "Accept (mark reviewed)"],
+      ["R", "Reject (dismiss)"],
+      ["S", "Mark submitted"],
     ],
   },
   {
