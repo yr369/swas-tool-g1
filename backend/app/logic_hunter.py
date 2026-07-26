@@ -195,11 +195,14 @@ async def _upsert_surface_endpoints(conn, target_id: int, endpoints: list[dict])
                 last_seen_at = now(),
                 last_status_code = EXCLUDED.last_status_code,
                 is_live = COALESCE(EXCLUDED.is_live, attack_surface_endpoints.is_live),
-                sources = (
-                    SELECT jsonb_agg(DISTINCT s)
-                    FROM jsonb_array_elements_text(
-                        attack_surface_endpoints.sources || EXCLUDED.sources
-                    ) AS s
+                sources = COALESCE(
+                    (
+                        SELECT jsonb_agg(DISTINCT s)
+                        FROM jsonb_array_elements_text(
+                            attack_surface_endpoints.sources || EXCLUDED.sources
+                        ) AS s
+                    ),
+                    '[]'::jsonb
                 ),
                 requires_auth = COALESCE(attack_surface_endpoints.requires_auth, EXCLUDED.requires_auth),
                 auth_evidence = COALESCE(attack_surface_endpoints.auth_evidence, EXCLUDED.auth_evidence)

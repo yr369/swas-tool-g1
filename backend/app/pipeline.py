@@ -2232,17 +2232,23 @@ async def _save_surface_endpoints_pooled(
                     last_seen_at = now(),
                     last_status_code = EXCLUDED.last_status_code,
                     is_live = COALESCE(EXCLUDED.is_live, attack_surface_endpoints.is_live),
-                    tech_stack = (
-                        SELECT jsonb_agg(DISTINCT t)
-                        FROM jsonb_array_elements_text(
-                            attack_surface_endpoints.tech_stack || EXCLUDED.tech_stack
-                        ) AS t
+                    tech_stack = COALESCE(
+                        (
+                            SELECT jsonb_agg(DISTINCT t)
+                            FROM jsonb_array_elements_text(
+                                attack_surface_endpoints.tech_stack || EXCLUDED.tech_stack
+                            ) AS t
+                        ),
+                        '[]'::jsonb
                     ),
-                    sources = (
-                        SELECT jsonb_agg(DISTINCT s)
-                        FROM jsonb_array_elements_text(
-                            attack_surface_endpoints.sources || EXCLUDED.sources
-                        ) AS s
+                    sources = COALESCE(
+                        (
+                            SELECT jsonb_agg(DISTINCT s)
+                            FROM jsonb_array_elements_text(
+                                attack_surface_endpoints.sources || EXCLUDED.sources
+                            ) AS s
+                        ),
+                        '[]'::jsonb
                     ),
                     requires_auth = COALESCE(attack_surface_endpoints.requires_auth, EXCLUDED.requires_auth),
                     auth_evidence = COALESCE(attack_surface_endpoints.auth_evidence, EXCLUDED.auth_evidence)
@@ -2283,9 +2289,12 @@ async def _save_surface_params_pooled(pool: asyncpg.Pool, target_id: int, url: s
         await conn.execute(
             """
             UPDATE attack_surface_endpoints
-            SET params = (
-                SELECT jsonb_agg(DISTINCT p)
-                FROM jsonb_array_elements_text(params || $2::jsonb) AS p
+            SET params = COALESCE(
+                (
+                    SELECT jsonb_agg(DISTINCT p)
+                    FROM jsonb_array_elements_text(COALESCE(params, '[]'::jsonb) || $2::jsonb) AS p
+                ),
+                '[]'::jsonb
             )
             WHERE target_id = $1 AND url = $3
             """,
