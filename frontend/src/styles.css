@@ -189,20 +189,16 @@ code,
 
 .ops-panel[data-label]::before {
   content: attr(data-label);
-  position: absolute;
-  top: -9px;
-  left: 22px;
-  background: var(--bg-surface-raised);
-  border: 1px solid var(--border-strong);
-  border-bottom: none;
-  padding: 1px 8px 3px;
+  display: block;
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--text-secondary);
-  z-index: 1;
+  margin: -2px 0 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
 }
 
 .ops-panel.live[data-label]::before {
@@ -320,17 +316,29 @@ textarea.input {
   border-radius: 999px;
   border: 1px solid var(--border);
   background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   user-select: none;
-  transition: border-color 0.15s, background 0.15s, opacity 0.15s;
+  transition: border-color 0.15s, background 0.15s, opacity 0.15s, color 0.15s;
+}
+
+.chip[data-active="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-dim);
 }
 
 .chip[data-active="false"] {
-  opacity: 0.45;
+  opacity: 0.6;
 }
 
 .chip:hover {
   border-color: var(--border-strong);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .header-tagline {

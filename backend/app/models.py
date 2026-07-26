@@ -40,6 +40,13 @@ class ProjectCreate(BaseModel):
     platform: PlatformType
 
 
+class ProjectUpdate(BaseModel):
+    # Both optional - a rename shouldn't force a platform re-pick and
+    # vice versa. At least one must be set (checked in the endpoint).
+    name: Optional[str] = None
+    platform: Optional[PlatformType] = None
+
+
 class Project(BaseModel):
     id: int
     name: str

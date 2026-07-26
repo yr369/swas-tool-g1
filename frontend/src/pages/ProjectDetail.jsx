@@ -6,7 +6,7 @@ import { FindingsList } from "../components/FindingsList";
 import { ScanNotesPanel } from "../components/ScanNotesPanel";
 import { DiffPanel } from "../components/DiffPanel";
 import { ScopeManager } from "../components/ScopeManager";
-import { platformLabel } from "../constants";
+import { PLATFORM_LABEL, platformLabel } from "../constants";
 
 // Fallback polling interval, used ONLY when the WebSocket isn't
 // connected (never established, or dropped). While the socket is live,
@@ -31,6 +31,7 @@ export function ProjectDetail() {
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState(null);
   const [liveConnected, setLiveConnected] = useState(false);
+  const [diffHasContent, setDiffHasContent] = useState(false);
   const pollRef = useRef(null);
   const wsRef = useRef(null);
 
@@ -207,19 +208,7 @@ export function ProjectDetail() {
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <div className="eyebrow" style={{ marginBottom: 4 }}>
-          {platformLabel(project.platform)} target
-        </div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <h1 style={{ fontSize: 22, fontWeight: 500, margin: "0 0 4px" }}>{project.name}</h1>
-          <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>#{project.id}</span>
-        </div>
-        <p style={{ color: "var(--text-muted)", fontSize: 13, margin: 0 }}>
-          {platformLabel(project.platform)} · {inScopeCount} in-scope target
-          {inScopeCount === 1 ? "" : "s"} · Created {formatDate(project.created_at)}
-        </p>
-      </div>
+      <ProjectHeader project={project} inScopeCount={inScopeCount} onSaved={loadAll} />
 
       <Section
         title="Pipeline"
@@ -243,7 +232,7 @@ export function ProjectDetail() {
         }
       >
         <PipelineTracker phaseRuns={phaseRuns} />
-        <div style={{ marginTop: 20, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <button onClick={handleStartScan} disabled={scanStarting || inScopeCount === 0} style={primaryButtonStyle}>
             {scanStarting ? "Starting…" : "Start scan"}
           </button>
@@ -315,9 +304,11 @@ export function ProjectDetail() {
         <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
       </Section>
 
-      <Section title="Changes since last scan">
-        <DiffPanel projectId={id} />
-      </Section>
+      <div style={{ display: diffHasContent ? "block" : "none" }}>
+        <Section title="Changes since last scan">
+          <DiffPanel projectId={id} onHasContent={setDiffHasContent} />
+        </Section>
+      </div>
 
       <Section
         title="Findings"
@@ -421,6 +412,94 @@ export function ProjectDetail() {
   );
 }
 
+function ProjectHeader({ project, inScopeCount, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [nameValue, setNameValue] = useState(project.name);
+  const [platformValue, setPlatformValue] = useState(project.platform);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  function startEditing() {
+    setNameValue(project.name);
+    setPlatformValue(project.platform);
+    setErr(null);
+    setEditing(true);
+  }
+
+  async function save() {
+    if (!nameValue.trim()) {
+      setErr("Name can't be empty.");
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const patch = {};
+      if (nameValue.trim() !== project.name) patch.name = nameValue.trim();
+      if (platformValue !== project.platform) patch.platform = platformValue;
+      if (Object.keys(patch).length > 0) {
+        await api.updateProject(project.id, patch);
+        await onSaved();
+      }
+      setEditing(false);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (editing) {
+    return (
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            type="text"
+            value={nameValue}
+            onChange={(e) => setNameValue(e.target.value)}
+            className="input"
+            style={{ fontSize: 18, fontWeight: 500, maxWidth: 320 }}
+            autoFocus
+          />
+          <select value={platformValue} onChange={(e) => setPlatformValue(e.target.value)} className="input">
+            {Object.entries(PLATFORM_LABEL).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <button className="btn btn-primary" onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+          <button className="btn" onClick={() => setEditing(false)} disabled={saving}>
+            Cancel
+          </button>
+        </div>
+        {err && <p style={{ color: "var(--status-fail)", fontSize: 13, margin: "6px 0 0" }}>{err}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div className="eyebrow" style={{ marginBottom: 4 }}>
+        {platformLabel(project.platform)} target
+      </div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <h1 style={{ fontSize: 22, fontWeight: 500, margin: "0 0 4px" }}>{project.name}</h1>
+        <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>#{project.id}</span>
+        <button className="btn" onClick={startEditing} style={{ padding: "3px 9px", fontSize: 11 }}>
+          Edit
+        </button>
+      </div>
+      <p style={{ color: "var(--text-muted)", fontSize: 13, margin: 0 }}>
+        {platformLabel(project.platform)} · {inScopeCount} in-scope target
+        {inScopeCount === 1 ? "" : "s"} · Created {formatDate(project.created_at)}
+      </p>
+    </div>
+  );
+}
+
 function ScanHistorySection({ projectId }) {
   const [expanded, setExpanded] = useState(false);
   const [runs, setRuns] = useState(null);
@@ -439,7 +518,7 @@ function ScanHistorySection({ projectId }) {
   }
 
   return (
-    <div className="ops-panel" data-label="Scan history" style={{ marginBottom: 24, padding: "20px 20px 18px" }}>
+    <div className="ops-panel" data-label="Scan history" style={{ marginBottom: 16, padding: "14px 18px 12px" }}>
       <button className="btn" onClick={toggle}>
         {expanded ? "Hide" : "Show"} scan history{runs !== null ? ` (${runs.length})` : ""}
       </button>
@@ -467,7 +546,7 @@ function ScanHistorySection({ projectId }) {
 
 function Section({ title, aside, children }) {
   return (
-    <div className="ops-panel" data-label={title} style={{ marginBottom: 24, padding: "20px 20px 18px" }}>
+    <div className="ops-panel" data-label={title} style={{ marginBottom: 16, padding: "14px 18px 12px" }}>
       {aside && (
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
           {aside}

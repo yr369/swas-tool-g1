@@ -28,6 +28,7 @@ from . import checkpoint, database, gate, logic_hunter, pipeline, readiness, sco
 from .models import (
     Project,
     ProjectCreate,
+    ProjectUpdate,
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
@@ -556,6 +557,47 @@ async def get_project(project_id: int):
         )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    return dict(row)
+
+
+@app.patch("/api/projects/{project_id}", response_model=Project)
+async def update_project(project_id: int, payload: ProjectUpdate):
+    """
+    Renames a project and/or moves it to a different platform/folder.
+    Doesn't touch scope, findings, or scan history - this is metadata
+    only, for the case where a program's listing changes name or a
+    target turns out to belong to a different platform than first
+    entered.
+    """
+    if payload.name is None and payload.platform is None:
+        raise HTTPException(status_code=400, detail="Provide at least one of name or platform")
+    if payload.name is not None and not payload.name.strip():
+        raise HTTPException(status_code=400, detail="name can't be empty")
+
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        await conn.execute(
+            """
+            UPDATE projects
+            SET name = COALESCE($2, name), platform = COALESCE($3, platform)
+            WHERE id = $1
+            """,
+            project_id, payload.name, payload.platform,
+        )
+        row = await conn.fetchrow(
+            """
+            SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
+                   p.next_scheduled_scan_at, p.created_at,
+                   (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
+            FROM projects p WHERE p.id = $1
+            """,
+            project_id,
+        )
     return dict(row)
 
 

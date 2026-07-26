@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { SeverityBadge } from "./FindingsList";
 
-export function DiffPanel({ projectId }) {
+export function DiffPanel({ projectId, onHasContent }) {
   const [diff, setDiff] = useState(null);
   const [status, setStatus] = useState("loading"); // loading | ready | insufficient | error
   const [errorMessage, setErrorMessage] = useState(null);
@@ -22,9 +22,11 @@ export function DiffPanel({ projectId }) {
         if (cancelled) return;
         setDiff(result);
         setStatus("ready");
+        onHasContent?.(result.new_findings.length > 0 || result.resolved_findings.length > 0);
       })
       .catch((err) => {
         if (cancelled) return;
+        onHasContent?.(false);
         // The backend returns 400 specifically for "not enough scans yet" -
         // that's an expected state here, not a real error, so it gets its
         // own quiet message rather than the red error banner.

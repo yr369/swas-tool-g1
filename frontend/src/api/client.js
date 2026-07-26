@@ -35,6 +35,7 @@ export const api = {
   // Projects
   listProjects: () => request("/projects"),
   getProject: (id) => request(`/projects/${id}`),
+  updateProject: (id, payload) => request(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   createProject: (name, platform) =>
     request("/projects", { method: "POST", body: JSON.stringify({ name, platform }) }),
   bulkProjectAction: (projectIds, action) =>

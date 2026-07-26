@@ -63,6 +63,16 @@ export function ScopeManager({ projectId, scope, onChange }) {
             {bulkRescanning ? "Starting…" : `Rescan selected (${selected.size})`}
           </button>
         )}
+        {expanded && !addingSingle && (
+          <button onClick={() => setAddingSingle(true)} style={secondaryButtonStyle}>
+            + Add target
+          </button>
+        )}
+        {expanded && !addingBulk && (
+          <button onClick={() => setAddingBulk(true)} style={secondaryButtonStyle}>
+            + Bulk import targets
+          </button>
+        )}
         {expanded && bulkResult && (
           <span style={{ fontSize: 12, color: bulkResult.failed.length ? "var(--sev-medium)" : "var(--status-success)" }}>
             {bulkResult.started} started
@@ -71,6 +81,31 @@ export function ScopeManager({ projectId, scope, onChange }) {
           </span>
         )}
       </div>
+
+      {expanded && (addingSingle || addingBulk) && (
+        <div style={{ marginBottom: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {addingSingle && (
+            <SingleAddForm
+              projectId={projectId}
+              onDone={() => {
+                setAddingSingle(false);
+                onChange();
+              }}
+              onCancel={() => setAddingSingle(false)}
+            />
+          )}
+          {addingBulk && (
+            <BulkAddForm
+              projectId={projectId}
+              onDone={() => {
+                setAddingBulk(false);
+                onChange();
+              }}
+              onCancel={() => setAddingBulk(false)}
+            />
+          )}
+        </div>
+      )}
 
       {expanded && (
         <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", overflow: "hidden" }}>
@@ -91,37 +126,6 @@ export function ScopeManager({ projectId, scope, onChange }) {
           )}
         </div>
       )}
-
-      <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {addingSingle ? (
-          <SingleAddForm
-            projectId={projectId}
-            onDone={() => {
-              setAddingSingle(false);
-              onChange();
-            }}
-            onCancel={() => setAddingSingle(false)}
-          />
-        ) : (
-          <button onClick={() => setAddingSingle(true)} style={secondaryButtonStyle}>
-            + Add target
-          </button>
-        )}
-        {addingBulk ? (
-          <BulkAddForm
-            projectId={projectId}
-            onDone={() => {
-              setAddingBulk(false);
-              onChange();
-            }}
-            onCancel={() => setAddingBulk(false)}
-          />
-        ) : (
-          <button onClick={() => setAddingBulk(true)} style={secondaryButtonStyle}>
-            + Bulk import targets
-          </button>
-        )}
-      </div>
     </div>
   );
 }

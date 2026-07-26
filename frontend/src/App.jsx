@@ -5,6 +5,7 @@ import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Dashboard } from "./pages/Dashboard";
 import { SignatureStats } from "./pages/SignatureStats";
+import { ScheduledScans } from "./pages/ScheduledScans";
 import { CommandPalette } from "./components/CommandPalette";
 import { Sidebar } from "./components/Sidebar";
 import { ShortcutsModal } from "./components/ShortcutsModal";
@@ -28,7 +29,7 @@ function Shell() {
       if (gPending.current) {
         gPending.current = false;
         clearTimeout(gTimer.current);
-        const dest = { p: "/", d: "/dashboard", s: "/signatures", n: "/new" }[e.key.toLowerCase()];
+        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new" }[e.key.toLowerCase()];
         if (dest) {
           e.preventDefault();
           navigate(dest);
@@ -59,12 +60,12 @@ function Shell() {
   }, [navigate]);
 
   return (
-    <div style={{ minHeight: "100%", display: "flex" }}>
+    <div style={{ height: "100vh", display: "flex", overflow: "hidden" }}>
       <CommandPalette />
       {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
       <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
 
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0 }}>
         <header
           style={{
             borderBottom: "1px solid var(--border)",
@@ -72,6 +73,7 @@ function Shell() {
             display: "flex",
             alignItems: "center",
             justifyContent: "flex-end",
+            flexShrink: 0,
           }}
         >
           <div style={{ display: "flex", gap: 8 }}>
@@ -89,14 +91,17 @@ function Shell() {
           </div>
         </header>
 
-        <main style={{ flex: 1, padding: "32px 28px", maxWidth: 960, width: "100%", margin: "0 auto" }}>
-          <Routes>
-            <Route path="/" element={<ProjectList />} />
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/signatures" element={<SignatureStats />} />
-            <Route path="/new" element={<NewProject />} />
-            <Route path="/projects/:id" element={<ProjectDetail />} />
-          </Routes>
+        <main style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "24px 24px" }}>
+          <div style={{ maxWidth: 960, margin: "0 auto" }}>
+            <Routes>
+              <Route path="/" element={<ProjectList />} />
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/scheduled" element={<ScheduledScans />} />
+              <Route path="/signatures" element={<SignatureStats />} />
+              <Route path="/new" element={<NewProject />} />
+              <Route path="/projects/:id" element={<ProjectDetail />} />
+            </Routes>
+          </div>
         </main>
       </div>
     </div>

@@ -129,7 +129,7 @@ export function ProjectList() {
         </div>
       ) : (
         <>
-          <div className="ops-panel" data-label="STATUS" style={{ padding: "18px 20px", marginBottom: 20 }}>
+          <div className="ops-panel" data-label="STATUS" style={{ padding: "12px 18px", marginBottom: 14 }}>
             <Donut segments={donutSegments} centerLabel="projects by status" />
           </div>
 
