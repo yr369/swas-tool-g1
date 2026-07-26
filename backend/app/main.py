@@ -49,6 +49,7 @@ from .models import (
     FindingWithProject,
     FindingBulkStatusRequest,
     FindingBulkStatusResult,
+    ReportDraft,
     PhaseRun,
     ScanRun,
     OutcomeLogRequest,
@@ -1763,6 +1764,117 @@ async def export_findings_csv(project_id: int):
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"]
 
 
+_IMPACT_TEMPLATES = {
+    "critical": "If exploited, this could allow an attacker to fully compromise the affected system, "
+                "access or modify sensitive data at scale, or take actions with the highest level of "
+                "privilege available in this application.",
+    "high": "If exploited, this could allow an attacker to access or modify sensitive data, escalate "
+            "privileges, or otherwise significantly impact the confidentiality, integrity, or "
+            "availability of the affected system.",
+    "medium": "If exploited, this could allow an attacker to access limited sensitive data or "
+              "otherwise negatively impact users of the affected system, typically requiring specific "
+              "conditions or user interaction.",
+    "low": "The direct impact is limited, but this weakens the overall security posture of the "
+           "affected system and may be combined with other issues for greater effect.",
+    "info": "No direct security impact on its own, but worth documenting as a hardening opportunity "
+            "or as supporting evidence for a related finding.",
+}
+
+# Coarse, substring-matched starting points - not exhaustive, just enough
+# that the operator is editing a real first draft instead of a blank
+# textarea. vuln_type strings vary by detector, so this matches loosely.
+_REMEDIATION_HINTS = [
+    (("sql injection", "sqli"), "Use parameterized queries / prepared statements for all database "
+                                  "access; never build SQL via string concatenation with user input."),
+    (("xss", "cross-site scripting"), "Encode output for the destination context (HTML, attribute, "
+                                        "JS, URL) and apply a restrictive Content-Security-Policy."),
+    (("ssrf",), "Validate and allowlist outbound destinations server-side; block requests to "
+                 "internal/link-local address ranges and cloud metadata endpoints."),
+    (("idor", "broken access control", "authorization"), "Enforce object-level authorization checks "
+                                                            "server-side on every request, not just in the UI."),
+    (("xxe", "xml external entity"), "Disable external entity resolution and DTD processing in the "
+                                       "XML parser."),
+    (("open redirect",), "Validate redirect targets against an allowlist rather than trusting a "
+                          "user-supplied URL parameter."),
+    (("cache poisoning",), "Ensure cache keys account for every header/parameter that changes the "
+                             "response, and strip or normalize unkeyed inputs before they reach the origin."),
+    (("subdomain takeover",), "Remove the dangling DNS record, or reclaim the resource at the "
+                                "third-party provider before an attacker can."),
+    (("exposed", "disclosure", "misconfiguration"), "Restrict access to this resource (authentication, "
+                                                       "network ACL, or removal from the public-facing "
+                                                       "deployment) and rotate any credentials it exposed."),
+]
+
+
+def _guess_remediation(vuln_type: str) -> str:
+    lowered = vuln_type.lower()
+    for keywords, hint in _REMEDIATION_HINTS:
+        if any(k in lowered for k in keywords):
+            return hint
+    return "Describe the specific fix once confirmed - generally: validate/sanitize the relevant " \
+           "input server-side and apply the principle of least privilege to the affected component."
+
+
+@app.get("/api/findings/{finding_id}/report-draft", response_model=ReportDraft)
+async def get_report_draft(finding_id: int):
+    """
+    A structured starting draft for ONE finding, for the Report Builder.
+    Deliberately per-finding rather than per-project - most programs
+    want one report per vulnerability, not a bundled dump (that's what
+    GET /projects/{id}/report.md is for, as an overview/backup).
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT f.id, f.severity, f.tool_name, f.vuln_type, f.evidence, f.triage_reasoning,
+                   f.project_id, st.target,
+                   p.name AS project_name, p.platform AS project_platform
+            FROM findings f
+            JOIN scope_targets st ON st.id = f.target_id
+            JOIN projects p ON p.id = f.project_id
+            WHERE f.id = $1
+            """,
+            finding_id,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    sev = row["severity"] if row["severity"] in _SEVERITY_ORDER else "unknown"
+    title = f"{row['vuln_type']} on {row['target']}"
+    summary = (
+        row["triage_reasoning"].strip()
+        if row["triage_reasoning"]
+        else f"A {sev} severity {row['vuln_type']} issue was identified on {row['target']}, "
+             f"detected via {row['tool_name']}."
+    )
+    steps = (
+        f"1. Navigate to / send a request to: {row['target']}\n"
+        f"2. (describe the exact request/action that triggers the issue)\n"
+        f"3. Observe: (describe the vulnerable behavior)\n"
+        f"\nSee evidence below for the raw output that supports this."
+    )
+    impact = _IMPACT_TEMPLATES.get(sev, _IMPACT_TEMPLATES["info"])
+    remediation = _guess_remediation(row["vuln_type"])
+
+    return {
+        "finding_id": row["id"],
+        "title": title,
+        "severity": sev,
+        "vuln_type": row["vuln_type"],
+        "tool_name": row["tool_name"],
+        "target": row["target"],
+        "project_id": row["project_id"],
+        "project_name": row["project_name"],
+        "platform": row["project_platform"],
+        "summary": summary,
+        "steps_to_reproduce": steps,
+        "impact": impact,
+        "remediation": remediation,
+        "evidence": row["evidence"],
+    }
+
+
 @app.get("/api/projects/{project_id}/report.md")
 async def generate_markdown_report(project_id: int):
     """
@@ -1841,7 +1953,7 @@ async def generate_markdown_report(project_id: int):
             lines.append(f"### {sev.title()} ({len(rows_for_sev)})")
             lines.append("")
             for f in rows_for_sev:
-                lines.append(f"- **{f['target']}** â€” `{f['tool_name']}` / {f['vuln_type']} _{f['status']}_")
+                lines.append(f"- **{f['target']}** — `{f['tool_name']}` / {f['vuln_type']} _{f['status']}_")
                 if f["evidence"]:
                     # Indent so it renders as a nested code block under
                     # the bullet, rather than breaking out to top level.

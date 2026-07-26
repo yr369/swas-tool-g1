@@ -264,6 +264,9 @@ export function TriageQueue() {
                   <button className="btn" onClick={() => decide("submitted")} disabled={actingId === current.id}>
                     Mark submitted <span className="kbd" style={{ marginLeft: 4 }}>S</span>
                   </button>
+                  <Link to={`/report/${current.id}`} className="btn" style={{ textDecoration: "none" }}>
+                    Build report
+                  </Link>
                 </div>
               </>
             )}

@@ -7,6 +7,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { SignatureStats } from "./pages/SignatureStats";
 import { ScheduledScans } from "./pages/ScheduledScans";
 import { TriageQueue } from "./pages/TriageQueue";
+import { ReportBuilder } from "./pages/ReportBuilder";
 import { CommandPalette } from "./components/CommandPalette";
 import { Sidebar } from "./components/Sidebar";
 import { ShortcutsModal } from "./components/ShortcutsModal";
@@ -21,7 +22,7 @@ function Shell() {
   // The triage queue is a split-pane workspace, not a document - it
   // wants the full main area, not the ~960px reading-width column
   // every other page uses.
-  const isFullBleed = location.pathname === "/triage";
+  const isFullBleed = location.pathname === "/triage" || location.pathname.startsWith("/report/");
 
   useEffect(() => {
     function isTypingTarget(el) {
@@ -106,6 +107,7 @@ function Shell() {
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/scheduled" element={<ScheduledScans />} />
               <Route path="/triage" element={<TriageQueue />} />
+              <Route path="/report/:findingId" element={<ReportBuilder />} />
               <Route path="/signatures" element={<SignatureStats />} />
               <Route path="/new" element={<NewProject />} />
               <Route path="/projects/:id" element={<ProjectDetail />} />

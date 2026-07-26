@@ -258,6 +258,30 @@ class FindingBulkStatusResult(BaseModel):
     updated: list[int]
 
 
+class ReportDraft(BaseModel):
+    """
+    A structured starting point for a single-finding submission report -
+    fields the operator edits in the Report Builder before copying/
+    downloading. Pre-filled from what triage already collected
+    (evidence, reasoning, severity) rather than left blank, but every
+    field is meant to be edited, not submitted verbatim.
+    """
+    finding_id: int
+    title: str
+    severity: str
+    vuln_type: str
+    tool_name: str
+    target: str
+    project_id: int
+    project_name: str
+    platform: PlatformType
+    summary: str
+    steps_to_reproduce: str
+    impact: str
+    remediation: str
+    evidence: Optional[str] = None
+
+
 # ---------- Scope parsing (AI-assisted intake) ----------
 
 class ScopeParseRequest(BaseModel):

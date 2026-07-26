@@ -10,6 +10,7 @@
  */
 
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { Donut } from "./charts/Donut";
 
@@ -266,6 +267,9 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
             <button onClick={handleCheckReadiness} disabled={checkingReadiness} style={smallButtonStyle}>
               {checkingReadiness ? "Checking…" : "Check submission readiness"}
             </button>
+            <Link to={`/report/${finding.id}`} style={{ ...smallButtonStyle, textDecoration: "none", display: "inline-block" }}>
+              Build report
+            </Link>
           </div>
 
           {triageResult ? (
