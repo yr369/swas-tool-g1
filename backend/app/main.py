@@ -24,11 +24,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import os
 
-from . import checkpoint, database, gate, logic_hunter, pipeline, readiness, scope_parser, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, scope_parser, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
     ProjectUpdate,
+    AuthPolicy,
+    AuthSessionMeta,
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
@@ -600,6 +602,37 @@ async def update_project(project_id: int, payload: ProjectUpdate):
             project_id,
         )
     return dict(row)
+
+
+# ---------- Authenticated / multi-account testing ----------
+# Web-facing surface over auth_policy.py / auth_sessions.py. Every rule
+# (default-deny, encryption at rest, never returning a decrypted secret)
+# is already enforced in those modules - these routes are a thin,
+# deliberately narrow pass-through, not a new place for logic.
+
+# ---------- Authenticated / multi-account testing (read-only) ----------
+# auth_cli.py is explicit and deliberate that approving a project and
+# handling session credentials stays CLI-only - this box is on the
+# public internet with no login layer in front of the API, and this is
+# the one feature whose entire point is protecting real bug-bounty
+# account credentials. Adding a write path here would undo that
+# decision for no real gain. What WAS missing is any way to even see
+# the current status without SSHing in - these two read-only routes
+# fix that without touching the write-path decision at all.
+
+@app.get("/api/projects/{project_id}/auth-policy", response_model=AuthPolicy)
+async def get_auth_policy(project_id: int):
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        return await auth_policy.get_policy(conn, project_id)
+
+
+@app.get("/api/projects/{project_id}/auth-sessions", response_model=List[AuthSessionMeta])
+async def list_auth_sessions(project_id: int):
+    """Metadata only - matches auth_sessions.list_sessions exactly, never a credential value."""
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        return await auth_sessions.list_sessions(conn, project_id)
 
 
 @app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)

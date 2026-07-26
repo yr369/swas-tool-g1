@@ -300,6 +300,8 @@ export function ProjectDetail() {
 
       <ScanHistorySection projectId={id} />
 
+      <AuthTestingSection projectId={id} />
+
       <Section title="Scope">
         <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
       </Section>
@@ -496,6 +498,86 @@ function ProjectHeader({ project, inScopeCount, onSaved }) {
         {platformLabel(project.platform)} · {inScopeCount} in-scope target
         {inScopeCount === 1 ? "" : "s"} · Created {formatDate(project.created_at)}
       </p>
+    </div>
+  );
+}
+
+function AuthTestingSection({ projectId }) {
+  const [expanded, setExpanded] = useState(false);
+  const [policy, setPolicy] = useState(null);
+  const [sessions, setSessions] = useState(null);
+  const [err, setErr] = useState(null);
+
+  async function toggle() {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && policy === null) {
+      try {
+        const [p, s] = await Promise.all([api.getAuthPolicy(projectId), api.listAuthSessions(projectId)]);
+        setPolicy(p);
+        setSessions(s);
+      } catch (e) {
+        setErr(e.message);
+      }
+    }
+  }
+
+  const statusColor = { approved: "var(--status-success)", denied: "var(--status-fail)", unset: "var(--text-muted)" };
+
+  return (
+    <div className="ops-panel" data-label="Authenticated testing" style={{ marginBottom: 16, padding: "14px 18px 12px" }}>
+      <button className="btn" onClick={toggle}>
+        {expanded ? "Hide" : "Show"} status
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 14 }}>
+          {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
+          {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
+          {policy && (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: statusColor[policy.status] }}>
+                  {policy.status.toUpperCase()}
+                </span>
+                {policy.set_by && (
+                  <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                    by {policy.set_by} on {formatDate(policy.set_at)}
+                  </span>
+                )}
+              </div>
+              {policy.policy_note && (
+                <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 12px" }}>{policy.policy_note}</p>
+              )}
+
+              <div className="eyebrow" style={{ marginBottom: 6 }}>
+                Sessions ({sessions?.length ?? 0})
+              </div>
+              {sessions && sessions.length === 0 && (
+                <p style={{ fontSize: 13, color: "var(--text-muted)" }}>None registered.</p>
+              )}
+              {sessions && sessions.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+                  {sessions.map((s) => (
+                    <div key={s.session_name} style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                      <span className="mono">{s.session_name}</span> ({s.session_type})
+                      {s.last_used_at && <> · last used {formatDate(s.last_used_at)}</>}
+                      {s.notes && <> · {s.notes}</>}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <p style={{ fontSize: 12, color: "var(--text-muted)", borderTop: "1px solid var(--border)", paddingTop: 10, margin: 0 }}>
+                Approval and session credentials are managed via <code className="mono">auth_cli.py</code> over SSH,
+                not from here - deliberately, since this box has no login layer in front of the API and this is the
+                one feature that handles real account credentials. Run{" "}
+                <code className="mono">python3 -m app.auth_cli status --project-id {projectId}</code> or{" "}
+                <code className="mono">approve</code>/<code className="mono">add-session</code> on the OCI box.
+              </p>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

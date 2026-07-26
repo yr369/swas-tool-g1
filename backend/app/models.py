@@ -47,6 +47,29 @@ class ProjectUpdate(BaseModel):
     platform: Optional[PlatformType] = None
 
 
+# ---------- Authenticated / multi-account testing ----------
+# Read-only web-facing surface over auth_policy.py / auth_sessions.py.
+# Approving a project and creating/deleting sessions stays CLI-only by
+# deliberate design (see auth_cli.py's docstring) - this only exposes
+# visibility into current status, nothing that can move a project out
+# of default-deny or handle a credential.
+
+class AuthPolicy(BaseModel):
+    status: Literal["unset", "approved", "denied"]
+    policy_note: Optional[str] = None
+    set_by: Optional[str] = None
+    set_at: Optional[datetime] = None
+
+
+class AuthSessionMeta(BaseModel):
+    session_name: str
+    session_type: Literal["cookie", "bearer_token", "header"]
+    header_name: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+
+
 class Project(BaseModel):
     id: int
     name: str
