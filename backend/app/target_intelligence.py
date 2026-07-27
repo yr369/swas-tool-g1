@@ -34,6 +34,7 @@ should cost SWAS a missed optimization, never a missed finding or a
 crashed scan. Same fail-open philosophy as gate.py.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -327,3 +328,112 @@ def order_target_rows(rows: list) -> list:
     tied on priority.
     """
     return sorted(rows, key=lambda r: compute_payout_priority(r.get("reward_range")), reverse=True)
+
+
+# ---------------------------------------------------------------------
+# 5. Rescan / freshness triggers
+# ---------------------------------------------------------------------
+
+def compute_surface_fingerprint(live_hosts: list[str], tech_stack: dict[str, list[str]]) -> str:
+    """
+    A stable hash of "what does this target's attack surface look
+    like" - the live host set plus the union of detected tech. Deliberately
+    coarse (not per-endpoint-content hashing, which would churn on every
+    scan from dynamic pages and defeat the purpose) - this is meant to
+    catch real structural change: a new subdomain went live, a WAF got
+    added, the stack was upgraded (e.g. PHP -> a new framework) -
+    not "the homepage's timestamp changed."
+    """
+    tech_flat = sorted({t for techs in tech_stack.values() for t in techs})
+    signature = "|".join(sorted(live_hosts)) + "||" + ",".join(tech_flat)
+    return hashlib.sha256(signature.encode("utf-8")).hexdigest()
+
+
+async def check_and_reset_on_change(
+    conn: asyncpg.Connection, target_id: int, live_hosts: list[str], tech_stack: dict[str, list[str]],
+) -> bool:
+    """
+    Compares this scan's surface fingerprint to the last stored one.
+    On a genuine change (not the first-ever scan, which has nothing to
+    compare against) resets this target's finding_clusters back to
+    'pending' for both logic_hunter and triage - the same re-hunt
+    mechanism pipeline.py already uses when a cluster gets a brand new
+    member finding (see _upsert_finding_cluster), just triggered by
+    surface drift instead of a new finding. Returns True if a reset
+    happened, False otherwise (including on the first-ever scan, where
+    there's deliberately no reset - nothing to be "stale" relative to).
+    """
+    new_fp = compute_surface_fingerprint(live_hosts, tech_stack)
+    try:
+        old_fp = await conn.fetchval(
+            "SELECT surface_fingerprint FROM target_intelligence WHERE target_id = $1", target_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO target_intelligence (target_id, surface_fingerprint)
+            VALUES ($1, $2)
+            ON CONFLICT (target_id) DO UPDATE SET
+                surface_fingerprint = EXCLUDED.surface_fingerprint, updated_at = now()
+            """,
+            target_id, new_fp,
+        )
+        if old_fp is not None and old_fp != new_fp:
+            await conn.execute(
+                """
+                UPDATE finding_clusters
+                SET logic_hunter_status = 'pending', triage_status = 'pending', updated_at = now()
+                WHERE target_id = $1
+                """,
+                target_id,
+            )
+            logger.info(
+                "target_intelligence: surface changed for target_id=%s - clusters reset to pending for re-hunt",
+                target_id,
+            )
+            return True
+        return False
+    except Exception as exc:
+        logger.warning("target_intelligence: fingerprint check failed for target_id=%s: %s", target_id, exc)
+        return False
+
+
+# ---------------------------------------------------------------------
+# 6. Human-in-the-loop checkpoints
+# ---------------------------------------------------------------------
+
+# Findings at/above this severity that triage marked as likely to be
+# accepted are worth a real-time alert, not just sitting in the queue
+# until someone happens to check the dashboard.
+_ALERT_SEVERITIES = ("critical", "high")
+
+
+async def get_unalerted_high_value_findings(conn: asyncpg.Connection, project_id: int) -> list[dict]:
+    """
+    Returns triaged findings in this project that are high-value
+    (severity critical/high AND likely_program_outcome='accepted') and
+    haven't been alerted on yet (alerted_at IS NULL). Callers should
+    mark them alerted via mark_alerted() right after sending the
+    notification, so the same finding never double-alerts on a later
+    scan pass.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT f.id, f.target_id, st.target, f.tool_name, f.vuln_type, f.severity, f.triage_reasoning
+        FROM findings f
+        JOIN scope_targets st ON st.id = f.target_id
+        WHERE f.project_id = $1
+          AND f.severity = ANY($2::text[])
+          AND f.likely_program_outcome = 'accepted'
+          AND f.alerted_at IS NULL
+        """,
+        project_id, list(_ALERT_SEVERITIES),
+    )
+    return [dict(r) for r in rows]
+
+
+async def mark_alerted(conn: asyncpg.Connection, finding_ids: list[int]) -> None:
+    if not finding_ids:
+        return
+    await conn.execute(
+        "UPDATE findings SET alerted_at = now() WHERE id = ANY($1::int[])", finding_ids,
+    )

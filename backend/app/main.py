@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, scope_parser, target_intelligence, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, target_intelligence, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -1231,6 +1231,48 @@ async def triage_one_finding(finding_id: int):
         )
 
     return {"finding_id": finding_id, "signature": signature, **result}
+
+
+@app.post("/api/findings/{finding_id}/report-draft")
+async def draft_finding_report(finding_id: int):
+    """
+    Generates a platform-tailored report draft for an already-triaged
+    finding (#11 on the roadmap). Requires the finding to have a real
+    severity already (not 'unknown') - report drafting reasons FROM the
+    triage judgment, it doesn't replace it, so drafting before triage
+    would just be asking the model to guess twice. This is explicitly a
+    DRAFT (see report_writer.py) - review before submitting anywhere.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        finding = await conn.fetchrow(
+            """
+            SELECT f.id, f.tool_name, f.vuln_type, f.severity, f.evidence,
+                   f.triage_reasoning, st.target, p.platform
+            FROM findings f
+            JOIN scope_targets st ON st.id = f.target_id
+            JOIN projects p ON p.id = f.project_id
+            WHERE f.id = $1
+            """,
+            finding_id,
+        )
+        if finding is None:
+            raise HTTPException(status_code=404, detail="Finding not found")
+        if finding["severity"] in (None, "unknown"):
+            raise HTTPException(
+                status_code=400,
+                detail="Finding hasn't been triaged yet - run /triage first so there's a real severity to draft a report against.",
+            )
+
+        result = await report_writer.draft_report(
+            platform=finding["platform"], target=finding["target"], vuln_type=finding["vuln_type"],
+            severity=finding["severity"], evidence=finding["evidence"] or "",
+            triage_reasoning=finding["triage_reasoning"],
+        )
+        if "error" in result:
+            raise HTTPException(status_code=502, detail=f"Report drafting failed: {result['error']}")
+
+    return {"finding_id": finding_id, **result}
 
 
 async def _fetch_signature_stats(conn, signature: str) -> dict | None:

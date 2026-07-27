@@ -322,7 +322,7 @@ async def _execute_phase(
             await _phase_triage(conn, project_id)
 
     elif phase_name == "notify":
-        await _phase_notify(target)
+        await _phase_notify(pool, project_id, target)
 
     else:
         raise ValueError(f"Unknown phase: {phase_name}")
@@ -458,6 +458,15 @@ async def _phase_probe(
         "probe: %d live hosts, %d historical URLs for %s",
         len(live_hosts), len(discovered_urls), target,
     )
+
+    # Rescan/freshness trigger (#14): compare this scan's live-host +
+    # tech-stack fingerprint to the last one seen. A real change (new
+    # host went live, stack changed) resets this target's clusters back
+    # to 'pending' so logic_hunter/triage re-examine it with fresh eyes,
+    # instead of relying solely on "a new finding showed up" to trigger
+    # a re-hunt.
+    async with pool.acquire() as conn:
+        await target_intelligence.check_and_reset_on_change(conn, target_id, live_hosts, tech_stack)
 
 
 async def _phase_fuzz(pool: asyncpg.Pool, target_id: int, live_hosts: list[str], params_found: dict[str, bool]) -> None:
@@ -2630,10 +2639,23 @@ async def _phase_triage(conn: asyncpg.Connection, project_id: int) -> None:
     )
 
 
-async def _phase_notify(target: str) -> None:
+async def _phase_notify(pool: asyncpg.Pool, project_id: int, target: str) -> None:
     """
     Best-effort notification. A failure here should not be treated as a
     pipeline failure - it's a courtesy, not a critical step.
+
+    Human-in-the-loop checkpoint (#13): before (or regardless of) the
+    generic "scan completed" message, checks for any high-value finding
+    in this PROJECT (severity critical/high, triage says likely
+    accepted) that hasn't been alerted on yet, and sends one immediate,
+    specific notification per finding. This runs at the project level,
+    not just this target, because notify is the last phase per-target
+    but findings from a sibling target in the same project may have
+    finished triage moments earlier - checking the whole project each
+    time a target reaches notify means nothing waits longer than one
+    target's worth of phases to get flagged. mark_alerted ensures the
+    same finding is never announced twice across multiple targets'
+    notify phases landing close together.
 
     Phase 1 has no notification destination configured yet (no Slack/
     Discord webhook, etc.) - rather than calling the notify tool and
@@ -2645,6 +2667,20 @@ async def _phase_notify(target: str) -> None:
     if not os.environ.get("NOTIFY_WEBHOOK_URL"):
         logger.info("notify: skipped (no notification destination configured yet)")
         return
+
+    async with pool.acquire() as conn:
+        high_value = await target_intelligence.get_unalerted_high_value_findings(conn, project_id)
+        for f in high_value:
+            alert_msg = (
+                f"[HIGH VALUE] {f['severity'].upper()} {f['vuln_type']} on {f['target']} "
+                f"({f['tool_name']}) - triage says likely accepted. {f.get('triage_reasoning') or ''}"
+            )
+            alert_result = await tools.run_notify(alert_msg[:1000])
+            if not alert_result.success:
+                logger.info("notify: high-value alert failed for finding_id=%s: %s", f["id"], alert_result.error)
+        if high_value:
+            await target_intelligence.mark_alerted(conn, [f["id"] for f in high_value])
+            logger.info("notify: sent %d high-value alert(s) for project_id=%s", len(high_value), project_id)
 
     result = await tools.run_notify(f"Scan completed for {target}")
     if not result.success:

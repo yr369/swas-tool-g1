@@ -25,6 +25,7 @@ to guess.
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger("swas.tools")
@@ -178,6 +179,81 @@ def looks_like_real_output(result: ToolResult, min_length: int = 1) -> bool:
     return result.success and len(result.stdout.strip()) >= min_length
 
 
+# ---------------------------------------------------------------------
+# Adaptive WAF/rate-limit backoff
+# ---------------------------------------------------------------------
+#
+# Plain-language: a human hunter who gets a 429 or a Cloudflare
+# challenge page backs off and slows down instead of hammering the
+# same request again immediately. Most of this codebase's tools were
+# either fully successful or fully failed with no middle ground - this
+# adds that middle ground: detect the specific signals that mean "the
+# target is blocking us, not that the request itself was wrong", and
+# retry with real delay instead of treating it as a normal failure or
+# (worse) a normal empty result.
+
+_BLOCK_SIGNALS = [
+    re.compile(r"\b429\b"),
+    re.compile(r"rate[ -]?limit", re.IGNORECASE),
+    re.compile(r"access denied", re.IGNORECASE),
+    re.compile(r"request blocked", re.IGNORECASE),
+    re.compile(r"cloudflare", re.IGNORECASE),
+    re.compile(r"attention required", re.IGNORECASE),  # Cloudflare challenge title
+    re.compile(r"checking your browser", re.IGNORECASE),
+    re.compile(r"\bcaptcha\b", re.IGNORECASE),
+    re.compile(r"akamai", re.IGNORECASE),
+    re.compile(r"incapsula", re.IGNORECASE),
+]
+
+
+def looks_blocked(result: ToolResult) -> bool:
+    """
+    Heuristic only - false positives just cost an extra backoff-retry
+    (cheap), false negatives just mean this specific block goes
+    untreated as one (same as before this existed). Checks stdout AND
+    stderr since some tools (curl-based ones) put the response body in
+    stdout while others surface HTTP status only in stderr/logs.
+    """
+    haystack = f"{result.stdout}\n{result.stderr}"
+    return any(pattern.search(haystack) for pattern in _BLOCK_SIGNALS)
+
+
+async def run_tool_with_backoff(
+    tool_name: str,
+    args: list[str],
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = 3,
+    base_delay_seconds: float = 5.0,
+) -> ToolResult:
+    """
+    Same contract as run_tool, but if the output looks like a WAF/
+    rate-limit block (see looks_blocked), retries with exponential
+    backoff (base_delay * 2**attempt, so 5s/10s/20s by default) instead
+    of returning the blocked result as-is. Gives up after max_retries
+    and returns the last (blocked) result - callers should still treat
+    a returned blocked-looking result as a real signal worth recording
+    via target_intelligence.record_technique_outcome(..., outcome=
+    "blocked_by_waf"), not silently retry forever.
+
+    Does NOT retry on ordinary failures (timeout, non-zero exit with no
+    block signal, binary not found) - those are real errors, retrying
+    them blindly would just waste time. Backoff is specifically for the
+    "the target is actively pushing back" case.
+    """
+    result = await run_tool(tool_name, args, timeout_seconds=timeout_seconds)
+    attempt = 0
+    while looks_blocked(result) and attempt < max_retries:
+        delay = base_delay_seconds * (2 ** attempt)
+        logger.warning(
+            "%s looks blocked (WAF/rate-limit) - backing off %.0fs before retry %d/%d",
+            tool_name, delay, attempt + 1, max_retries,
+        )
+        await asyncio.sleep(delay)
+        result = await run_tool(tool_name, args, timeout_seconds=timeout_seconds)
+        attempt += 1
+    return result
+
+
 # ---------- Specific tool wrappers ----------
 # Each of these is a thin, readable wrapper so the pipeline orchestrator
 # can call run_subfinder(domain) instead of remembering raw CLI flags.
@@ -214,7 +290,7 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
     if header := _research_header():
         header_flags = ["-H", header]
 
-    return await run_tool(
+    return await run_tool_with_backoff(
         "httpx",
         # -td: tech-detect, fingerprints the tech stack (server, CMS,
         # frameworks) in one pass. -json: structured output so we can
@@ -325,7 +401,7 @@ async def run_nuclei(target: str) -> ToolResult:
     if min_severity.strip():
         args += ["-severity", min_severity.strip()]
 
-    return await run_tool("nuclei", args, timeout_seconds=300)
+    return await run_tool_with_backoff("nuclei", args, timeout_seconds=300)
 
 
 async def run_dalfox(url: str) -> ToolResult:
