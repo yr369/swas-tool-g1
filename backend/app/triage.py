@@ -287,11 +287,11 @@ async def triage_project_findings(conn, project_id: int) -> int:
     findings always got, without you needing to remember to click
     anything. Returns the number of findings triaged.
     """
-    from . import vrt as vrt_module
+    from . import target_intelligence, vrt as vrt_module
 
     rows = await conn.fetch(
         """
-        SELECT id, tool_name, vuln_type, evidence FROM findings
+        SELECT id, target_id, tool_name, vuln_type, evidence FROM findings
         WHERE project_id = $1 AND severity = 'unknown' AND gate_status != 'failed'
         """,
         project_id,
@@ -326,6 +326,31 @@ async def triage_project_findings(conn, project_id: int) -> int:
             result.get("confidence"),
             row["id"],
         )
+
+        # Close the loop: what triage decided about this signature on
+        # THIS target feeds back into target_intelligence so later
+        # logic_hunter reasoning and (once #3 in the roadmap builds on
+        # this) scan-technique selection can see it. Fails soft - a
+        # broken write here costs an optimization, never the triage
+        # result itself, which is already committed above.
+        if row["target_id"]:
+            await target_intelligence.record_technique_outcome(
+                conn, row["target_id"], signature, outcome or "unknown",
+                note=result.get("reasoning"),
+            )
+            if result.get("severity") in ("critical", "high", "medium") and outcome == "accepted":
+                surface_summary = await conn.fetchrow(
+                    "SELECT tech_stack_union FROM attack_surface_summary WHERE target_id = $1",
+                    row["target_id"],
+                )
+                tech_signature = target_intelligence.normalize_tech_signature(
+                    surface_summary["tech_stack_union"] if surface_summary else None
+                )
+                if tech_signature:
+                    await target_intelligence.record_cross_target_pattern(
+                        conn, project_id, row["vuln_type"], tech_signature, row["target_id"],
+                        note=f"triaged {result.get('severity')}, accepted: {(result.get('reasoning') or '')[:200]}",
+                    )
         triaged += 1
 
     return triaged

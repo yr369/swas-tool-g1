@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, tools, triage, verify
+from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, target_intelligence, tools, triage, verify
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -112,6 +112,21 @@ async def run_target_pipeline(
     target must never crash or block the rest of the queue.
     """
     logger.info("Starting pipeline for target_id=%s (%s)", target_id, target)
+
+    # Attack persona: a short AI-written plan for what to prioritize on
+    # THIS target (see target_intelligence.py). Generated once per
+    # target and reused on every later scan - failures here are
+    # swallowed (returns None) since a missing persona just means
+    # logic_hunter reasons without it, same fail-open pattern as gate.py.
+    async with pool.acquire() as conn:
+        target_row = await conn.fetchrow(
+            "SELECT target_type, reward_range FROM scope_targets WHERE id = $1", target_id,
+        )
+        if target_row:
+            await target_intelligence.get_or_generate_persona(
+                conn, target_id, target,
+                target_row["target_type"], reward_range=target_row["reward_range"],
+            )
 
     discovered_subdomains: list[str] = []
     live_hosts: list[str] = []

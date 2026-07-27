@@ -53,7 +53,7 @@ import os
 
 from google import genai
 
-from . import agent_loop
+from . import agent_loop, target_intelligence
 from .gemini_rotation import generate_with_rotation
 
 logger = logging.getLogger("swas.logic_hunter")
@@ -109,7 +109,10 @@ def _parse_hunter_response(text: str) -> dict:
     return json.loads(text)
 
 
-async def hunt_cluster(target_name: str, target_type: str | None, members: list[dict], surface_summary: dict | None = None) -> dict:
+async def hunt_cluster(
+    target_name: str, target_type: str | None, members: list[dict],
+    surface_summary: dict | None = None, extra_context: str = "",
+) -> dict:
     """
     members: rows with tool_name, vuln_type, severity, evidence, source
     (severity may still be 'unknown' - logic_hunter runs before triage,
@@ -120,6 +123,13 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
     target on its first scan, or scans predating this feature) - in
     that case the prompt says so plainly rather than silently omitting
     the section, so the model doesn't need to guess why it's missing.
+
+    extra_context: pre-formatted text from target_intelligence.py -
+    this target's attack persona, what's already been tried on it, and
+    hints from other targets in the same project sharing its tech
+    stack (see hunt_project). Appended to surface_context rather than
+    given its own prompt section, since it's the same kind of "context
+    to reason from, not a finding to repeat" material.
     """
     client = _get_client()
     findings_block = "\n".join(
@@ -138,6 +148,7 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
         )
     else:
         surface_context = "No attack-surface data recorded yet for this target - reason from the findings below alone."
+    surface_context += extra_context
     prompt = _LOGIC_HUNTER_PROMPT.format(
         target_name=target_name, target_type=target_type or "website",
         surface_context=surface_context, findings_block=findings_block,
@@ -218,7 +229,8 @@ async def _upsert_surface_endpoints(conn, target_id: int, endpoints: list[dict])
 
 
 async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: str,
-                            target_type: str | None, cluster_id: int, result: dict) -> int | None:
+                            target_type: str | None, cluster_id: int, result: dict,
+                            tech_signature: str | None = None) -> int | None:
     """
     Saves a logic_hunter hypothesis the same way pipeline._save_finding
     saves everything else (severity='unknown', goes through triage
@@ -270,6 +282,18 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
         cluster_id, finding_id,
     )
     await _upsert_surface_endpoints(conn, target_id, investigation["endpoints_touched"])
+
+    vuln_type = result.get("vuln_type") or "business_logic_hypothesis"
+    await target_intelligence.record_technique_outcome(
+        conn, target_id, technique=f"logic_hunter:{vuln_type}",
+        outcome="hypothesis_saved", note=investigation.get("summary", "")[:200],
+    )
+    if tech_signature:
+        await target_intelligence.record_cross_target_pattern(
+            conn, project_id, vuln_type, tech_signature, target_id,
+            note=f"logic_hunter hypothesis (confidence={confidence:.2f}): {(result['hypothesis'] or '')[:200]}",
+        )
+
     return finding_id
 
 
@@ -308,16 +332,36 @@ async def hunt_project(conn, project_id: int) -> int:
         surface_summary = await conn.fetchrow(
             "SELECT * FROM attack_surface_summary WHERE target_id = $1", row["target_id"],
         )
+        tech_signature = target_intelligence.normalize_tech_signature(
+            surface_summary["tech_stack_union"] if surface_summary else None
+        )
+
+        # Adaptiveness context: this target's attack persona, what's
+        # already been tried on it, and hints from sibling targets in
+        # the same project sharing its tech stack - see
+        # target_intelligence.py. Each call fails soft to "" so a
+        # broken lookup never blocks the hunt itself.
+        extra_context = ""
+        persona = await conn.fetchval(
+            "SELECT persona FROM target_intelligence WHERE target_id = $1", row["target_id"],
+        )
+        if persona:
+            extra_context += f"\nAttack persona for this target: {persona}\n"
+        extra_context += await target_intelligence.format_technique_notes(conn, row["target_id"])
+        extra_context += await target_intelligence.format_cross_target_context(
+            conn, project_id, tech_signature, exclude_target_id=row["target_id"],
+        )
 
         if members:
             result = await hunt_cluster(
                 row["target_name"], row["target_type"], [dict(m) for m in members],
                 dict(surface_summary) if surface_summary else None,
+                extra_context=extra_context,
             )
             if result.get("has_hypothesis") and result.get("hypothesis"):
                 finding_id = await _save_hypothesis(
                     conn, project_id, row["target_id"], row["target_name"], row["target_type"],
-                    row["cluster_id"], result,
+                    row["cluster_id"], result, tech_signature,
                 )
                 hunted += 1
                 logger.info(

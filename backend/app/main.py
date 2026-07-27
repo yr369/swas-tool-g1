@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, scope_parser, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, scope_parser, target_intelligence, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -121,9 +121,14 @@ async def _trigger_scan_for_project(project_id: int) -> dict:
             )
 
         targets = await conn.fetch(
-            "SELECT id, target FROM scope_targets WHERE project_id = $1 AND in_scope = true",
+            "SELECT id, target, reward_range FROM scope_targets WHERE project_id = $1 AND in_scope = true",
             project_id,
         )
+        # Highest-payout targets first: with MAX_CONCURRENT_TARGET_SCANS
+        # bounding concurrency, order determines which targets actually
+        # get worked on first rather than sitting in the queue behind
+        # lower-value ones. See target_intelligence.compute_payout_priority.
+        targets = target_intelligence.order_target_rows(targets)
 
         if not targets:
             raise HTTPException(
