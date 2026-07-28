@@ -437,3 +437,50 @@ async def mark_alerted(conn: asyncpg.Connection, finding_ids: list[int]) -> None
     await conn.execute(
         "UPDATE findings SET alerted_at = now() WHERE id = ANY($1::int[])", finding_ids,
     )
+
+
+# ---------------------------------------------------------------------
+# 7. Tech-driven technique selection (#1)
+# ---------------------------------------------------------------------
+#
+# Deliberately rule-based, not an LLM call: httpx -td already gives a
+# concrete, reliable signal (detected tech per host) at zero extra
+# cost, and this runs on every single host in scan phase - the right
+# lever is the same one pipeline.py's own comment already pointed at
+# ("we deliberately do NOT use tech_stack to skip/steer tools yet -
+# that's a real future optimization"). An LLM call per host here would
+# be slow and expensive for a decision this mechanical.
+
+_TECH_TAG_MAP: dict[str, str] = {
+    "wordpress": "wordpress,cms", "wp-": "wordpress,cms",
+    "drupal": "drupal,cms", "joomla": "joomla,cms",
+    "graphql": "graphql", "jenkins": "jenkins",
+    "elastic": "elasticsearch", "kibana": "kibana", "grafana": "grafana",
+    "jira": "atlassian", "confluence": "atlassian", "gitlab": "gitlab",
+    "iis": "iis", "aws": "cloud", "azure": "cloud", "gcp": "cloud",
+    "docker": "docker", "kubernetes": "kubernetes", "k8s": "kubernetes",
+    "jboss": "jboss", "tomcat": "tomcat", "weblogic": "weblogic",
+    "sharepoint": "sharepoint", "magento": "magento", "shopify": "shopify",
+}
+
+
+def select_nuclei_tags_for_host(tech_list: list[str] | None) -> str | None:
+    """
+    Turns detected tech (from httpx -td) into an ADDITIVE nuclei -tags
+    value for THIS host, on top of the broad default scan every host
+    already gets - a WordPress host and a bare custom-API host get a
+    different scanning style, not the same generic sweep. Returns None
+    if nothing in the tech list matched anything meaningful; caller
+    keeps the default broad scan in that case (this never NARROWS
+    coverage, only adds to it, so a miss here costs nothing beyond
+    "no extra emphasis this pass").
+    """
+    if not tech_list:
+        return None
+    matched: set[str] = set()
+    for tech in tech_list:
+        tech_lower = tech.lower()
+        for key, tags in _TECH_TAG_MAP.items():
+            if key in tech_lower:
+                matched.update(tags.split(","))
+    return ",".join(sorted(matched)) if matched else None

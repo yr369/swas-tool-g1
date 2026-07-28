@@ -510,13 +510,11 @@ async def _phase_scan(
     spec that avoids wasting time running injection tools against hosts
     with nothing to inject into.
 
-    tech_stack (from probe's httpx -td) is logged here for visibility -
-    knowing "this host runs Apache 2.4.7" alongside its findings is
-    useful context. We deliberately do NOT use it to skip tools yet
-    (e.g. "no CMS detected, skip CMS-specific templates") - that's a
-    real future optimization, but doing it safely needs care about which
-    detections are reliable enough to gate on. The proven params_found
-    check above stays as the sole gating logic for now.
+    tech_stack (from probe's httpx -td) is used here to steer nuclei's
+    -tags per host (see target_intelligence.select_nuclei_tags_for_host)
+    - a detected CMS/platform adds relevant template categories on top
+    of the broad default sweep, instead of every host getting the exact
+    same generic scan regardless of what it actually runs.
     """
     for host in live_hosts[:10]:  # Phase 1: cap scope for the first working version
         if tech_stack.get(host):
@@ -524,7 +522,8 @@ async def _phase_scan(
 
         _log_aem_pivot_hint(host, tech_stack.get(host, []))
 
-        nuclei_result = await tools.run_nuclei(host)
+        nuclei_tags = target_intelligence.select_nuclei_tags_for_host(tech_stack.get(host))
+        nuclei_result = await tools.run_nuclei(host, include_tags=nuclei_tags)
         if tools.looks_like_real_output(nuclei_result):
             await _save_nuclei_findings_pooled(pool, project_id, target_id, nuclei_result.stdout)
 

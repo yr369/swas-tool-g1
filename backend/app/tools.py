@@ -224,6 +224,7 @@ async def run_tool_with_backoff(
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     max_retries: int = 3,
     base_delay_seconds: float = 5.0,
+    mutate_args_fn=None,
 ) -> ToolResult:
     """
     Same contract as run_tool, but if the output looks like a WAF/
@@ -239,19 +240,75 @@ async def run_tool_with_backoff(
     block signal, binary not found) - those are real errors, retrying
     them blindly would just waste time. Backoff is specifically for the
     "the target is actively pushing back" case.
+
+    mutate_args_fn (#4 - technique mutation on failure): optional
+    `(attempt: int, base_args: list[str]) -> list[str]` called before
+    each retry to actually vary the request instead of just waiting
+    longer and repeating the exact same thing that got blocked - the
+    same instinct a human hunter has ("that got blocked, let me try a
+    different rate/UA/encoding") rather than just hoping a longer wait
+    fixes it. If None, retries replay the original args unchanged
+    (backoff-only, same as before this parameter existed) - existing
+    call sites that don't pass this keep their exact prior behavior.
     """
     result = await run_tool(tool_name, args, timeout_seconds=timeout_seconds)
     attempt = 0
     while looks_blocked(result) and attempt < max_retries:
         delay = base_delay_seconds * (2 ** attempt)
+        retry_args = mutate_args_fn(attempt, args) if mutate_args_fn else args
         logger.warning(
-            "%s looks blocked (WAF/rate-limit) - backing off %.0fs before retry %d/%d",
+            "%s looks blocked (WAF/rate-limit) - backing off %.0fs before retry %d/%d%s",
             tool_name, delay, attempt + 1, max_retries,
+            " (with mutated args)" if mutate_args_fn else "",
         )
         await asyncio.sleep(delay)
-        result = await run_tool(tool_name, args, timeout_seconds=timeout_seconds)
+        result = await run_tool(tool_name, retry_args, timeout_seconds=timeout_seconds)
         attempt += 1
     return result
+
+
+# A small, genuinely different set of User-Agent strings for mutation
+# retries - not trying to impersonate anything deceptive, just varying
+# a fingerprint that some WAF rules key on. Real browser UAs, publicly
+# common, nothing exotic.
+_UA_ROTATION = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+]
+
+
+def nuclei_mutation(attempt: int, base_args: list[str]) -> list[str]:
+    """
+    Mutation strategy for nuclei retries (#4): each retry lowers the
+    request rate (-rl) further and rotates the User-Agent, since
+    nuclei's default rate is the most common trigger for a WAF's
+    automated-traffic rule. Strips any -rl/-H User-Agent this function
+    added on a previous attempt before adding this attempt's version,
+    so retries don't stack duplicate flags.
+    """
+    args = [a for a in base_args if a not in ("-rl",) ]
+    # remove a prior mutation's rate-limit value and UA header pair if present
+    cleaned = []
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "-rl":
+            skip_next = True
+            continue
+        cleaned.append(a)
+    rate = max(1, 10 - attempt * 3)  # 10 -> 7 -> 4 req/s across retries
+    ua = _UA_ROTATION[attempt % len(_UA_ROTATION)]
+    return cleaned + ["-rl", str(rate), "-H", f"User-Agent: {ua}"]
+
+
+def httpx_mutation(attempt: int, base_args: list[str]) -> list[str]:
+    """Same idea as nuclei_mutation but for httpx-pd's -rate-limit flag."""
+    rate = max(1, 20 - attempt * 6)
+    ua = _UA_ROTATION[attempt % len(_UA_ROTATION)]
+    return base_args + ["-rate-limit", str(rate), "-H", f"User-Agent: {ua}"]
 
 
 # ---------- Specific tool wrappers ----------
@@ -299,6 +356,7 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
         # downstream gets this info instead of re-detecting on its own.
         ["httpx-pd", "-silent", "-td", "-json"] + target_flags + header_flags,
         timeout_seconds=120,
+        mutate_args_fn=httpx_mutation,
     )
 
 
@@ -371,7 +429,7 @@ _DEFAULT_NUCLEI_EXCLUDE_TAGS = "ssl,tls"
 _DEFAULT_NUCLEI_MIN_SEVERITY = "low,medium,high,critical,unknown"
 
 
-async def run_nuclei(target: str) -> ToolResult:
+async def run_nuclei(target: str, include_tags: str | None = None) -> ToolResult:
     """
     Runs template-based vulnerability scanning against a target.
 
@@ -388,6 +446,18 @@ async def run_nuclei(target: str) -> ToolResult:
     categories we never want regardless of severity (SSL/TLS), -severity
     catches the broad "this is recon, not a finding" tier regardless of
     category. Both configurable via env, same override pattern.
+
+    include_tags (#1 - per-target technique adaptiveness): an ADDITIVE
+    -tags value derived from THIS host's detected tech stack (see
+    target_intelligence.select_nuclei_tags_for_host) - e.g. a detected
+    WordPress site adds "wordpress,cms" template categories on top of
+    the broad default sweep, while a bare custom-API host adds nothing
+    and just gets the default. This is the mechanism that makes SWAS
+    change its scanning style per target instead of running the exact
+    same sweep against everything - the tech-stack model already
+    existed, this is what actually reads from it (see the comment in
+    pipeline.py's old _phase_scan explaining this was deliberately
+    deferred until it could be done safely).
     """
     args = ["nuclei", "-u", target, "-silent", "-no-color"]
     if header := _research_header():
@@ -401,7 +471,10 @@ async def run_nuclei(target: str) -> ToolResult:
     if min_severity.strip():
         args += ["-severity", min_severity.strip()]
 
-    return await run_tool_with_backoff("nuclei", args, timeout_seconds=300)
+    if include_tags:
+        args += ["-tags", include_tags]
+
+    return await run_tool_with_backoff("nuclei", args, timeout_seconds=300, mutate_args_fn=nuclei_mutation)
 
 
 async def run_dalfox(url: str) -> ToolResult:

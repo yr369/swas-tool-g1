@@ -85,6 +85,30 @@ own actual severity, don't inflate it just because AEM was mentioned.
 """
 
 
+_ADVERSARIAL_PROMPT = """You are reviewing a security finding that has ALREADY been triaged as \
+real and worth reporting. Your ONLY job is to argue the STRONGEST possible case that this is \
+actually a false positive, non-exploitable, or not something a program would pay for - even if \
+you have to work to find that angle. Be a skeptic, not a rubber stamp.
+
+Tool: {tool_name}
+Evidence:
+---
+{evidence}
+---
+Triage's severity: {severity}
+Triage's reasoning: {reasoning}
+
+Respond with ONLY a JSON object, no other text, no markdown fences:
+{{"counter_argument": "the strongest case this is a false positive or non-issue, one to two sentences - if you genuinely can't find a good one after trying, say so explicitly rather than inventing a weak one", "counter_argument_is_strong": true or false, "revised_confidence": 0.0-1.0}}
+
+"counter_argument_is_strong" should be true only if the counter-argument would genuinely change \
+a human reviewer's mind on a second look - not just "there's always some uncertainty." \
+"revised_confidence" is your own confidence that the ORIGINAL triage verdict (real, reportable) \
+still holds after considering your own counter-argument - this can be lower than triage's original \
+confidence if your counter-argument is compelling, or the same if it isn't.
+"""
+
+
 def build_signature(tool_name: str, vuln_type: str, target_type: str = "website") -> str:
     """
     Builds the stable pattern key used to look up past outcomes - e.g.
@@ -233,6 +257,53 @@ async def triage_finding(
     return result
 
 
+# ---------------------------------------------------------------------
+# Adversarial skeptic pass (#7)
+# ---------------------------------------------------------------------
+#
+# Plain-language: triage_finding() above already reasons carefully, but
+# it's reasoning in one direction - "is this real". This runs a SEPARATE
+# call whose only job is to argue the opposite side, the way a second,
+# more paranoid reviewer would look at the same evidence. It only fires
+# for findings that are ABOUT to sail through as solid (medium+ severity,
+# confidence >= 0.7) - that's specifically where a rubber-stamp failure
+# mode would be most costly (a bad "high, confident" verdict wastes a
+# report; a bad "info, confident" verdict just under-reports, which is
+# safer to leave alone). Gating on confidence/severity like this also
+# controls cost - most findings never earn a second LLM call.
+_ADVERSARIAL_MIN_SEVERITY = ("medium", "high", "critical")
+_ADVERSARIAL_MIN_CONFIDENCE = 0.7
+
+
+def qualifies_for_adversarial_review(severity: str, confidence: float) -> bool:
+    return severity in _ADVERSARIAL_MIN_SEVERITY and confidence >= _ADVERSARIAL_MIN_CONFIDENCE
+
+
+async def adversarial_review(tool_name: str, evidence: str, severity: str, reasoning: str) -> dict:
+    """
+    Returns {"counter_argument": str, "counter_argument_is_strong": bool,
+    "revised_confidence": float, "model_used": str}. On any failure,
+    returns a no-op result (counter_argument_is_strong=False, confidence
+    unchanged) rather than raising - a broken skeptic pass should never
+    block or downgrade a finding that triage already stood behind; it
+    should just fail open exactly like gate.py and fp_filter.py do.
+    """
+    client = _get_client()
+    prompt = _ADVERSARIAL_PROMPT.format(
+        tool_name=tool_name, evidence=evidence[:2000], severity=severity, reasoning=reasoning or "",
+    )
+    try:
+        response, model_used = await generate_with_rotation(client, prompt, preferred_model=_CHEAP_MODEL)
+        result = json.loads((response.text or "").strip().strip("`").removeprefix("json").strip())
+        result["model_used"] = model_used
+        result.setdefault("counter_argument_is_strong", False)
+        result.setdefault("revised_confidence", 1.0)
+        return result
+    except Exception as exc:
+        logger.warning("Adversarial review failed, keeping original triage verdict unchanged: %s", exc)
+        return {"counter_argument": "", "counter_argument_is_strong": False, "revised_confidence": 1.0, "model_used": "none"}
+
+
 # detective.py findings get saved with severity='unknown' (same as every
 # other finding) plus their own self-assessed severity embedded at the
 # front of the evidence text, in this format. See pipeline.py's
@@ -309,6 +380,24 @@ async def triage_project_findings(conn, project_id: int) -> int:
             outcome_stats=outcome_stats, vrt_entries=vrt_entries,
             self_declared_severity=self_declared_severity,
         )
+
+        # Adversarial skeptic pass (#7): only for findings about to sail
+        # through as solid, since that's where a rubber-stamp mistake
+        # costs the most. A strong counter-argument lowers confidence
+        # and gets appended to the reasoning shown to you - it does NOT
+        # change the severity/outcome verdict itself, since this pass
+        # argues against a finding on purpose and shouldn't get the
+        # final word on its own.
+        if qualifies_for_adversarial_review(result.get("severity", ""), result.get("confidence", 0.0)):
+            review = await adversarial_review(
+                row["tool_name"], clean_evidence, result["severity"], result.get("reasoning", ""),
+            )
+            if review.get("counter_argument_is_strong"):
+                result["confidence"] = min(result.get("confidence", 1.0), review.get("revised_confidence", 1.0))
+                result["reasoning"] = (
+                    f"{result.get('reasoning', '')} [Skeptic review: {review['counter_argument']}]"
+                )
+
         outcome = result.get("likely_program_outcome")
         await conn.execute(
             """
