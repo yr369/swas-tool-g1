@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { BrowserRouter, Routes, Route, useLocation, useNavigate } from "react-router-dom";
 import { ProjectList } from "./pages/ProjectList";
+import { Chronology } from "./pages/Chronology";
 import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Dashboard } from "./pages/Dashboard";
@@ -36,7 +37,7 @@ function Shell() {
       if (gPending.current) {
         gPending.current = false;
         clearTimeout(gTimer.current);
-        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new", t: "/triage" }[
+        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new", t: "/triage", h: "/chronology" }[
           e.key.toLowerCase()
         ];
         if (dest) {
@@ -104,6 +105,7 @@ function Shell() {
           <div style={isFullBleed ? { height: "100%" } : { maxWidth: 960, margin: "0 auto" }}>
             <Routes>
               <Route path="/" element={<ProjectList />} />
+              <Route path="/chronology" element={<Chronology />} />
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/scheduled" element={<ScheduledScans />} />
               <Route path="/triage" element={<TriageQueue />} />

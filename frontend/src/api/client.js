@@ -34,6 +34,7 @@ async function request(path, options = {}) {
 export const api = {
   // Projects
   listProjects: () => request("/projects"),
+  listChronology: () => request("/projects/chronology"),
   getProject: (id) => request(`/projects/${id}`),
   getAuthPolicy: (id) => request(`/projects/${id}/auth-policy`),
   listAuthSessions: (id) => request(`/projects/${id}/auth-sessions`),

@@ -549,6 +549,60 @@ async def list_projects():
     return [dict(row) for row in rows]
 
 
+@app.get("/api/projects/chronology")
+async def project_chronology():
+    """
+    Every project, ranked by most recent activity - not creation date.
+    "Activity" is whichever of these happened most recently: the
+    project was created, a target was added, the whole project was
+    (re)scanned, or a single target was rescanned. This is what powers
+    the sidebar's Chronology view: the project you touched five minutes
+    ago sits at the top, not buried under whatever was created first.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.id, p.name, p.platform, p.status, p.created_at,
+                   COUNT(st.id) AS target_count,
+                   COUNT(*) FILTER (WHERE st.target LIKE '*.%') AS wildcard_count,
+                   MAX(st.created_at) AS last_target_added_at,
+                   (SELECT st2.target FROM scope_targets st2 WHERE st2.project_id = p.id
+                        ORDER BY st2.created_at DESC LIMIT 1) AS latest_target_added,
+                   MAX(st.last_scanned_at) AS last_target_scan_at,
+                   (SELECT st3.target FROM scope_targets st3 WHERE st3.project_id = p.id
+                        ORDER BY st3.last_scanned_at DESC NULLS LAST LIMIT 1) AS latest_scanned_target,
+                   (SELECT MAX(sr.started_at) FROM scan_runs sr WHERE sr.project_id = p.id) AS last_project_scan_at,
+                   (SELECT COUNT(*) FROM scan_runs sr WHERE sr.project_id = p.id) AS scan_run_count
+            FROM projects p
+            LEFT JOIN scope_targets st ON st.project_id = p.id
+            GROUP BY p.id
+            """
+        )
+
+    items = []
+    for row in rows:
+        r = dict(row)
+        candidates = [
+            ("created", r["created_at"]),
+            ("target_added", r["last_target_added_at"]),
+            ("scanned", r["last_project_scan_at"]),
+            ("target_rescanned", r["last_target_scan_at"]),
+        ]
+        candidates = [(k, v) for k, v in candidates if v is not None]
+        activity_type, activity_at = max(candidates, key=lambda kv: kv[1])
+        items.append({
+            "id": r["id"], "name": r["name"], "platform": r["platform"], "status": r["status"],
+            "target_count": r["target_count"], "wildcard_count": r["wildcard_count"],
+            "scan_run_count": r["scan_run_count"],
+            "activity_type": activity_type, "activity_at": activity_at,
+            "latest_target_added": r["latest_target_added"],
+            "latest_scanned_target": r["latest_scanned_target"],
+        })
+    items.sort(key=lambda x: x["activity_at"], reverse=True)
+    return items
+
+
 @app.get("/api/projects/{project_id}", response_model=Project)
 async def get_project(project_id: int):
     pool = database.get_pool()

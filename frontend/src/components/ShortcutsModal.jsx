@@ -3,6 +3,7 @@ const GROUPS = [
     title: "Navigate",
     items: [
       ["G then P", "Projects"],
+      ["G then H", "Chronology"],
       ["G then T", "Triage queue"],
       ["G then D", "Dashboard"],
       ["G then C", "Scheduled scans"],

@@ -69,6 +69,7 @@ export function CommandPalette() {
       { id: "action:scheduled", label: "Scheduled scans", hint: "Go to", go: () => navigate("/scheduled") },
       { id: "action:signatures", label: "Signature stats", hint: "Go to", go: () => navigate("/signatures") },
       { id: "action:projects", label: "All projects", hint: "Go to", go: () => navigate("/") },
+      { id: "action:chronology", label: "Chronology", hint: "Go to", go: () => navigate("/chronology") },
     ],
     [navigate]
   );
