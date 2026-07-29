@@ -2002,7 +2002,7 @@ async def get_outcome_trend(project_id: int, weeks: int = 12):
                    COUNT(*) FILTER (WHERE fo.outcome = 'accepted') AS accepted
             FROM finding_outcomes fo
             JOIN findings f ON f.id = fo.finding_id
-            WHERE f.project_id = $1 AND fo.recorded_at >= now() - ($2 || ' weeks')::interval
+            WHERE f.project_id = $1 AND fo.recorded_at >= now() - ($2 * interval '1 week')
             GROUP BY week
             ORDER BY week ASC
             """,
