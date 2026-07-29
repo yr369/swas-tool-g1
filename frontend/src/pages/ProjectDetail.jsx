@@ -6,6 +6,8 @@ import { FindingsList } from "../components/FindingsList";
 import { ScanNotesPanel } from "../components/ScanNotesPanel";
 import { DiffPanel } from "../components/DiffPanel";
 import { ScopeManager } from "../components/ScopeManager";
+import { ScopeInsights } from "../components/ScopeInsights";
+import { OutcomeTrend } from "../components/OutcomeTrend";
 import { PLATFORM_LABEL, platformLabel } from "../constants";
 
 // Fallback polling interval, used ONLY when the WebSocket isn't
@@ -303,8 +305,11 @@ export function ProjectDetail() {
       <AuthTestingSection projectId={id} />
 
       <Section title="Scope">
+        <ScopeInsights projectId={id} />
         <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
       </Section>
+
+      <OutcomeTrend projectId={id} />
 
       <div style={{ display: diffHasContent ? "block" : "none" }}>
         <Section title="Changes since last scan">

@@ -130,3 +130,29 @@ async def parse_scope_text(platform: str, raw_text: str) -> list[ParsedScopeItem
         )
 
     return items
+
+
+# ---------------------------------------------------------------------
+# Wildcard overlap detection
+# ---------------------------------------------------------------------
+
+def find_covering_wildcard(existing_targets: list[str], candidate: str) -> str | None:
+    """
+    Returns the existing wildcard target (e.g. "*.example.com") that
+    already covers `candidate` (e.g. "api.example.com"), or None. Only
+    checks candidate-covered-by-existing-wildcard, not the reverse (a
+    newly added wildcard covering older exact-host entries) - that
+    direction is rarer in practice (people paste a wildcard once, up
+    front) and adding it would mean re-checking the whole scope on
+    every wildcard add, which isn't worth the cost for how often it'd
+    actually fire.
+    """
+    c = candidate.strip().lower()
+    for existing in existing_targets:
+        e = existing.strip().lower()
+        if not e.startswith("*.") or e == c:
+            continue
+        suffix = e[1:]  # ".example.com"
+        if c.endswith(suffix) or c == e[2:]:
+            return existing
+    return None

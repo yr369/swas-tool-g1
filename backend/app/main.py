@@ -16,15 +16,15 @@ import csv
 import io
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, target_intelligence, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -279,6 +279,115 @@ async def _scheduler_loop() -> None:
         await asyncio.sleep(60)
 
 
+# #4: daily activity digest. In-memory "last sent" tracker is fine for
+# the same reason the scheduler loop's in-memory state is fine - single
+# process, no --workers flag. A restart just means today's digest might
+# fire again if it's still the target hour, which is harmless (worst
+# case: one duplicate digest after a redeploy).
+_digest_last_sent_date: str | None = None
+
+
+async def _send_daily_digest() -> None:
+    global _digest_last_sent_date
+    digest_hour = int(os.environ.get("DIGEST_HOUR_UTC", "8"))
+    now = datetime.now(timezone.utc)
+    today_str = now.date().isoformat()
+    if now.hour != digest_hour or _digest_last_sent_date == today_str:
+        return
+    if not os.environ.get("NOTIFY_WEBHOOK_URL"):
+        return
+
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        new_findings = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE severity IN ('critical', 'high')) AS high_value
+            FROM findings WHERE created_at >= now() - interval '24 hours'
+            """
+        )
+        scans_run = await conn.fetchval(
+            "SELECT COUNT(*) FROM scan_runs WHERE started_at >= now() - interval '24 hours'"
+        )
+        stale_flags = await conn.fetchval(
+            "SELECT COUNT(*) FROM scan_notes WHERE check_name = 'stale_project' AND NOT dismissed "
+            "AND created_at >= now() - interval '24 hours'"
+        )
+
+    msg = (
+        f"[DAILY DIGEST] {new_findings['total']} new finding(s) in the last 24h "
+        f"({new_findings['high_value']} critical/high) · {scans_run} scan(s) run · "
+        f"{stale_flags} project(s) newly flagged stale"
+    )
+    result = await tools.run_notify(msg)
+    if not result.success:
+        logger.info("daily digest send failed (non-fatal): %s", result.error)
+    _digest_last_sent_date = today_str
+
+
+async def _digest_loop() -> None:
+    logger.info("daily digest loop started (checks hourly)")
+    while True:
+        try:
+            await _send_daily_digest()
+        except Exception:
+            logger.exception("digest loop iteration failed - will retry in 1h")
+        await asyncio.sleep(3600)
+
+
+# #6: flag (not auto-archive) projects with no recent activity. Reuses
+# scan_notes - the same dismissable-note mechanism already shown in the
+# UI for scan-quality issues - rather than inventing a new notification
+# surface. "Activity" here means the same signal Chronology uses:
+# created, target added, project scanned, or target rescanned.
+async def _flag_stale_projects() -> None:
+    stale_days = int(os.environ.get("STALE_PROJECT_DAYS", "30"))
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT p.id, p.name,
+                   GREATEST(
+                       p.created_at,
+                       COALESCE((SELECT MAX(created_at) FROM scope_targets WHERE project_id = p.id), p.created_at),
+                       COALESCE((SELECT MAX(last_scanned_at) FROM scope_targets WHERE project_id = p.id), p.created_at),
+                       COALESCE((SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id), p.created_at)
+                   ) AS last_activity_at
+            FROM projects p
+            WHERE p.status != 'archived'
+            """
+        )
+        for r in rows:
+            if r["last_activity_at"] >= datetime.now(timezone.utc) - timedelta(days=stale_days):
+                continue
+            already_flagged = await conn.fetchval(
+                "SELECT 1 FROM scan_notes WHERE project_id = $1 AND check_name = 'stale_project' AND NOT dismissed",
+                r["id"],
+            )
+            if already_flagged:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO scan_notes (project_id, check_name, note)
+                VALUES ($1, 'stale_project', $2)
+                """,
+                r["id"],
+                f"No activity in {stale_days}+ days (last activity {r['last_activity_at'].date().isoformat()}) - "
+                f"consider archiving if this program is done, or scanning again if it's still live.",
+            )
+            logger.info("Flagged project_id=%s (%s) as stale", r["id"], r["name"])
+
+
+async def _stale_flag_loop() -> None:
+    logger.info("stale-project flag loop started (checks daily)")
+    while True:
+        try:
+            await _flag_stale_projects()
+        except Exception:
+            logger.exception("stale-flag loop iteration failed - will retry in 24h")
+        await asyncio.sleep(86400)
+
+
 async def _enqueue_project(project_id: int, priority: bool = False) -> dict:
     """Adds a project to the scan queue instead of triggering it directly.
     Both the manual POST /scan endpoint and the scheduler loop now call
@@ -482,11 +591,15 @@ async def lifespan(app: FastAPI):
 
     scheduler_task = asyncio.create_task(_scheduler_loop())
     queue_worker_task = asyncio.create_task(_queue_worker_loop())
+    digest_task = asyncio.create_task(_digest_loop())
+    stale_flag_task = asyncio.create_task(_stale_flag_loop())
 
     yield
     # Runs once when the app shuts down (e.g. container stopping)
     scheduler_task.cancel()
     queue_worker_task.cancel()
+    digest_task.cancel()
+    stale_flag_task.cancel()
     await database.disconnect_db()
 
 
@@ -1035,6 +1148,94 @@ async def bulk_add_scope_targets(project_id: int, payload: BulkScopeTargetsCreat
     return {"created": created, "skipped_duplicates": skipped}
 
 
+@app.get("/api/projects/{project_id}/scope/overlaps")
+async def get_scope_overlaps(project_id: int):
+    """
+    #1: flags targets already covered by an existing wildcard in this
+    project's scope - e.g. adding "api.example.com" when "*.example.com"
+    is already in scope. Advisory only, never blocks adding a target
+    (a program might still want the narrower entry tracked separately
+    for its own reward_range/notes) - see scope_parser.find_covering_wildcard.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, target FROM scope_targets WHERE project_id = $1 AND in_scope = true",
+            project_id,
+        )
+    targets = [r["target"] for r in rows]
+    overlaps = []
+    for row in rows:
+        covering = scope_parser.find_covering_wildcard(targets, row["target"])
+        if covering:
+            overlaps.append({"target_id": row["id"], "target": row["target"], "covered_by": covering})
+    return overlaps
+
+
+@app.get("/api/projects/{project_id}/scope/duration-estimates")
+async def get_scope_duration_estimates(project_id: int):
+    """
+    #3: rough expected scan duration per target, based on this
+    project's own phase_runs history (falls back to a global average
+    across all projects if this specific target has never completed a
+    full run yet - a brand new target still gets a useful number
+    instead of nothing). Sums the average completed-start gap per phase
+    across the standard 9-phase pipeline.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT st.id AS target_id, st.target,
+                   COALESCE(per_target.estimated_seconds, global_avg.estimated_seconds) AS estimated_seconds
+            FROM scope_targets st
+            LEFT JOIN (
+                SELECT target_id, SUM(avg_phase_seconds) AS estimated_seconds
+                FROM (
+                    SELECT target_id, phase_name,
+                           AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) AS avg_phase_seconds
+                    FROM phase_runs
+                    WHERE status = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                    GROUP BY target_id, phase_name
+                ) per_phase
+                GROUP BY target_id
+            ) per_target ON per_target.target_id = st.id
+            CROSS JOIN (
+                SELECT SUM(avg_phase_seconds) AS estimated_seconds
+                FROM (
+                    SELECT phase_name, AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) AS avg_phase_seconds
+                    FROM phase_runs
+                    WHERE status = 'completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                    GROUP BY phase_name
+                ) global_per_phase
+            ) global_avg
+            WHERE st.project_id = $1
+            """,
+            project_id,
+        )
+    return [
+        {"target_id": r["target_id"], "target": r["target"],
+         "estimated_seconds": round(r["estimated_seconds"]) if r["estimated_seconds"] else None}
+        for r in rows
+    ]
+
+
+@app.get("/api/targets/{target_id}/screenshot")
+async def get_target_screenshot(target_id: int):
+    """
+    #7: serves the most recent screenshot captured for this target, if
+    screenshot capture is enabled and one exists (see screenshots.py).
+    404 covers both "capture is disabled" and "capture is enabled but
+    hasn't run for this target yet" - the frontend treats both the same
+    way (don't show an image), so there's no need to distinguish them
+    in the response.
+    """
+    path = screenshots.screenshot_path(target_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No screenshot available for this target")
+    return FileResponse(path, media_type="image/png")
+
+
 # ---------- Scope intake (AI-assisted parsing) ----------
 #
 # This is a two-step flow:
@@ -1287,7 +1488,7 @@ async def triage_one_finding(finding_id: int):
     return {"finding_id": finding_id, "signature": signature, **result}
 
 
-@app.post("/api/findings/{finding_id}/report-draft")
+@app.get("/api/findings/{finding_id}/report-draft")
 async def draft_finding_report(finding_id: int):
     """
     Generates a platform-tailored report draft for an already-triaged
@@ -1302,7 +1503,7 @@ async def draft_finding_report(finding_id: int):
         finding = await conn.fetchrow(
             """
             SELECT f.id, f.tool_name, f.vuln_type, f.severity, f.evidence,
-                   f.triage_reasoning, st.target, p.platform
+                   f.triage_reasoning, st.target, p.id AS project_id, p.name AS project_name, p.platform
             FROM findings f
             JOIN scope_targets st ON st.id = f.target_id
             JOIN projects p ON p.id = f.project_id
@@ -1326,7 +1527,12 @@ async def draft_finding_report(finding_id: int):
         if "error" in result:
             raise HTTPException(status_code=502, detail=f"Report drafting failed: {result['error']}")
 
-    return {"finding_id": finding_id, **result}
+    return {
+        "finding_id": finding_id, "vuln_type": finding["vuln_type"], "severity": finding["severity"],
+        "target": finding["target"], "tool_name": finding["tool_name"], "evidence": finding["evidence"],
+        "project_id": finding["project_id"], "project_name": finding["project_name"], "platform": finding["platform"],
+        **result,
+    }
 
 
 async def _fetch_signature_stats(conn, signature: str) -> dict | None:
@@ -1774,6 +1980,40 @@ async def get_finding_readiness(finding_id: int):
 
 
 # ---------- Run-to-run diff ----------
+
+@app.get("/api/projects/{project_id}/outcome-trend")
+async def get_outcome_trend(project_id: int, weeks: int = 12):
+    """
+    #2: weekly accept-rate trend for this project, so you can see
+    whether a program's actually-accepted rate is drifting up or down
+    over time, not just today's snapshot. Only counts outcomes tied to
+    a finding still linked to THIS project (finding_outcomes.finding_id
+    can be NULL after a finding is deleted - those rows are excluded
+    here since we can't attribute them to a project anymore, though
+    they're still used project-agnostically elsewhere, e.g. triage's
+    signature stats).
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT date_trunc('week', fo.recorded_at) AS week,
+                   COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE fo.outcome = 'accepted') AS accepted
+            FROM finding_outcomes fo
+            JOIN findings f ON f.id = fo.finding_id
+            WHERE f.project_id = $1 AND fo.recorded_at >= now() - ($2 || ' weeks')::interval
+            GROUP BY week
+            ORDER BY week ASC
+            """,
+            project_id, weeks,
+        )
+    return [
+        {"week": r["week"], "total": r["total"], "accepted": r["accepted"],
+         "accept_rate": round(r["accepted"] / r["total"], 3) if r["total"] else None}
+        for r in rows
+    ]
+
 
 @app.get("/api/projects/{project_id}/diff", response_model=DiffResponse)
 async def diff_latest_scans(project_id: int):

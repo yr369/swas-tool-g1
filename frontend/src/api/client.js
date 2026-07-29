@@ -50,6 +50,10 @@ export const api = {
 
   // Scope
   listScope: (projectId) => request(`/projects/${projectId}/scope`),
+  listScopeOverlaps: (projectId) => request(`/projects/${projectId}/scope/overlaps`),
+  listDurationEstimates: (projectId) => request(`/projects/${projectId}/scope/duration-estimates`),
+  getOutcomeTrend: (projectId, weeks) => request(`/projects/${projectId}/outcome-trend${weeks ? `?weeks=${weeks}` : ""}`),
+  screenshotUrl: (targetId) => `${BASE}/targets/${targetId}/screenshot`,
   addScopeTarget: (projectId, target) =>
     request(`/projects/${projectId}/scope`, { method: "POST", body: JSON.stringify(target) }),
   updateScopeTarget: (projectId, targetId, updates) =>

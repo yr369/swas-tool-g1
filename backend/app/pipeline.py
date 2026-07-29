@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, target_intelligence, tools, triage, verify
+from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -467,6 +467,13 @@ async def _phase_probe(
     # a re-hunt.
     async with pool.acquire() as conn:
         await target_intelligence.check_and_reset_on_change(conn, target_id, live_hosts, tech_stack)
+
+    # Screenshot (#7) - opt-in, see screenshots.py. One per target
+    # (the first live host is representative enough for a quick visual
+    # triage glance; capturing every discovered subdomain would be a
+    # lot of Chromium launches for marginal extra signal).
+    if screenshots.is_enabled() and live_hosts:
+        await screenshots.capture(target_id, live_hosts[0])
 
 
 async def _phase_fuzz(pool: asyncpg.Pool, target_id: int, live_hosts: list[str], params_found: dict[str, bool]) -> None:

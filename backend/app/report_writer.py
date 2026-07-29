@@ -51,7 +51,7 @@ Raw evidence:
 ---
 
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"title": "concise, specific report title", "summary": "one paragraph describing the vulnerability", "steps_to_reproduce": ["step 1", "step 2", "..."], "impact": "one paragraph on real-world impact, grounded in the evidence - do not invent impact beyond what the evidence supports", "suggested_fix": "one or two sentences, generic remediation guidance for this vuln class"}}
+{{"title": "concise, specific report title", "summary": "one paragraph describing the vulnerability", "steps_to_reproduce": ["step 1", "step 2", "..."], "impact": "one paragraph on real-world impact, grounded in the evidence - do not invent impact beyond what the evidence supports", "remediation": "one or two sentences, generic remediation guidance for this vuln class"}}
 
 Platform tone guidance: {platform_guidance}
 
@@ -117,6 +117,9 @@ async def draft_report(
     try:
         response, model_used = await generate_with_rotation(client, prompt, preferred_model=_MODEL)
         result = _parse_report_response(response.text or "")
+        steps = result.get("steps_to_reproduce")
+        if isinstance(steps, list):
+            result["steps_to_reproduce"] = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
         result["model_used"] = model_used
         return result
     except Exception as exc:
