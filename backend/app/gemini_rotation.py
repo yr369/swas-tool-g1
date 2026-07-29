@@ -31,12 +31,69 @@ is exhausted).
 import asyncio
 import logging
 import os
+import time
 
 import httpx
 from google import genai
 from google.genai import errors as genai_errors
 
 logger = logging.getLogger("swas.gemini_rotation")
+
+# Circuit breaker: generate_with_rotation() used to restart from
+# MODEL_ROTATION[0] (or preferred_model) on EVERY call, so once a model
+# hits its daily 429 quota, every subsequent call for the rest of the
+# day still burns a real request on it before rotating past it - wasted
+# latency at scale, and on a busy day it's most of the models most of
+# the time. This tracks which models are known-exhausted (per-process,
+# in-memory - resets on container restart, which is fine since a
+# restart is a reasonable point to give a model another chance anyway)
+# and skips them outright until the cooldown elapses. Default 6h: long
+# enough to stop hammering a genuinely exhausted model, short enough
+# that it doesn't stay skipped long past whenever Google's quota
+# actually resets (which isn't a fixed, documented time SWAS can rely
+# on). Override with GEMINI_MODEL_COOLDOWN_SECONDS if needed.
+_MODEL_COOLDOWN_SECONDS = int(os.environ.get("GEMINI_MODEL_COOLDOWN_SECONDS", str(6 * 3600)))
+
+_tripped_models: dict[str, float] = {}
+
+
+def _is_tripped(model: str) -> bool:
+    """True if `model` is currently in its cooldown window. Clears the
+    trip and returns False once the cooldown has elapsed, so a model
+    isn't skipped forever after one bad day."""
+    tripped_at = _tripped_models.get(model)
+    if tripped_at is None:
+        return False
+    if time.monotonic() - tripped_at >= _MODEL_COOLDOWN_SECONDS:
+        del _tripped_models[model]
+        return False
+    return True
+
+
+def _trip(model: str) -> None:
+    _tripped_models[model] = time.monotonic()
+    logger.warning(
+        "Circuit breaker: model %s quota-exhausted, skipping it for %ds (until cooldown elapses)",
+        model, _MODEL_COOLDOWN_SECONDS,
+    )
+
+
+def get_circuit_breaker_status() -> dict[str, float]:
+    """Returns {model: seconds_remaining_in_cooldown} for every
+    currently-tripped model. Used by the health dashboard; also handy
+    for debugging why rotation is jumping straight to tier-2."""
+    now = time.monotonic()
+    return {
+        model: max(0.0, _MODEL_COOLDOWN_SECONDS - (now - tripped_at))
+        for model, tripped_at in _tripped_models.items()
+        if _is_tripped(model)
+    }
+
+
+def _reset_circuit_breaker_for_tests() -> None:
+    """Test-only helper - clears all trip state. Not called from
+    production code paths."""
+    _tripped_models.clear()
 
 # Ordered cheapest/fastest -> most capable. Rotation tries them in this
 # order (starting from a caller-preferred model if given). Free-tier
@@ -208,6 +265,10 @@ async def generate_with_rotation(
     Once every Gemini model has failed, falls through to tier 2
     (DeepSeek / GLM via _TIER_2_PROVIDERS) before giving up entirely.
 
+    A model that's tripped the circuit breaker (see _trip/_is_tripped
+    above - hit a 429 recently and hasn't cleared its cooldown yet) is
+    skipped outright, without spending an attempt on it.
+
     Returns (response, model_used). Raises the last error only if every
     Gemini model AND every configured tier-2 provider has failed.
     """
@@ -217,8 +278,14 @@ async def generate_with_rotation(
         models = models[start:] + models[:start]
 
     last_error: Exception | None = None
+    any_attempted = False
 
     for model in models:
+        if _is_tripped(model):
+            logger.info("Model %s in circuit-breaker cooldown, skipping without an attempt", model)
+            continue
+
+        any_attempted = True
         for attempt in range(1, _MAX_RETRIES_PER_MODEL + 1):
             try:
                 response = client.models.generate_content(model=model, contents=prompt)
@@ -229,6 +296,7 @@ async def generate_with_rotation(
                 last_error = exc
                 if _is_quota_exhausted(exc):
                     logger.warning("Model %s quota exhausted for today, rotating to next model", model)
+                    _trip(model)
                     break
                 elif _is_transient_server_error(exc):
                     logger.warning(
@@ -243,11 +311,19 @@ async def generate_with_rotation(
                     logger.warning("Model %s failed with non-retryable error: %s", model, exc)
                     break
 
-    logger.warning("All Gemini models exhausted/failed, trying tier-2 providers: %s", models)
+    if not any_attempted:
+        logger.warning("Every Gemini model is in circuit-breaker cooldown - going straight to tier-2")
+    else:
+        logger.warning("All Gemini models exhausted/failed, trying tier-2 providers: %s", models)
 
     response, model_used = await _generate_with_tier_2(prompt)
     if response is not None:
         return response, model_used
 
+    if last_error is None:
+        last_error = RuntimeError(
+            "All Gemini models are in circuit-breaker cooldown and no tier-2 provider "
+            "is configured (or all tier-2 providers also failed)"
+        )
     logger.error("All Gemini models AND all tier-2 providers exhausted/failed")
     raise last_error
