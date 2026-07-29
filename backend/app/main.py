@@ -1502,7 +1502,8 @@ async def triage_one_finding(finding_id: int):
             SET severity = $1,
                 likely_program_outcome = $2,
                 triage_reasoning = $3,
-                triage_confidence = $4
+                triage_confidence = $4,
+                impact_evidence = $6
             WHERE id = $5
             """,
             result["severity"] if result["severity"] in
@@ -1511,6 +1512,7 @@ async def triage_one_finding(finding_id: int):
             result.get("reasoning"),
             result.get("confidence"),
             finding_id,
+            (result.get("impact_evidence") or "").strip() or None,
         )
 
     return {"finding_id": finding_id, "signature": signature, **result}
@@ -1530,7 +1532,7 @@ async def draft_finding_report(finding_id: int):
     async with pool.acquire() as conn:
         finding = await conn.fetchrow(
             """
-            SELECT f.id, f.tool_name, f.vuln_type, f.severity, f.evidence,
+            SELECT f.id, f.tool_name, f.vuln_type, f.severity, f.evidence, f.impact_evidence,
                    f.triage_reasoning, st.target, p.id AS project_id, p.name AS project_name, p.platform
             FROM findings f
             JOIN scope_targets st ON st.id = f.target_id
@@ -1551,6 +1553,7 @@ async def draft_finding_report(finding_id: int):
             platform=finding["platform"], target=finding["target"], vuln_type=finding["vuln_type"],
             severity=finding["severity"], evidence=finding["evidence"] or "",
             triage_reasoning=finding["triage_reasoning"],
+            impact_evidence=finding["impact_evidence"],
         )
         if "error" in result:
             raise HTTPException(status_code=502, detail=f"Report drafting failed: {result['error']}")

@@ -44,6 +44,7 @@ Vulnerability type: {vuln_type}
 Severity (already decided, do not second-guess): {severity}
 VRT category: {vrt_category}
 Triage reasoning (already decided, do not second-guess): {triage_reasoning}
+Impact evidence on file (already decided, do not second-guess): {impact_evidence_context}
 
 Raw evidence:
 ---
@@ -51,7 +52,7 @@ Raw evidence:
 ---
 
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"title": "concise, specific report title", "summary": "one paragraph describing the vulnerability", "steps_to_reproduce": ["step 1", "step 2", "..."], "impact": "one paragraph on real-world impact, grounded in the evidence - do not invent impact beyond what the evidence supports", "remediation": "one or two sentences, generic remediation guidance for this vuln class"}}
+{{"title": "concise, specific report title", "summary": "one paragraph describing the vulnerability", "steps_to_reproduce": ["step 1", "step 2", "..."], "impact": "one paragraph on real-world impact, grounded ONLY in the impact evidence on file and the raw evidence above - if impact evidence on file says impact is unproven, say plainly that impact beyond the vulnerability mechanism itself has not yet been demonstrated, rather than writing confident impact language anyway", "remediation": "one or two sentences, generic remediation guidance for this vuln class"}}
 
 Platform tone guidance: {platform_guidance}
 
@@ -64,6 +65,15 @@ behavior" is honest; inventing a specific curl command with made-up parameter va
 that aren't in the evidence is not). This report will be submitted to a real program - \
 a fabricated technical detail that doesn't hold up under review costs credibility on the \
 whole account, not just this one report.
+
+CRITICAL, impact section specifically: if "Impact evidence on file" above says impact is \
+unproven, the "impact" field must say so plainly - e.g. "This confirms the vulnerability \
+mechanism fires, but no concrete evidence of data exposure or a privileged action has been \
+demonstrated yet; further testing would be needed to establish real-world impact." Writing \
+confident impact language (data breach framing, specific harm scenarios) when the actual \
+evidence doesn't support it is exactly the kind of report language that gets a submission \
+closed as Informative once a triager checks the evidence themselves - an honest "impact not \
+yet proven" framing is more credible, not less, than an oversold one that doesn't hold up.
 """
 
 _PLATFORM_GUIDANCE = {
@@ -94,6 +104,7 @@ def _parse_report_response(text: str) -> dict:
 async def draft_report(
     platform: str, target: str, vuln_type: str, severity: str,
     evidence: str, vrt_category: str | None = None, triage_reasoning: str | None = None,
+    impact_evidence: str | None = None,
 ) -> dict:
     """
     Returns {"title", "summary", "steps_to_reproduce", "impact",
@@ -102,15 +113,28 @@ async def draft_report(
     to something that looks like a real draft, since this is
     user-facing content meant to be copy-pasted toward a real
     submission.
+
+    impact_evidence (optional): triage's own concrete evidence of real
+    impact (see triage.py's impact_evidence field), or None/empty if
+    triage never demonstrated impact beyond the vulnerability mechanism
+    itself. Fed into the prompt so the draft's "impact" section reflects
+    that honestly instead of writing confident impact language a real
+    triager's own evidence review would contradict.
     """
     client = _get_client()
     platform_guidance = _PLATFORM_GUIDANCE.get(
         platform.lower(), "No platform-specific guidance available - use a clear, generic structure."
     )
+    impact_evidence_context = (
+        impact_evidence.strip() if impact_evidence and impact_evidence.strip()
+        else "unproven - only the vulnerability mechanism itself was confirmed, no concrete "
+             "evidence of data exposure or a privileged action was demonstrated"
+    )
     prompt = _REPORT_PROMPT.format(
         platform=platform, target=target, vuln_type=vuln_type, severity=severity,
         vrt_category=vrt_category or "none assigned",
         triage_reasoning=triage_reasoning or "none recorded",
+        impact_evidence_context=impact_evidence_context,
         evidence=(evidence or "")[:3000],
         platform_guidance=platform_guidance,
     )

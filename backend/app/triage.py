@@ -36,7 +36,7 @@ Tool: {tool_name}
 ---
 {outcome_context}{vrt_context}
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null"}}
+{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null", "impact_evidence": "concrete proof of REAL impact found IN THE EVIDENCE ABOVE - an actual sensitive value shown (email/token/row/credential), an actual privileged action performed, an actual different user's data accessed - or an empty string if the evidence only shows the vulnerability mechanism firing (a 200 response, a reflected payload, a matched signature) without anything concrete beyond that"}}
 
 Guidance: missing security headers, generic fingerprinting (server/version
 detection), and DNS records are almost always "info". Known CVEs with
@@ -46,6 +46,17 @@ bypass) is "high" or "critical". If you are NOT confident in this
 classification (the evidence is ambiguous, contradictory, or you're
 guessing), set confidence below 0.6 - this is expected and fine, it
 routes the finding to a closer look rather than forcing a bad guess.
+
+impact_evidence is separate from confidence and separate from whether
+the technique works - it specifically answers "did the evidence show
+something a program would consider actual harm, not just a working
+mechanism?" A SQLi finding where the evidence shows one real extracted
+row IS impact_evidence; a SQLi finding where the evidence only shows a
+boolean-blind true/false differential is NOT, even if you're highly
+confident the injection itself is real. Do not pad this field with
+restated technical detail to make it look substantive - if the evidence
+genuinely doesn't show concrete impact, leave it as an empty string
+rather than describing the mechanism again in different words.
 
 SSL/TLS/certificate findings (weak ciphers, self-signed or expired
 certs, missing HSTS/CSP, protocol version warnings, and similar scanner
@@ -177,6 +188,65 @@ def _format_self_declared_context(self_declared_severity: str | None) -> str:
     )
 
 
+_MIN_IMPACT_EVIDENCE_LENGTH = 15
+_WEAK_IMPACT_EVIDENCE_MARKERS = {
+    "none", "n/a", "na", "not applicable", "not demonstrated", "not shown",
+    "no impact evidence", "no impact", "not proven", "unproven", "no concrete impact",
+}
+
+
+def _impact_evidence_is_weak(impact_evidence: str | None) -> bool:
+    """
+    True if impact_evidence doesn't actually establish real-world harm -
+    missing, empty, or just a short hedge/filler phrase rather than a
+    concrete detail. Deliberately simple (length + a fixed filler-phrase
+    set) rather than a second AI call to grade the first AI call's
+    answer - that would just move the "can I trust this judgment"
+    problem one level up instead of resolving it.
+    """
+    if not impact_evidence:
+        return True
+    cleaned = impact_evidence.strip()
+    if len(cleaned) < _MIN_IMPACT_EVIDENCE_LENGTH:
+        return True
+    if cleaned.rstrip(".!").lower() in _WEAK_IMPACT_EVIDENCE_MARKERS:
+        return True
+    return False
+
+
+def _apply_impact_evidence_cap(result: dict) -> dict:
+    """
+    "Real bug, unproven impact" shouldn't inherit high severity by
+    default just because the underlying technique is real - this is the
+    direct fix for the recurring "no real impact to sensitive data"
+    platform rejection. Only caps critical/high (the tiers where a
+    weak-impact rejection actually costs a payout); medium/low/info are
+    left alone since those severities don't depend on impact_evidence to
+    begin with (e.g. a confirmed CVE version match is legitimately
+    "medium" on technical grounds alone, not on demonstrated impact).
+
+    Caps to "medium", not lower - this is still a real, confirmed
+    finding, just not yet proven to matter at the critical/high tier.
+    Mutates and returns the same dict so callers can just chain this
+    onto the parsed response.
+    """
+    severity = result.get("severity")
+    if severity not in ("critical", "high"):
+        return result
+
+    if not _impact_evidence_is_weak(result.get("impact_evidence")):
+        return result
+
+    original_severity = severity
+    result["severity"] = "medium"
+    result["reasoning"] = (
+        f"[Severity capped from {original_severity} to medium: no concrete real-world impact "
+        f"evidence was provided, only that the vulnerability mechanism fires - see impact_evidence] "
+        f"{result.get('reasoning', '')}"
+    )
+    return result
+
+
 async def triage_finding(
     tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None,
     self_declared_severity: str | None = None,
@@ -255,15 +325,15 @@ async def triage_finding(
             )
             escalated = _parse_triage_response(response.text or "")
             escalated["model_used"] = escalation_model_used
-            return escalated
+            return _apply_impact_evidence_cap(escalated)
         except Exception as exc:
             logger.warning("Escalation failed on every model, keeping first-pass result: %s", exc)
             # Fall back to the first-pass result rather than losing the
             # finding entirely - a low-confidence guess is still more
             # useful than nothing, and it's clearly labeled as such.
-            return result
+            return _apply_impact_evidence_cap(result)
 
-    return result
+    return _apply_impact_evidence_cap(result)
 
 
 # ---------------------------------------------------------------------
@@ -406,7 +476,8 @@ async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: lis
         SET severity = $1,
             likely_program_outcome = $2,
             triage_reasoning = $3,
-            triage_confidence = $4
+            triage_confidence = $4,
+            impact_evidence = $6
         WHERE id = $5
         """,
         result["severity"] if result["severity"] in
@@ -415,6 +486,7 @@ async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: lis
         result.get("reasoning"),
         result.get("confidence"),
         row["id"],
+        (result.get("impact_evidence") or "").strip() or None,
     )
 
     # Close the loop: what triage decided about this signature on
