@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, config, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -520,7 +520,15 @@ async def _queue_worker_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Runs once when the app starts up
+    # Runs once when the app starts up. Config sanity check comes FIRST,
+    # before even the DB connection - a missing GEMINI_API_KEY or a
+    # nuclei binary that never made it into the image should surface as
+    # one clear crash-on-boot, not a cryptic KeyError/FileNotFoundError
+    # three phases into someone's first real scan.
+    config_warnings = config.check_startup_config()
+    for w in config_warnings:
+        logger.warning("STARTUP CONFIG WARNING: %s", w)
+
     await database.connect_db()
 
     # Crash-safety check: if the app was restarted while scans were mid-
