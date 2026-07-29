@@ -518,6 +518,24 @@ async def _queue_worker_loop() -> None:
         await asyncio.sleep(10)
 
 
+async def _ai_retry_queue_worker_loop() -> None:
+    """Runs for the lifetime of the app, checking ai_retry_queue every
+    5 minutes. Slower than the 10s scan queue worker on purpose - retry
+    items already carry their own exponential backoff (2min-4h, see
+    retry_queue._BACKOFF_SCHEDULE_MINUTES), so there is rarely anything
+    due; a tight poll loop would just be near-constant no-op DB round
+    trips."""
+    logger.info("AI retry queue worker started (checks every 5m)")
+    while True:
+        try:
+            processed = await triage.retry_pending_ai_failures(database.get_pool())
+            if processed:
+                logger.info("AI retry queue: processed %d due item(s)", processed)
+        except Exception:
+            logger.exception("AI retry queue worker iteration failed - will retry in 5m")
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Runs once when the app starts up. Config sanity check comes FIRST,
@@ -601,6 +619,7 @@ async def lifespan(app: FastAPI):
     queue_worker_task = asyncio.create_task(_queue_worker_loop())
     digest_task = asyncio.create_task(_digest_loop())
     stale_flag_task = asyncio.create_task(_stale_flag_loop())
+    ai_retry_task = asyncio.create_task(_ai_retry_queue_worker_loop())
 
     yield
     # Runs once when the app shuts down (e.g. container stopping)
@@ -608,6 +627,7 @@ async def lifespan(app: FastAPI):
     queue_worker_task.cancel()
     digest_task.cancel()
     stale_flag_task.cancel()
+    ai_retry_task.cancel()
     await database.disconnect_db()
 
 

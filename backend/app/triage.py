@@ -18,6 +18,7 @@ import re
 
 from google import genai
 
+from . import error_taxonomy
 from .gemini_rotation import generate_with_rotation
 
 logger = logging.getLogger("swas.triage")
@@ -233,7 +234,15 @@ async def triage_finding(
         result["model_used"] = model_used
     except Exception as exc:
         logger.exception("Triage failed on every model in the rotation")
-        return {"severity": "unknown", "confidence": 0.0, "reasoning": f"Triage failed: {exc}", "model_used": "none"}
+        return {
+            "severity": "unknown", "confidence": 0.0,
+            "reasoning": f"Triage failed: {exc}", "model_used": "none",
+            # Distinguishes "the AI call itself failed" from a model
+            # genuinely, successfully returning severity=unknown/low
+            # confidence - only the former should get queued for retry.
+            "ai_call_failed": True,
+            "error_type": error_taxonomy.classify_error(exc),
+        }
 
     if result.get("confidence", 1.0) < 0.6:
         logger.info("Low confidence (%.2f) on %s, escalating", result.get("confidence", 0), result["model_used"])
@@ -347,6 +356,95 @@ async def fetch_signature_stats(conn, signature: str) -> dict | None:
     return dict(row) if row and row["total"] else None
 
 
+async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: list[dict]) -> dict:
+    """
+    Runs triage_finding for ONE finding row, applies the adversarial
+    skeptic pass if it qualifies, writes the result to `findings`, and
+    feeds the outcome back into target_intelligence. Returns the raw
+    triage result dict (including "ai_call_failed"/"error_type" if the
+    AI call itself failed on every model/provider) so callers can decide
+    whether to enqueue a retry.
+
+    Factored out of triage_project_findings so the retry-queue worker
+    (retry_pending_ai_failures, below) can redo exactly this same work
+    for a single previously-failed finding, instead of drifting out of
+    sync with a second, hand-copied version of this logic.
+    """
+    from . import target_intelligence
+
+    signature = build_signature(row["tool_name"], row["vuln_type"])
+    outcome_stats = await fetch_signature_stats(conn, signature)
+    clean_evidence, self_declared_severity = _extract_self_declared_severity(row["evidence"] or "")
+
+    result = await triage_finding(
+        row["tool_name"], clean_evidence,
+        outcome_stats=outcome_stats, vrt_entries=vrt_entries,
+        self_declared_severity=self_declared_severity,
+    )
+
+    # Adversarial skeptic pass (#7): only for findings about to sail
+    # through as solid, since that's where a rubber-stamp mistake
+    # costs the most. A strong counter-argument lowers confidence
+    # and gets appended to the reasoning shown to you - it does NOT
+    # change the severity/outcome verdict itself, since this pass
+    # argues against a finding on purpose and shouldn't get the
+    # final word on its own.
+    if qualifies_for_adversarial_review(result.get("severity", ""), result.get("confidence", 0.0)):
+        review = await adversarial_review(
+            row["tool_name"], clean_evidence, result["severity"], result.get("reasoning", ""),
+        )
+        if review.get("counter_argument_is_strong"):
+            result["confidence"] = min(result.get("confidence", 1.0), review.get("revised_confidence", 1.0))
+            result["reasoning"] = (
+                f"{result.get('reasoning', '')} [Skeptic review: {review['counter_argument']}]"
+            )
+
+    outcome = result.get("likely_program_outcome")
+    await conn.execute(
+        """
+        UPDATE findings
+        SET severity = $1,
+            likely_program_outcome = $2,
+            triage_reasoning = $3,
+            triage_confidence = $4
+        WHERE id = $5
+        """,
+        result["severity"] if result["severity"] in
+        ("critical", "high", "medium", "low", "info") else "unknown",
+        outcome if outcome in ("accepted", "informative", "out_of_scope", "duplicate") else None,
+        result.get("reasoning"),
+        result.get("confidence"),
+        row["id"],
+    )
+
+    # Close the loop: what triage decided about this signature on
+    # THIS target feeds back into target_intelligence so later
+    # logic_hunter reasoning and (once #3 in the roadmap builds on
+    # this) scan-technique selection can see it. Fails soft - a
+    # broken write here costs an optimization, never the triage
+    # result itself, which is already committed above.
+    if row["target_id"]:
+        await target_intelligence.record_technique_outcome(
+            conn, row["target_id"], signature, outcome or "unknown",
+            note=result.get("reasoning"),
+        )
+        if result.get("severity") in ("critical", "high", "medium") and outcome == "accepted":
+            surface_summary = await conn.fetchrow(
+                "SELECT tech_stack_union FROM attack_surface_summary WHERE target_id = $1",
+                row["target_id"],
+            )
+            tech_signature = target_intelligence.normalize_tech_signature(
+                surface_summary["tech_stack_union"] if surface_summary else None
+            )
+            if tech_signature:
+                await target_intelligence.record_cross_target_pattern(
+                    conn, project_id, row["vuln_type"], tech_signature, row["target_id"],
+                    note=f"triaged {result.get('severity')}, accepted: {(result.get('reasoning') or '')[:200]}",
+                )
+
+    return result
+
+
 async def triage_project_findings(conn, project_id: int) -> int:
     """
     Triages every 'unknown'-severity finding in a project, one at a
@@ -357,8 +455,14 @@ async def triage_project_findings(conn, project_id: int) -> int:
     detective.py findings get the same independent AI review tool
     findings always got, without you needing to remember to click
     anything. Returns the number of findings triaged.
+
+    A finding whose AI call fails on every model AND every tier-2
+    provider gets queued in ai_retry_queue (kind="finding_triage")
+    instead of just sitting at severity='unknown' until the next full
+    scan happens to re-triage it - see retry_pending_ai_failures, which
+    a background loop in main.py runs every few minutes.
     """
-    from . import target_intelligence, vrt as vrt_module
+    from . import retry_queue, vrt as vrt_module
 
     rows = await conn.fetch(
         """
@@ -371,78 +475,84 @@ async def triage_project_findings(conn, project_id: int) -> int:
     vrt_entries = await vrt_module.get_vrt_entries()  # fetched once, reused for every finding in this batch
     triaged = 0
     for row in rows:
-        signature = build_signature(row["tool_name"], row["vuln_type"])
-        outcome_stats = await fetch_signature_stats(conn, signature)
-        clean_evidence, self_declared_severity = _extract_self_declared_severity(row["evidence"] or "")
+        result = await _triage_and_store_finding(conn, project_id, row, vrt_entries)
 
-        result = await triage_finding(
-            row["tool_name"], clean_evidence,
-            outcome_stats=outcome_stats, vrt_entries=vrt_entries,
-            self_declared_severity=self_declared_severity,
-        )
-
-        # Adversarial skeptic pass (#7): only for findings about to sail
-        # through as solid, since that's where a rubber-stamp mistake
-        # costs the most. A strong counter-argument lowers confidence
-        # and gets appended to the reasoning shown to you - it does NOT
-        # change the severity/outcome verdict itself, since this pass
-        # argues against a finding on purpose and shouldn't get the
-        # final word on its own.
-        if qualifies_for_adversarial_review(result.get("severity", ""), result.get("confidence", 0.0)):
-            review = await adversarial_review(
-                row["tool_name"], clean_evidence, result["severity"], result.get("reasoning", ""),
+        if result.get("ai_call_failed"):
+            await retry_queue.enqueue(
+                conn, "finding_triage",
+                {"finding_id": row["id"], "project_id": project_id},
             )
-            if review.get("counter_argument_is_strong"):
-                result["confidence"] = min(result.get("confidence", 1.0), review.get("revised_confidence", 1.0))
-                result["reasoning"] = (
-                    f"{result.get('reasoning', '')} [Skeptic review: {review['counter_argument']}]"
-                )
 
-        outcome = result.get("likely_program_outcome")
-        await conn.execute(
-            """
-            UPDATE findings
-            SET severity = $1,
-                likely_program_outcome = $2,
-                triage_reasoning = $3,
-                triage_confidence = $4
-            WHERE id = $5
-            """,
-            result["severity"] if result["severity"] in
-            ("critical", "high", "medium", "low", "info") else "unknown",
-            outcome if outcome in ("accepted", "informative", "out_of_scope", "duplicate") else None,
-            result.get("reasoning"),
-            result.get("confidence"),
-            row["id"],
-        )
-
-        # Close the loop: what triage decided about this signature on
-        # THIS target feeds back into target_intelligence so later
-        # logic_hunter reasoning and (once #3 in the roadmap builds on
-        # this) scan-technique selection can see it. Fails soft - a
-        # broken write here costs an optimization, never the triage
-        # result itself, which is already committed above.
-        if row["target_id"]:
-            await target_intelligence.record_technique_outcome(
-                conn, row["target_id"], signature, outcome or "unknown",
-                note=result.get("reasoning"),
-            )
-            if result.get("severity") in ("critical", "high", "medium") and outcome == "accepted":
-                surface_summary = await conn.fetchrow(
-                    "SELECT tech_stack_union FROM attack_surface_summary WHERE target_id = $1",
-                    row["target_id"],
-                )
-                tech_signature = target_intelligence.normalize_tech_signature(
-                    surface_summary["tech_stack_union"] if surface_summary else None
-                )
-                if tech_signature:
-                    await target_intelligence.record_cross_target_pattern(
-                        conn, project_id, row["vuln_type"], tech_signature, row["target_id"],
-                        note=f"triaged {result.get('severity')}, accepted: {(result.get('reasoning') or '')[:200]}",
-                    )
         triaged += 1
 
     return triaged
+
+
+async def retry_pending_ai_failures(pool) -> int:
+    """
+    Called periodically by main.py's background loop. Pulls due
+    "finding_triage" items from ai_retry_queue and redoes the triage
+    call for each - this is what makes a totally-exhausted AI call (all
+    Gemini models AND all tier-2 providers down/quota'd) get retried in
+    minutes instead of waiting for that project's NEXT full scan to
+    happen to re-triage it.
+
+    Skips (marks succeeded, no-op) a queued finding that's no longer
+    severity='unknown' by the time this runs - something else already
+    resolved it (a manual override, a rescan, etc.) and retrying would
+    just clobber that. Returns the number of items processed.
+    """
+    from . import error_taxonomy, retry_queue, vrt as vrt_module
+
+    processed = 0
+    async with pool.acquire() as conn:
+        items = await retry_queue.fetch_due(conn, "finding_triage")
+        if not items:
+            return 0
+
+        vrt_entries = await vrt_module.get_vrt_entries()
+
+        for item in items:
+            payload = item["payload"]
+            if isinstance(payload, str):
+                import json
+                payload = json.loads(payload)
+            finding_id = payload["finding_id"]
+            project_id = payload["project_id"]
+
+            row = await conn.fetchrow(
+                "SELECT id, target_id, tool_name, vuln_type, evidence, severity FROM findings WHERE id = $1",
+                finding_id,
+            )
+            if row is None:
+                # Finding was deleted (project removed, scope pruned) -
+                # nothing left to retry.
+                await retry_queue.mark_succeeded(conn, item["id"])
+                processed += 1
+                continue
+            if row["severity"] != "unknown":
+                # Already resolved some other way since this was queued.
+                await retry_queue.mark_succeeded(conn, item["id"])
+                processed += 1
+                continue
+
+            try:
+                result = await _triage_and_store_finding(conn, project_id, row, vrt_entries)
+                if result.get("ai_call_failed"):
+                    # triage_finding itself caught the exception and
+                    # returned the "failed" sentinel rather than raising -
+                    # treat that the same as a raised exception for
+                    # retry-scheduling purposes.
+                    raise RuntimeError(result.get("reasoning", "AI call failed again"))
+                await retry_queue.mark_succeeded(conn, item["id"])
+                logger.info("Retry queue: finding %s triaged successfully on retry", finding_id)
+            except Exception as exc:
+                error_type = error_taxonomy.classify_error(exc)
+                await retry_queue.mark_attempt_failed(conn, item["id"], str(exc), error_type)
+
+            processed += 1
+
+    return processed
 
 
 # ---------------------------------------------------------------------
