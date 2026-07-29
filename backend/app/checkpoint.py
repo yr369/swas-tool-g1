@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 import asyncpg
 
-from . import ws_manager
+from . import error_taxonomy, ws_manager
 
 logger = logging.getLogger("swas.checkpoint")
 
@@ -117,6 +117,8 @@ async def run_phase(
         # exception swallowing" bug from earlier versions of this tool.
         logger.exception("Phase run %s failed", phase_run_id)
 
+        error_type = error_taxonomy.classify_error(exc)
+
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -124,12 +126,14 @@ async def run_phase(
                 SET status = 'failed',
                     completed_at = $2,
                     error_message = $3,
+                    error_type = $4,
                     retry_count = retry_count + 1
                 WHERE id = $1
                 """,
                 phase_run_id,
                 datetime.now(timezone.utc),
                 str(exc)[:2000],  # cap length so one giant error can't bloat the row
+                error_type,
             )
         await ws_manager.manager.broadcast(
             project_id,
