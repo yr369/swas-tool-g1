@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, config, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -1549,6 +1549,16 @@ async def draft_finding_report(finding_id: int):
                 detail="Finding hasn't been triaged yet - run /triage first so there's a real severity to draft a report against.",
             )
 
+        # Batch 24: evidence integrity re-check. A finding's evidence
+        # proves the bug was real AT SCAN TIME - time passes before a
+        # report actually gets drafted/submitted, and the target may
+        # have been patched since. One targeted re-check right before
+        # drafting, not a full re-scan - see evidence_lifecycle.py's
+        # own docstring for the full reasoning.
+        integrity_status = await evidence_lifecycle.check_and_record_evidence_integrity(
+            conn, finding_id, finding["evidence"]
+        )
+
         result = await report_writer.draft_report(
             platform=finding["platform"], target=finding["target"], vuln_type=finding["vuln_type"],
             severity=finding["severity"], evidence=finding["evidence"] or "",
@@ -1562,6 +1572,7 @@ async def draft_finding_report(finding_id: int):
         "finding_id": finding_id, "vuln_type": finding["vuln_type"], "severity": finding["severity"],
         "target": finding["target"], "tool_name": finding["tool_name"], "evidence": finding["evidence"],
         "project_id": finding["project_id"], "project_name": finding["project_name"], "platform": finding["platform"],
+        "evidence_integrity": integrity_status,
         **result,
     }
 

@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from . import checkpoint, detective, evidence_lifecycle, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -103,6 +103,19 @@ _SQLI_UNION_CHECK_CAP = 10
 _LFI_CONFIRM_CHECK_CAP = 10
 _BUCKET_OBJECT_EXTRACT_CHECK_CAP = 15
 
+# Batch 23 - behavioral/chain impact probes. Multi-step (SSRF credential
+# chase, headless-browser cookie exfil, OAuth redirect chain, CSRF
+# preflight, rate-limit burst) so capped tighter than batch 22's single-
+# extra-request probes. (Dangling NS delegation takeover is host-level,
+# runs once per host inside the already-capped subdomain-takeover loop -
+# no separate cap constant needed, same convention as other host-level
+# checks.)
+_SSRF_METADATA_CRED_CHECK_CAP = 8
+_XSS_COOKIE_EXFIL_CHECK_CAP = 6       # real headless browser launch per candidate - expensive
+_OAUTH_REDIRECT_CHAIN_CHECK_CAP = 10
+_CSRF_POC_CHECK_CAP = 10
+_RATE_LIMIT_BYPASS_CHECK_CAP = 6      # deliberately bursts up to 12 requests per candidate
+
 logger = logging.getLogger("swas.pipeline")
 
 PHASES = ["recon", "probe", "fuzz", "scan", "verify", "gate", "logic_hunter", "triage", "notify"]
@@ -123,6 +136,26 @@ async def run_target_pipeline(
     target must never crash or block the rest of the queue.
     """
     logger.info("Starting pipeline for target_id=%s (%s)", target_id, target)
+
+    # Batch 24: dead-target pre-flight check. Cheap - samples a few
+    # PREVIOUSLY known hosts (if any cache exists) before spending a
+    # full recon pass finding out the same thing the slow way. A
+    # first-ever scan of this target always passes through (nothing
+    # cached to sample against yet).
+    async with pool.acquire() as conn:
+        alive = await evidence_lifecycle.check_target_alive_before_scan(conn, target_id, target)
+    if not alive:
+        async with pool.acquire() as conn:
+            await checkpoint.mark_remaining_phases_skipped(
+                conn, project_id, target_id, after_phase=None,
+                reason="target appears dead - all previously-known hosts unreachable (batch 24 pre-flight check)",
+            )
+        logger.info(
+            "target_id=%s (%s): appears dead (all previously-known hosts unreachable) - "
+            "skipping this scan run entirely",
+            target_id, target,
+        )
+        return
 
     # Attack persona: a short AI-written plan for what to prioritize on
     # THIS target (see target_intelligence.py). Generated once per
@@ -388,6 +421,21 @@ async def _phase_recon(
     for res in takeover_results:
         if isinstance(res, Exception):
             logger.debug("takeover check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+    # Detective check: dangling NS delegation takeover (batch 23).
+    # Different, rarer technique than the CNAME check above - reuses the
+    # same candidate list/cap since both are cheap DoH-only lookups.
+    logger.info("detective: running dangling NS delegation check against %d candidate(s)", len(candidates))
+    ns_takeover_results = await asyncio.gather(
+        *(detective.check_dangling_ns_delegation_takeover(host) for host in candidates),
+        return_exceptions=True,
+    )
+    for res in ns_takeover_results:
+        if isinstance(res, Exception):
+            logger.debug("dangling NS delegation check raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
@@ -1121,6 +1169,25 @@ async def _phase_scan(
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
+    # Detective check: open redirect -> OAuth redirect_uri chain impact
+    # probe (batch 23). Reuses the same candidate list - only does real
+    # work when a URL's path looks like an OAuth/SSO authorize endpoint.
+    oauth_redirect_candidates = redirect_candidates[:_OAUTH_REDIRECT_CHAIN_CHECK_CAP]
+    logger.info(
+        "detective: running OAuth redirect_uri chain probe against %d candidate URL(s)",
+        len(oauth_redirect_candidates),
+    )
+    oauth_redirect_results = await asyncio.gather(
+        *(detective.check_open_redirect_oauth_chain(url) for url in oauth_redirect_candidates),
+        return_exceptions=True,
+    )
+    for res in oauth_redirect_results:
+        if isinstance(res, Exception):
+            logger.debug("OAuth redirect_uri chain probe raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
     # Detective check: blind SQL injection via timing. The most
     # expensive check here (each real hit costs several deliberate
     # seconds of wait), so it only runs against URLs that already have
@@ -1218,6 +1285,54 @@ async def _phase_scan(
                 for res in blind_ssrf_results:
                     if isinstance(res, Exception):
                         logger.debug("blind SSRF OOB check raised: %s", res)
+                        continue
+                    if res is not None:
+                        await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+                # Batch 22: SSRF metadata credential-extraction impact
+                # probe. Reuses the same candidate list - only does real
+                # work when a param actually reaches the metadata
+                # service.
+                ssrf_cred_candidates = ssrf_candidates[:_SSRF_METADATA_CRED_CHECK_CAP]
+                logger.info(
+                    "detective: running SSRF metadata credential extraction probe against %d URL(s)",
+                    len(ssrf_cred_candidates),
+                )
+                ssrf_cred_results = await asyncio.gather(
+                    *(detective.check_ssrf_metadata_credential_extraction(url) for url in ssrf_cred_candidates),
+                    return_exceptions=True,
+                )
+                for res in ssrf_cred_results:
+                    if isinstance(res, Exception):
+                        logger.debug("SSRF metadata credential extraction probe raised: %s", res)
+                        continue
+                    if res is not None:
+                        await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+                # Batch 23: XSS cookie exfiltration impact probe. Shares
+                # this same OOB session (one interactsh session serves
+                # both blind SSRF and this) - real headless-browser
+                # launch per candidate, so capped tighter than the other
+                # probes. Uses each URL's first query parameter.
+                xss_cookie_candidates = [
+                    (url, next(iter(httpx.URL(url).params), None))
+                    for url in ssrf_candidates[:_XSS_COOKIE_EXFIL_CHECK_CAP]
+                ]
+                xss_cookie_candidates = [(u, p) for u, p in xss_cookie_candidates if p]
+                logger.info(
+                    "detective: running XSS cookie exfiltration probe against %d URL(s)",
+                    len(xss_cookie_candidates),
+                )
+                xss_cookie_results = await asyncio.gather(
+                    *(
+                        detective.check_xss_cookie_exfiltration(url, param, oob_domain, oob_proc, f"x{i}")
+                        for i, (url, param) in enumerate(xss_cookie_candidates)
+                    ),
+                    return_exceptions=True,
+                )
+                for res in xss_cookie_results:
+                    if isinstance(res, Exception):
+                        logger.debug("XSS cookie exfiltration probe raised: %s", res)
                         continue
                     if res is not None:
                         await _save_detective_finding_pooled(pool, project_id, target_id, res)
@@ -1790,6 +1905,46 @@ async def _phase_scan(
             continue
         if res is not None:
             await _save_scan_note_pooled(pool, project_id, target_id, "csrf_token_missing", res)
+
+    # Detective check: CSRF PoC generation impact probe (batch 23).
+    # Reuses the same candidate list - only generates a PoC when the
+    # missing token is paired with a lack of server-side Origin
+    # enforcement (see the check's own docstring); never submits the
+    # real form.
+    csrf_poc_candidates = csrf_token_candidates[:_CSRF_POC_CHECK_CAP]
+    logger.info(
+        "detective: running CSRF PoC generation probe against %d URL(s)", len(csrf_poc_candidates)
+    )
+    csrf_poc_results = await asyncio.gather(
+        *(detective.check_csrf_poc_live_confirmation(url) for url in csrf_poc_candidates),
+        return_exceptions=True,
+    )
+    for res in csrf_poc_results:
+        if isinstance(res, Exception):
+            logger.debug("CSRF PoC generation probe raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+    # Detective check: rate-limit header bypass impact probe (batch 23).
+    # GET-only by design (see the check's own docstring on why it's
+    # never run against state-changing endpoints) - reuses a small slice
+    # of the general discovered-URL list rather than any particular
+    # candidate filter.
+    rate_limit_candidates = sane_discovered_urls[:_RATE_LIMIT_BYPASS_CHECK_CAP]
+    logger.info(
+        "detective: running rate-limit header bypass probe against %d URL(s)", len(rate_limit_candidates)
+    )
+    rate_limit_results = await asyncio.gather(
+        *(detective.check_rate_limit_header_bypass(url) for url in rate_limit_candidates),
+        return_exceptions=True,
+    )
+    for res in rate_limit_results:
+        if isinstance(res, Exception):
+            logger.debug("rate-limit header bypass probe raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: file upload form candidate. Recon-only, never
     # attempts an actual upload - see the check's own docstring.
@@ -2603,6 +2758,14 @@ async def _save_finding(
     )
     await _upsert_finding_cluster(conn, target_id, finding_id, tool_name)
 
+    # Batch 24: archive the FULL evidence to disk if it was truncated
+    # above, and record where - see evidence_lifecycle.py's own
+    # docstring on why raw_output_path existed but was never written
+    # before this.
+    archive_path = evidence_lifecycle.archive_evidence_to_disk(finding_id, cleaned_output)
+    if archive_path is not None:
+        await conn.execute("UPDATE findings SET raw_output_path = $1 WHERE id = $2", archive_path, finding_id)
+
 
 async def _save_scan_note(
     conn: asyncpg.Connection, project_id: int, target_id: int, check_name: str, note: str
@@ -2654,6 +2817,7 @@ async def _save_detective_finding(
     model as context (see triage._extract_self_declared_severity).
     """
     self_declared_prefix = f"[self-declared-severity: {result['severity']}]\n"
+    full_evidence = self_declared_prefix + result["evidence"]
     finding_id = await conn.fetchval(
         """
         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
@@ -2663,9 +2827,15 @@ async def _save_detective_finding(
         project_id,
         target_id,
         result["vuln_type"],
-        (self_declared_prefix + result["evidence"])[:5000],
+        full_evidence[:5000],
     )
     await _upsert_finding_cluster(conn, target_id, finding_id, 'detective')
+
+    # Batch 24: same archival as _save_finding above.
+    archive_path = evidence_lifecycle.archive_evidence_to_disk(finding_id, full_evidence)
+    if archive_path is not None:
+        await conn.execute("UPDATE findings SET raw_output_path = $1 WHERE id = $2", archive_path, finding_id)
+
     logger.info(
         "detective: saved %s finding (self-declared severity=%s, pending triage) for target_id=%s",
         result["vuln_type"], result["severity"], target_id,
@@ -2793,17 +2963,25 @@ async def _phase_notify(pool: asyncpg.Pool, project_id: int, target: str) -> Non
 
     async with pool.acquire() as conn:
         high_value = await target_intelligence.get_unalerted_high_value_findings(conn, project_id)
-        for f in high_value:
-            alert_msg = (
-                f"[HIGH VALUE] {f['severity'].upper()} {f['vuln_type']} on {f['target']} "
-                f"({f['tool_name']}) - triage says likely accepted. {f.get('triage_reasoning') or ''}"
-            )
-            alert_result = await tools.run_notify(alert_msg[:1000])
+        # Batch 24: alert fatigue guard. Groups findings sharing the
+        # same (tool_name, vuln_type) signature into one alert instead
+        # of firing one notify() call per finding - see
+        # evidence_lifecycle.group_and_throttle_alerts's own docstring
+        # for why an unthrottled 40-finding burst was the actual gap.
+        alerts = evidence_lifecycle.group_and_throttle_alerts(high_value)
+        for alert in alerts:
+            alert_result = await tools.run_notify(alert["message"])
             if not alert_result.success:
-                logger.info("notify: high-value alert failed for finding_id=%s: %s", f["id"], alert_result.error)
+                logger.info(
+                    "notify: high-value alert failed for finding_ids=%s: %s",
+                    alert["finding_ids"], alert_result.error,
+                )
         if high_value:
             await target_intelligence.mark_alerted(conn, [f["id"] for f in high_value])
-            logger.info("notify: sent %d high-value alert(s) for project_id=%s", len(high_value), project_id)
+            logger.info(
+                "notify: sent %d grouped alert(s) covering %d high-value finding(s) for project_id=%s",
+                len(alerts), len(high_value), project_id,
+            )
 
     result = await tools.run_notify(f"Scan completed for {target}")
     if not result.success:

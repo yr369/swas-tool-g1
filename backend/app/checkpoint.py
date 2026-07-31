@@ -198,22 +198,29 @@ _ALL_PHASES = ["recon", "probe", "fuzz", "scan", "verify", "gate", "logic_hunter
 
 
 async def mark_remaining_phases_skipped(
-    conn: asyncpg.Connection, project_id: int, target_id: int, after_phase: str
+    conn: asyncpg.Connection, project_id: int, target_id: int, after_phase: str | None,
+    reason: str = "no live hosts found in probe phase (signal-based budgeting)",
 ) -> None:
     """
     Signal-based budgeting: when a target shows zero signal (e.g. probe
-    found no live hosts), running fuzz/scan against it would just waste
-    time and compute for no benefit. Rather than silently doing nothing,
-    we explicitly create 'completed' rows for the skipped phases with a
-    clear error_message explaining why - so this shows up honestly in
-    phase-runs as "skipped, here's why" rather than looking like it never
-    ran or like something crashed.
+    found no live hosts, or a batch-24 dead-target pre-flight check
+    found every previously-known host unreachable), running the rest of
+    the pipeline against it would just waste time and compute for no
+    benefit. Rather than silently doing nothing, we explicitly create
+    'completed' rows for the skipped phases with a clear error_message
+    explaining why - so this shows up honestly in phase-runs as
+    "skipped, here's why" rather than looking like it never ran or like
+    something crashed.
+
+    after_phase=None means skip EVERY phase from the start (used by the
+    dead-target pre-flight check, which runs before recon even begins) -
+    otherwise skips everything after the named phase, as before.
 
     There's no separate 'skipped' status in the schema (avoiding a
     migration for Phase 2) - 'completed' + an explanatory message is the
     honest, queryable choice here.
     """
-    remaining = _ALL_PHASES[_ALL_PHASES.index(after_phase) + 1:]
+    remaining = _ALL_PHASES if after_phase is None else _ALL_PHASES[_ALL_PHASES.index(after_phase) + 1:]
     now = datetime.now(timezone.utc)
 
     for phase_name in remaining:
@@ -227,7 +234,7 @@ async def mark_remaining_phases_skipped(
             target_id,
             phase_name,
             now,
-            f"Skipped: no live hosts found in probe phase (signal-based budgeting)",
+            f"Skipped: {reason}",
         )
 
 
