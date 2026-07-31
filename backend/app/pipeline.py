@@ -91,6 +91,17 @@ _XFF_BYPASS_CHECK_CAP = 15
 _REFERER_BYPASS_CHECK_CAP = 15
 _APIKEY_IN_URL_CHECK_CAP = 25  # pure pattern match, no extra requests
 _PW_RESET_ENUM_CHECK_CAP = 10
+# Batch 22 - data/access impact probes. Each does at least one extra
+# live request beyond its candidate-only predecessor, so capped at the
+# same conservative level as the other request-issuing checks above.
+# (The 3 host-level probes - GraphQL field exposure, admin functional
+# access, JWT forgery - don't need their own cap constant, same as
+# every other host-level check: they run once per host inside the
+# already-capped live_hosts[:10] loop, not their own candidate list.)
+_IDOR_IMPACT_CHECK_CAP = 15
+_SQLI_UNION_CHECK_CAP = 10
+_LFI_CONFIRM_CHECK_CAP = 10
+_BUCKET_OBJECT_EXTRACT_CHECK_CAP = 15
 
 logger = logging.getLogger("swas.pipeline")
 
@@ -598,6 +609,14 @@ async def _phase_scan(
         if graphql_mutation_result is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, graphql_mutation_result)
 
+        # Batch 22: GraphQL sensitive field over-exposure impact probe.
+        # Builds on the introspection check above - only does real work
+        # when a readable schema with a sensitive-named field was found.
+        logger.info("detective: running GraphQL sensitive field exposure probe for %s", host)
+        graphql_field_exposure_result = await detective.check_graphql_sensitive_field_exposure(host)
+        if graphql_field_exposure_result is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, graphql_field_exposure_result)
+
         # Batch 15: GraphQL query via GET. Recon-only - grouped with
         # the other GraphQL checks above.
         logger.info("detective: running GraphQL GET query check for %s", host)
@@ -702,6 +721,15 @@ async def _phase_scan(
         if jwt_weak_secret_result is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, jwt_weak_secret_result)
 
+        # Batch 22: JWT forged privilege escalation impact probe.
+        # Builds on the weak-secret check above - only does real work
+        # when a secret was actually crackable, then forges and
+        # resubmits a privilege-escalated token to prove acceptance.
+        logger.info("detective: running JWT forged privilege escalation probe for %s", host)
+        jwt_forge_result = await detective.check_jwt_forged_privilege_escalation(host)
+        if jwt_forge_result is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, jwt_forge_result)
+
         # Batch 14: JWT 'kid' header injection candidate. Recon-only -
         # grouped with the other JWT checks above.
         logger.info("detective: running JWT kid injection check for %s", host)
@@ -726,6 +754,15 @@ async def _phase_scan(
         admin_panel_note = await detective.check_exposed_admin_panel(host)
         if admin_panel_note is not None:
             await _save_scan_note_pooled(pool, project_id, target_id, "exposed_admin_panel", admin_panel_note)
+
+        # Batch 22: admin panel no-auth functional access impact probe.
+        # Complements the reachability note above - fires only when the
+        # panel renders real admin-area content with no login form and
+        # no auth challenge at all.
+        logger.info("detective: running admin panel functional access probe for %s", host)
+        admin_functional_result = await detective.check_admin_panel_no_auth_functional_access(host)
+        if admin_functional_result is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, admin_functional_result)
 
         # Batches 15/17: infra-level checks grouped together.
         logger.info("detective: running SPF/DMARC check for %s", host)
@@ -1241,6 +1278,26 @@ async def _phase_scan(
         if res is not None:
             await _save_scan_note_pooled(pool, project_id, target_id, "idor_candidate", res)
 
+    # Detective check: IDOR impact probe (batch 22). Reuses the same
+    # candidate list as the recon-only note above, but this one DOES
+    # issue requests - see check_idor_unauthenticated_object_access's
+    # own docstring for why that's safe to automate (only fires when
+    # the endpoint requires no auth at all).
+    idor_impact_candidates = sane_discovered_urls[:_IDOR_IMPACT_CHECK_CAP]
+    logger.info(
+        "detective: running IDOR impact probe against %d URL(s)", len(idor_impact_candidates)
+    )
+    idor_impact_results = await asyncio.gather(
+        *(detective.check_idor_unauthenticated_object_access(url) for url in idor_impact_candidates),
+        return_exceptions=True,
+    )
+    for res in idor_impact_results:
+        if isinstance(res, Exception):
+            logger.debug("IDOR impact probe raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
     # Detective check: reflected XSS (batch 9).
     xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]
     logger.info(
@@ -1272,6 +1329,26 @@ async def _phase_scan(
     for res in sqli_error_results:
         if isinstance(res, Exception):
             logger.debug("error-based SQLi check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+    # Detective check: SQL injection UNION-based data extraction impact
+    # probe (batch 22). Same candidate list/cost profile as the
+    # error-based check - one baseline request plus a small column-
+    # count ladder per parameter.
+    sqli_union_candidates = [url for url in sane_discovered_urls if "=" in url][:_SQLI_UNION_CHECK_CAP]
+    logger.info(
+        "detective: running SQLi UNION extraction probe against %d candidate URL(s)",
+        len(sqli_union_candidates),
+    )
+    sqli_union_results = await asyncio.gather(
+        *(detective.check_sqli_union_data_extraction(url) for url in sqli_union_candidates),
+        return_exceptions=True,
+    )
+    for res in sqli_union_results:
+        if isinstance(res, Exception):
+            logger.debug("SQLi UNION extraction probe raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
@@ -1331,6 +1408,26 @@ async def _phase_scan(
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
+    # Detective check: LFI second-file confirmation impact probe
+    # (batch 22). Only does real work when the base path-traversal
+    # check above already found a working payload for a given URL, so
+    # this reuses the same candidate list rather than a separate one.
+    lfi_confirm_candidates = [url for url in sane_discovered_urls if "=" in url][:_LFI_CONFIRM_CHECK_CAP]
+    logger.info(
+        "detective: running LFI arbitrary-file confirmation probe against %d candidate URL(s)",
+        len(lfi_confirm_candidates),
+    )
+    lfi_confirm_results = await asyncio.gather(
+        *(detective.check_lfi_arbitrary_file_confirmation(url) for url in lfi_confirm_candidates),
+        return_exceptions=True,
+    )
+    for res in lfi_confirm_results:
+        if isinstance(res, Exception):
+            logger.debug("LFI arbitrary-file confirmation probe raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
     # Detective check: OS command injection, blind timing-based
     # (batch 10). Same cost profile as the SQLi timing check - each
     # real hit costs several deliberate seconds - so capped tighter.
@@ -1366,6 +1463,26 @@ async def _phase_scan(
     for res in bucket_results:
         if isinstance(res, Exception):
             logger.debug("cloud storage bucket exposure check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+    # Detective check: cloud storage bucket object extraction impact
+    # probe (batch 22). Same candidate list/cost profile as the base
+    # bucket-listing check - one extra read-only GET only fires when a
+    # listable bucket AND a real object key were both already found.
+    bucket_object_candidates = sane_discovered_urls[:_BUCKET_OBJECT_EXTRACT_CHECK_CAP]
+    logger.info(
+        "detective: running storage bucket object extraction probe against %d URL(s)",
+        len(bucket_object_candidates),
+    )
+    bucket_object_results = await asyncio.gather(
+        *(detective.check_storage_bucket_object_extraction(url) for url in bucket_object_candidates),
+        return_exceptions=True,
+    )
+    for res in bucket_object_results:
+        if isinstance(res, Exception):
+            logger.debug("storage bucket object extraction probe raised: %s", res)
             continue
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
