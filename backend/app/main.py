@@ -1503,6 +1503,7 @@ async def list_findings(project_id: int):
             SELECT f.id, f.project_id, f.target_id, f.tool_name, f.vuln_type, f.severity,
                    f.evidence, f.raw_output_path, f.status,
                    f.likely_program_outcome, f.triage_reasoning, f.triage_confidence,
+                   f.occurrence_count,
                    f.created_at,
                    EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id) AS has_logged_outcome
             FROM findings f
@@ -2244,13 +2245,35 @@ async def diff_latest_scans(project_id: int):
 
 # ---------- CSV export ----------
 
+_VALID_EXPORT_SEVERITIES = {"critical", "high", "medium", "low", "info", "unknown"}
+
+
+def _parse_severities_param(severities: Optional[str]) -> Optional[list[str]]:
+    """Parses a comma-separated severities query param, e.g.
+    'critical,high'. Returns None (meaning "no filter, everything") if
+    the param wasn't given at all - unfiltered stays the default so
+    old links/bookmarks to the export URL keep working. Unknown values
+    are dropped rather than raising, so a typo just narrows the filter
+    instead of 500ing the export."""
+    if severities is None:
+        return None
+    requested = {s.strip().lower() for s in severities.split(",") if s.strip()}
+    valid = [s for s in requested if s in _VALID_EXPORT_SEVERITIES]
+    return valid or None
+
+
 @app.get("/api/projects/{project_id}/findings/export")
-async def export_findings_csv(project_id: int):
+async def export_findings_csv(project_id: int, severities: Optional[str] = None):
     """
-    Exports every finding for this project as CSV - meant for pasting
-    into a submission draft or archiving outside the tool, not as a
+    Exports findings for this project as CSV - meant for pasting into a
+    submission draft or archiving outside the tool, not as a
     replacement for the readiness checklist.
+
+    `severities` (optional, comma-separated e.g. "critical,high")
+    filters which severities are included. Omit it to export
+    everything, same as before this param existed.
     """
+    sev_filter = _parse_severities_param(severities)
     pool = database.get_pool()
     async with pool.acquire() as conn:
         project = await conn.fetchrow("SELECT name FROM projects WHERE id = $1", project_id)
@@ -2263,6 +2286,7 @@ async def export_findings_csv(project_id: int):
             FROM findings f
             JOIN scope_targets st ON st.id = f.target_id
             WHERE f.project_id = $1
+              AND ($2::text[] IS NULL OR f.severity = ANY($2::text[]))
             ORDER BY
                 CASE f.severity
                     WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
@@ -2270,7 +2294,7 @@ async def export_findings_csv(project_id: int):
                 END,
                 f.created_at DESC
             """,
-            project_id,
+            project_id, sev_filter,
         )
 
     buffer = io.StringIO()
@@ -2409,7 +2433,7 @@ async def get_report_draft(finding_id: int):
 
 
 @app.get("/api/projects/{project_id}/report.md")
-async def generate_markdown_report(project_id: int):
+async def generate_markdown_report(project_id: int, severities: Optional[str] = None):
     """
     A submission-ready Markdown report: scope table, then findings
     grouped by severity with evidence in code blocks. Markdown rather
@@ -2417,7 +2441,13 @@ async def generate_markdown_report(project_id: int):
     note fields render Markdown directly, and it avoids adding a PDF-
     rendering dependency (weasyprint/wkhtmltopdf) to the Docker image
     just for this. Paste-and-go for a report body, or open in any editor.
+
+    `severities` (optional, comma-separated e.g. "critical,high")
+    limits which findings are included - 'info' rarely belongs in a
+    submission-ready report and is worth excluding by default from the
+    UI, though the API itself still defaults to everything if omitted.
     """
+    sev_filter = _parse_severities_param(severities)
     pool = database.get_pool()
     async with pool.acquire() as conn:
         project = await conn.fetchrow(
@@ -2440,6 +2470,7 @@ async def generate_markdown_report(project_id: int):
             FROM findings f
             JOIN scope_targets st ON st.id = f.target_id
             WHERE f.project_id = $1
+              AND ($2::text[] IS NULL OR f.severity = ANY($2::text[]))
             ORDER BY
                 CASE f.severity
                     WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
@@ -2447,7 +2478,7 @@ async def generate_markdown_report(project_id: int):
                 END,
                 f.created_at DESC
             """,
-            project_id,
+            project_id, sev_filter,
         )
 
     lines: list[str] = []

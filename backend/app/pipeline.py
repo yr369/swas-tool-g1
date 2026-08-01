@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, evidence_lifecycle, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from . import checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -2749,15 +2749,11 @@ async def _save_nuclei_findings(
             unparsed_lines.append(line)
             continue
 
-        finding_id = await conn.fetchval(
-            """
-            INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
-            VALUES ($1, $2, 'nuclei', $3, $4, $5)
-            RETURNING id
-            """,
-            project_id, target_id, vuln_type, severity, line[:1000],
+        finding_id, is_new = await finding_dedup.upsert_finding(
+            conn, project_id, target_id, 'nuclei', vuln_type, severity, line[:1000],
         )
-        await _upsert_finding_cluster(conn, target_id, finding_id, 'nuclei')
+        if is_new:
+            await _upsert_finding_cluster(conn, target_id, finding_id, 'nuclei')
         saved_count += 1
 
     if unparsed_lines:
@@ -2837,18 +2833,14 @@ async def _save_finding(
         logger.info("fp_filter: all %s output was noise, skipping finding", tool_name)
         return
 
-    finding_id = await conn.fetchval(
-        """
-        INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
-        VALUES ($1, $2, $3, $4, 'unknown', $5)
-        RETURNING id
-        """,
-        project_id,
-        target_id,
-        tool_name,
+    finding_id, is_new = await finding_dedup.upsert_finding(
+        conn, project_id, target_id, tool_name,
         tool_name,  # Phase 1: vuln_type defaults to the tool name until triage exists
+        'unknown',
         cleaned_output[:5000],  # cap stored evidence length
     )
+    if not is_new:
+        return
     await _upsert_finding_cluster(conn, target_id, finding_id, tool_name)
 
     # Batch 24: archive the FULL evidence to disk if it was truncated
@@ -2911,17 +2903,12 @@ async def _save_detective_finding(
     """
     self_declared_prefix = f"[self-declared-severity: {result['severity']}]\n"
     full_evidence = self_declared_prefix + result["evidence"]
-    finding_id = await conn.fetchval(
-        """
-        INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence)
-        VALUES ($1, $2, 'detective', $3, 'unknown', $4)
-        RETURNING id
-        """,
-        project_id,
-        target_id,
-        result["vuln_type"],
-        full_evidence[:5000],
+    finding_id, is_new = await finding_dedup.upsert_finding(
+        conn, project_id, target_id, 'detective',
+        result["vuln_type"], 'unknown', full_evidence[:5000],
     )
+    if not is_new:
+        return
     await _upsert_finding_cluster(conn, target_id, finding_id, 'detective')
 
     # Batch 24: same archival as _save_finding above.

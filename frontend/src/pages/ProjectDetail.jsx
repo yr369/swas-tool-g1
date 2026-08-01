@@ -317,21 +317,7 @@ export function ProjectDetail() {
         </Section>
       </div>
 
-      <Section
-        title="Findings"
-        aside={
-          findings.length > 0 && (
-            <span style={{ display: "flex", gap: 12 }}>
-              <a href={api.reportUrl(id)} style={{ fontSize: 12, color: "var(--accent)" }}>
-                Download report (.md)
-              </a>
-              <a href={api.exportFindingsUrl(id)} style={{ fontSize: 12, color: "var(--accent)" }}>
-                Export CSV
-              </a>
-            </span>
-          )
-        }
-      >
+      <Section title="Findings">
         {findings.length > 0 && (
           <div style={{ marginBottom: 12 }}>
             <button onClick={handleTriageAll} disabled={triagingAll} style={secondaryButtonStyle}>
@@ -339,7 +325,7 @@ export function ProjectDetail() {
             </button>
           </div>
         )}
-        <FindingsList findings={findings} onTriaged={loadAll} />
+        <FindingsList findings={findings} onTriaged={loadAll} projectId={id} />
       </Section>
 
       <Section title="Notes for manual review">

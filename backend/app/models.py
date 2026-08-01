@@ -281,6 +281,7 @@ class Finding(BaseModel):
     triage_reasoning: Optional[str] = None
     triage_confidence: Optional[float] = None
     has_logged_outcome: bool = False
+    occurrence_count: int = 1
     created_at: datetime
 
 

@@ -126,8 +126,10 @@ export const api = {
     const qs = params.toString();
     return request(`/findings${qs ? `?${qs}` : ""}`);
   },
-  exportFindingsUrl: (projectId) => `${BASE}/projects/${projectId}/findings/export`,
-  reportUrl: (projectId) => `${BASE}/projects/${projectId}/report.md`,
+  exportFindingsUrl: (projectId, severities) =>
+    `${BASE}/projects/${projectId}/findings/export${severities?.length ? `?severities=${severities.join(",")}` : ""}`,
+  reportUrl: (projectId, severities) =>
+    `${BASE}/projects/${projectId}/report.md${severities?.length ? `?severities=${severities.join(",")}` : ""}`,
   bulkUpdateFindingStatus: (findingIds, status) =>
     request("/findings/bulk-status", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
 

@@ -220,6 +220,18 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
         </div>
         <div style={{ minWidth: 90, color: "var(--text-secondary)" }} className="mono">
           {finding.tool_name}
+          {finding.occurrence_count > 1 && (
+            <span
+              className="mono"
+              style={{
+                marginLeft: 6, fontSize: 10, color: "var(--text-muted)",
+                border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0 4px",
+              }}
+              title={`Seen ${finding.occurrence_count} times across scans - collapsed into one finding`}
+            >
+              ×{finding.occurrence_count}
+            </span>
+          )}
         </div>
         {finding.likely_program_outcome && (
           <div style={{ minWidth: 0 }}>
@@ -333,7 +345,7 @@ function SeverityChip({ severity, count, active, onToggle }) {
   );
 }
 
-export function FindingsList({ findings, onTriaged }) {
+export function FindingsList({ findings, onTriaged, projectId }) {
   // "info" findings are rarely submittable and tend to bury the signal
   // in a long scan - hidden by default, one click on the Info chip
   // (existing severity-filter toggle) brings them back.
@@ -485,6 +497,23 @@ export function FindingsList({ findings, onTriaged }) {
               />
             ))}
           </div>
+          {projectId && (
+            <div style={{ display: "flex", gap: 12, fontSize: 12 }}>
+              <span style={{ color: "var(--text-muted)" }}>
+                Export selected severities ({activeSeverities.size} active):
+              </span>
+              <a
+                href={api.reportUrl(projectId, [...activeSeverities])}
+                style={{ color: "var(--accent)" }}
+                title="Only the checked severities above are included - uncheck 'info' etc. before generating if you don't want it in the report"
+              >
+                Report (.md)
+              </a>
+              <a href={api.exportFindingsUrl(projectId, [...activeSeverities])} style={{ color: "var(--accent)" }}>
+                CSV
+              </a>
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8 }}>
             <input
               type="text"
