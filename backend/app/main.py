@@ -15,6 +15,7 @@ import asyncio
 import csv
 import io
 import logging
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -24,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -655,6 +656,97 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/api/health/dashboard")
+async def health_dashboard():
+    """
+    Batch 25 item 1. Everything /api/health doesn't tell you: AI model
+    rotation health (circuit breaker state + today's usage - items 2/3),
+    whether every required tool binary is present AND at the pinned
+    version (batch 26 item 2), whether nuclei's template set is stale
+    (batch 26 item 1), whether OOB/interactsh confirmation is even
+    possible on this deployment, how many phase runs have failed/needed
+    attention in the last 24h across all projects, and - if any project
+    is flagged as a synthetic canary - whether its latest scan's finding
+    count has drifted from its baseline (batch 25 item 4: a silent sign
+    something in the pipeline itself broke, independent of any real
+    target's actual results).
+
+    Deliberately read-only and side-effect-free - safe to poll from a
+    dashboard on a timer. Each section fails independently (wrapped so
+    one broken check, e.g. a tool binary genuinely missing, can't take
+    the whole dashboard down) - a section reporting an error is itself
+    useful signal, not a 500.
+    """
+    pool = database.get_pool()
+
+    async def _safe(coro):
+        try:
+            return await coro
+        except Exception as exc:  # noqa: BLE001 - a broken health CHECK is itself a health signal, not a crash
+            return {"error": str(exc)}
+
+    async with pool.acquire() as conn:
+        db_ok = True
+        try:
+            await conn.fetchval("SELECT 1")
+        except Exception:
+            db_ok = False
+
+        recent_failures = await conn.fetch(
+            """
+            SELECT phase_name, status, count(*) AS n
+            FROM phase_runs
+            WHERE started_at > now() - interval '24 hours'
+              AND status IN ('failed', 'needs_attention')
+            GROUP BY phase_name, status
+            ORDER BY n DESC
+            """
+        )
+
+        canary_rows = await conn.fetch(
+            """
+            SELECT p.id, p.name, p.canary_baseline_finding_count,
+                   (SELECT count(*) FROM findings f
+                    JOIN scope_targets t ON t.id = f.target_id
+                    WHERE t.project_id = p.id) AS current_finding_count
+            FROM projects p
+            WHERE p.is_canary = true
+            """
+        )
+
+    canaries = []
+    for row in canary_rows:
+        baseline = row["canary_baseline_finding_count"]
+        current = row["current_finding_count"]
+        canaries.append({
+            "project_id": row["id"],
+            "project_name": row["name"],
+            "baseline_finding_count": baseline,
+            "current_finding_count": current,
+            "drifted": (baseline is not None and current != baseline),
+        })
+
+    tool_versions = await _safe(tools.check_tool_version_drift())
+
+    return {
+        "database_ok": db_ok,
+        "ai": {
+            "circuit_breaker": gemini_rotation.get_circuit_breaker_status(),
+            "usage_today": gemini_rotation.get_usage_stats(),
+        },
+        "tools": {
+            "binaries_present": {name: shutil.which(name) is not None for name in config._REQUIRED_BINARIES},
+            "version_drift": tool_versions,
+            "nuclei_templates": tools.check_nuclei_template_freshness(),
+        },
+        "oob_available": oob.is_available(),
+        "recent_phase_failures_24h": [
+            {"phase": r["phase_name"], "status": r["status"], "count": r["n"]} for r in recent_failures
+        ],
+        "canary_targets": canaries,
+    }
+
+
 # ---------- Projects ----------
 
 @app.post("/api/projects", response_model=Project)
@@ -681,6 +773,7 @@ async def list_projects():
             """
             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
                    p.next_scheduled_scan_at, p.created_at,
+                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
             FROM projects p
@@ -752,6 +845,7 @@ async def get_project(project_id: int):
             """
             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
                    p.next_scheduled_scan_at, p.created_at,
+                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
             FROM projects p WHERE p.id = $1
@@ -766,14 +860,23 @@ async def get_project(project_id: int):
 @app.patch("/api/projects/{project_id}", response_model=Project)
 async def update_project(project_id: int, payload: ProjectUpdate):
     """
-    Renames a project and/or moves it to a different platform/folder.
-    Doesn't touch scope, findings, or scan history - this is metadata
-    only, for the case where a program's listing changes name or a
-    target turns out to belong to a different platform than first
-    entered.
+    Renames a project and/or moves it to a different platform/folder,
+    and/or (batch 26) sets a per-project AI model override, and/or
+    (batch 25) flags/configures it as a synthetic canary target. Doesn't
+    touch scope, findings, or scan history - this is metadata only.
+
+    preferred_ai_model: pass "" (empty string) to explicitly clear an
+    existing override back to the hardcoded default - None/omitted
+    leaves whatever's currently set unchanged, same COALESCE pattern as
+    name/platform.
     """
-    if payload.name is None and payload.platform is None:
-        raise HTTPException(status_code=400, detail="Provide at least one of name or platform")
+    if all(
+        v is None for v in (
+            payload.name, payload.platform, payload.preferred_ai_model,
+            payload.is_canary, payload.canary_baseline_finding_count,
+        )
+    ):
+        raise HTTPException(status_code=400, detail="Provide at least one field to update")
     if payload.name is not None and not payload.name.strip():
         raise HTTPException(status_code=400, detail="name can't be empty")
 
@@ -783,18 +886,32 @@ async def update_project(project_id: int, payload: ProjectUpdate):
         if existing is None:
             raise HTTPException(status_code=404, detail="Project not found")
 
+        # "" means "clear the override" (NULL), distinct from None/omitted
+        # ("leave whatever's currently set unchanged") - COALESCE alone
+        # can't express that distinction, so it's handled explicitly.
+        preferred_ai_model_value = (
+            None if payload.preferred_ai_model == "" else payload.preferred_ai_model
+        )
+        clear_model_override = payload.preferred_ai_model == ""
+
         await conn.execute(
             """
             UPDATE projects
-            SET name = COALESCE($2, name), platform = COALESCE($3, platform)
+            SET name = COALESCE($2, name),
+                platform = COALESCE($3, platform),
+                preferred_ai_model = CASE WHEN $6 THEN NULL ELSE COALESCE($4, preferred_ai_model) END,
+                is_canary = COALESCE($5, is_canary),
+                canary_baseline_finding_count = COALESCE($7, canary_baseline_finding_count)
             WHERE id = $1
             """,
-            project_id, payload.name, payload.platform,
+            project_id, payload.name, payload.platform, preferred_ai_model_value,
+            payload.is_canary, clear_model_override, payload.canary_baseline_finding_count,
         )
         row = await conn.fetchrow(
             """
             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
                    p.next_scheduled_scan_at, p.created_at,
+                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
             FROM projects p WHERE p.id = $1

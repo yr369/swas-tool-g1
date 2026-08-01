@@ -270,3 +270,37 @@ async def recover_interrupted_runs(conn: asyncpg.Connection) -> int:
             "Interrupted: app restarted while this phase was in progress",
         )
     return len(interrupted)
+
+
+# ---------------------------------------------------------------------
+# Batch 26 item 4 - idempotent scan resume.
+# ---------------------------------------------------------------------
+# How long after a phase's most recent 'completed' row we still trust
+# it as "part of the same scan attempt". Long enough to cover a
+# container restart/redeploy cycle (exactly the scenario a batch
+# deploy like this one creates), short enough that a genuinely NEW
+# scheduled rescan hours/days later correctly re-runs every phase fresh
+# instead of skipping stale work.
+RESUME_WINDOW_MINUTES = 90
+
+
+async def get_recently_completed_phases(conn: asyncpg.Connection, target_id: int) -> set[str]:
+    """
+    Returns the set of phase names that already have a 'completed'
+    phase_runs row for this target within RESUME_WINDOW_MINUTES. Used by
+    run_target_pipeline's PHASES loop to skip re-running work that's
+    almost certainly from THIS scan attempt (interrupted by a crash/
+    redeploy, then re-triggered) rather than genuinely stale - recon
+    already had its own longer-lived cache for this same reason, this
+    extends the same idea to every other phase using data the pipeline
+    already records for every phase run, no new state to keep in sync.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT phase_name FROM phase_runs
+        WHERE target_id = $1 AND status = 'completed'
+          AND completed_at > now() - ($2 || ' minutes')::interval
+        """,
+        target_id, RESUME_WINDOW_MINUTES,
+    )
+    return {r["phase_name"] for r in rows}

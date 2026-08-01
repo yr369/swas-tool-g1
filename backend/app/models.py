@@ -45,6 +45,16 @@ class ProjectUpdate(BaseModel):
     # vice versa. At least one must be set (checked in the endpoint).
     name: Optional[str] = None
     platform: Optional[PlatformType] = None
+    # Batch 26 item 3: per-project AI model override. None/omitted means
+    # "leave whatever's currently set unchanged" for a PATCH - to
+    # explicitly clear an override back to the hardcoded default, pass
+    # the empty string "", which the endpoint treats as NULL.
+    preferred_ai_model: Optional[str] = None
+    # Batch 25 item 4: mark/unmark this project as a synthetic canary,
+    # and (re)set its baseline finding count - see health_dashboard's
+    # docstring for what this is used for.
+    is_canary: Optional[bool] = None
+    canary_baseline_finding_count: Optional[int] = None
 
 
 # ---------- Authenticated / multi-account testing ----------
@@ -80,6 +90,9 @@ class Project(BaseModel):
     created_at: datetime
     last_scan_at: Optional[datetime] = None
     scan_count: int = 0
+    preferred_ai_model: Optional[str] = None
+    is_canary: bool = False
+    canary_baseline_finding_count: Optional[int] = None
 
 
 class ScheduleUpdateRequest(BaseModel):

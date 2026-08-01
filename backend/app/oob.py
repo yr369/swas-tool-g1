@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 
 logger = logging.getLogger("swas.oob")
 
@@ -46,6 +47,15 @@ _POLL_WAIT_SECONDS = 8
 _STARTUP_TIMEOUT_SECONDS = 15
 
 _DOMAIN_LINE_RE = re.compile(r"([a-z0-9]{20,40}\.oast\.[a-z]+)", re.IGNORECASE)
+
+
+def is_available() -> bool:
+    """Cheap presence check (no process launch) - batch 25's health
+    dashboard uses this to show whether blind-SSRF/XSS-cookie-exfil OOB
+    confirmation is even possible on this deployment, without paying
+    the cost of actually starting and tearing down a real session."""
+    return shutil.which("interactsh-client") is not None
+
 
 
 async def start_session() -> tuple[str | None, "asyncio.subprocess.Process | None"]:

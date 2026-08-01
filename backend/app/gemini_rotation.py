@@ -386,7 +386,7 @@ async def _try_models_on_client(client, models: list[str], prompt: str, breaker_
     return None, None, last_error, any_attempted
 
 
-async def generate_with_rotation(
+async def _generate_with_rotation_inner(
     client: genai.Client,
     prompt: str,
     preferred_model: str | None = None,
@@ -468,3 +468,96 @@ async def generate_with_rotation(
         )
     logger.error("All Gemini models AND all tier-2 providers exhausted/failed")
     raise last_error
+
+
+# ---------------------------------------------------------------------
+# Batch 25 - rate-limit budget tracking (item 2) + per-project cost/
+# token tracking (item 3). Both share one mechanism: every successful
+# call always increments a "global" bucket (item 2 - works for every
+# existing caller automatically, nothing else to wire up) and, if the
+# caller passed a tracking_key, ALSO increments that specific bucket
+# (item 3 - opt-in per-project attribution). In-memory, per-process -
+# same tradeoff already accepted for the circuit breaker above: resets
+# on restart, which is fine for a "how much have we used today/this
+# session" dashboard number, not meant as permanent billing history.
+# ---------------------------------------------------------------------
+_GLOBAL_USAGE_KEY = "_global"
+_usage_by_key: dict[str, dict] = {}
+
+
+def _record_usage(tracking_key: str | None, model: str, prompt_tokens: int, output_tokens: int, estimated: bool) -> None:
+    for key in (_GLOBAL_USAGE_KEY, tracking_key):
+        if key is None:
+            continue
+        bucket = _usage_by_key.setdefault(
+            key, {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "estimated_tokens": 0, "by_model": {}}
+        )
+        bucket["calls"] += 1
+        if estimated:
+            bucket["estimated_tokens"] += prompt_tokens + output_tokens
+        else:
+            bucket["prompt_tokens"] += prompt_tokens
+            bucket["output_tokens"] += output_tokens
+        model_bucket = bucket["by_model"].setdefault(model, 0)
+        bucket["by_model"][model] = model_bucket + 1
+
+
+def get_usage_stats(tracking_key: str | None = None) -> dict:
+    """
+    Returns the usage bucket for `tracking_key` (e.g. "project:42"), or
+    the GLOBAL bucket (every call from every caller, regardless of
+    tracking_key) if none given - this is what the health dashboard's
+    rate-limit budget view (batch 25 item 2) reads. Returns a zeroed
+    bucket, never None/KeyError, for a key that hasn't seen any calls
+    yet - a fresh project asking for its usage shouldn't need a
+    try/except.
+    """
+    key = tracking_key or _GLOBAL_USAGE_KEY
+    return _usage_by_key.get(
+        key, {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "estimated_tokens": 0, "by_model": {}}
+    )
+
+
+async def generate_with_rotation(
+    client: genai.Client,
+    prompt: str,
+    preferred_model: str | None = None,
+    extra_clients: list[genai.Client] | None = _AUTO_EXTRA_CLIENTS,
+    tracking_key: str | None = None,
+):
+    """
+    Thin wrapper around _generate_with_rotation_inner (which has all the
+    actual rotation/retry/circuit-breaker logic - see its docstring)
+    that additionally records token usage for the batch 25 observability
+    work. tracking_key is entirely optional and additive - omitting it
+    (every pre-existing call site) behaves EXACTLY as before; passing
+    e.g. "project:42" additionally attributes this call's usage to that
+    project for the per-project cost dashboard.
+
+    Real Gemini responses expose response.usage_metadata with real
+    prompt/candidates token counts - used directly when available. The
+    tier-2 fallback's _TextResponse stand-in doesn't carry token counts
+    (the OpenAI-compatible providers' responses aren't parsed for usage
+    here), so those calls fall back to a rough word-count-based
+    estimate, clearly flagged as estimated in the returned stats rather
+    than presented as if they were exact.
+    """
+    response, model = await _generate_with_rotation_inner(client, prompt, preferred_model, extra_clients)
+
+    usage = getattr(response, "usage_metadata", None)
+    if usage is not None and getattr(usage, "prompt_token_count", None) is not None:
+        _record_usage(
+            tracking_key, model,
+            usage.prompt_token_count or 0,
+            getattr(usage, "candidates_token_count", 0) or 0,
+            estimated=False,
+        )
+    else:
+        # Tier-2 provider or a Gemini SDK version without usage_metadata -
+        # rough estimate only (~4 chars/token is the standard rule of
+        # thumb), clearly marked as such in the stats bucket.
+        estimated_prompt = len(prompt) // 4
+        estimated_output = len(getattr(response, "text", "") or "") // 4
+        _record_usage(tracking_key, model, estimated_prompt, estimated_output, estimated=True)
+
+    return response, model

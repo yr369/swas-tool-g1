@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 
 logger = logging.getLogger("swas.tools")
@@ -505,3 +506,119 @@ async def run_notify(message: str) -> ToolResult:
         ["notify", "-silent"],
         timeout_seconds=30,
     )
+
+
+# =======================================================================
+# Batch 26 - tool freshness/version awareness. Both items here answer
+# the same underlying question in two different ways: "are the tools
+# this whole pipeline depends on still current, or quietly stale?" A
+# stale nuclei template set silently misses recent CVE coverage with no
+# error or warning anywhere - it just finds less. A tool binary that's
+# drifted way ahead of (or behind) what this codebase was built/tested
+# against is a common source of "works on my machine" pipeline breakage.
+# =======================================================================
+
+# ---------------------------------------------------------------------
+# 1. Nuclei template freshness check
+# ---------------------------------------------------------------------
+NUCLEI_TEMPLATES_DIR = os.environ.get("NUCLEI_TEMPLATES_DIR", "/root/nuclei-templates")
+_TEMPLATE_STALENESS_DAYS = 7
+
+
+def check_nuclei_template_freshness() -> dict:
+    """
+    Nuclei's template repository gets new CVE coverage added constantly -
+    a template set that's even a couple weeks stale is silently missing
+    real, currently-exploitable coverage with zero error or warning
+    anywhere in a normal scan run. Rather than shelling out to `nuclei
+    -update-templates` (which touches the network and can be slow),
+    this is a cheap filesystem check: the templates directory's mtime
+    (updated by nuclei itself whenever `-update-templates` last ran, or
+    by the Docker image build step) versus now(). Returns
+    {"fresh": bool, "days_stale": float|None, "template_dir_exists": bool}
+    - fresh is False whenever days_stale exceeds _TEMPLATE_STALENESS_DAYS
+    OR the directory doesn't exist at all (can't tell how stale
+    "missing" is, so it's treated as maximally not-fresh).
+    """
+    if not os.path.isdir(NUCLEI_TEMPLATES_DIR):
+        return {"fresh": False, "days_stale": None, "template_dir_exists": False}
+
+    try:
+        mtime = os.path.getmtime(NUCLEI_TEMPLATES_DIR)
+    except OSError:
+        return {"fresh": False, "days_stale": None, "template_dir_exists": True}
+
+    days_stale = (time.time() - mtime) / 86400
+    return {
+        "fresh": days_stale <= _TEMPLATE_STALENESS_DAYS,
+        "days_stale": round(days_stale, 1),
+        "template_dir_exists": True,
+    }
+
+
+# ---------------------------------------------------------------------
+# 2. Tool/version pinning + changelog awareness
+# ---------------------------------------------------------------------
+# The version each tool was last confirmed working against. Not
+# enforced (an unpinned/newer tool isn't blocked from running) - purely
+# informational drift detection for the health dashboard, since a
+# silent tool upgrade (e.g. a `go install ...@latest` picking up a
+# breaking CLI flag change on the next image rebuild) is a real,
+# previously-invisible source of pipeline breakage.
+PINNED_TOOL_VERSIONS = {
+    "subfinder": "2.6.6",
+    "httpx-pd": "1.6.8",
+    "nuclei": "3.3.0",
+    "ffuf": "2.1.0",
+    "sqlmap": "1.8.8",
+    "arjun": "2.2.6",
+    "dalfox": "2.11.0",
+}
+_VERSION_FLAG_BY_TOOL = {
+    "subfinder": "-version",
+    "httpx-pd": "-version",
+    "nuclei": "-version",
+    "ffuf": "-V",
+    "sqlmap": "--version",
+    "arjun": "--version",
+    "dalfox": "version",
+}
+_VERSION_NUMBER_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
+
+
+async def check_tool_version_drift() -> dict:
+    """
+    Runs each pinned tool's version flag and compares the parsed version
+    number against PINNED_TOOL_VERSIONS. Returns a dict keyed by tool
+    name: {"installed": str|None, "pinned": str, "drifted": bool|None} -
+    drifted is None (not True/False) when the installed version couldn't
+    be determined at all (binary missing, unexpected output format) -
+    that's a DIFFERENT problem than "drifted from the pin" and shouldn't
+    be reported as if it were the same thing. Informational only - never
+    blocks a tool from running, matches this module's existing
+    philosophy of failing open on anything that isn't a hard timeout/
+    crash risk.
+    """
+    results: dict[str, dict] = {}
+    for tool_name, pinned_version in PINNED_TOOL_VERSIONS.items():
+        flag = _VERSION_FLAG_BY_TOOL.get(tool_name, "--version")
+        try:
+            result = await run_tool(tool_name, [tool_name, flag], timeout_seconds=15)
+        except Exception as exc:  # noqa: BLE001 - any failure here means "can't tell", not "drifted"
+            logger.info("tools: version check failed for %s: %s", tool_name, exc)
+            results[tool_name] = {"installed": None, "pinned": pinned_version, "drifted": None}
+            continue
+
+        combined_output = (result.stdout or "") + (result.stderr or "")
+        match = _VERSION_NUMBER_RE.search(combined_output)
+        if not match:
+            results[tool_name] = {"installed": None, "pinned": pinned_version, "drifted": None}
+            continue
+
+        installed_version = match.group(0)
+        results[tool_name] = {
+            "installed": installed_version,
+            "pinned": pinned_version,
+            "drifted": installed_version != pinned_version,
+        }
+    return results

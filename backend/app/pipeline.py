@@ -178,11 +178,71 @@ async def run_target_pipeline(
     params_found: dict[str, bool] = {}
     tech_stack: dict[str, list[str]] = {}  # host -> list of detected technologies
 
-    for phase_name in PHASES:
-        success = await _run_phase_with_retry(
-            pool, project_id, target_id, phase_name, target,
-            discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
+    # Batch 26 item 4: idempotent scan resume. Cheap to always check -
+    # recently_completed_phases is empty for the overwhelmingly common
+    # case (a fresh scan, nothing to resume), in which case every phase
+    # just runs normally below, unchanged from before this feature.
+    # When phases WERE recently completed (this run was interrupted by
+    # a crash/redeploy and got re-triggered), rehydrate the state those
+    # phases produced so later phases have what they need without
+    # re-running the ones that already finished.
+    async with pool.acquire() as conn:
+        recently_completed_phases = await checkpoint.get_recently_completed_phases(conn, target_id)
+        if "recon" in recently_completed_phases:
+            # recon already has its own cache mechanism (_get_recon_cache_if_fresh) -
+            # reuse it directly rather than re-deriving subdomains another way.
+            cached_subdomains = await _get_recon_cache_if_fresh(pool, target_id)
+            if cached_subdomains:
+                discovered_subdomains.extend(cached_subdomains)
+            else:
+                # Cache expired/missing even though a 'completed' row exists
+                # recently (edge case - cache TTL and resume window can
+                # differ) - can't safely skip recon without its output, so
+                # let it re-run rather than leave probe with nothing.
+                recently_completed_phases.discard("recon")
+        if recently_completed_phases & {"probe", "fuzz"}:
+            state_row = await conn.fetchrow(
+                "SELECT state_live_hosts, state_discovered_urls, state_params_found, state_tech_stack "
+                "FROM scope_targets WHERE id = $1",
+                target_id,
+            )
+            if state_row:
+                if state_row["state_live_hosts"]:
+                    live_hosts.extend(json.loads(state_row["state_live_hosts"]))
+                if state_row["state_discovered_urls"]:
+                    discovered_urls.extend(json.loads(state_row["state_discovered_urls"]))
+                if state_row["state_params_found"]:
+                    params_found.update(json.loads(state_row["state_params_found"]))
+                if state_row["state_tech_stack"]:
+                    tech_stack.update(json.loads(state_row["state_tech_stack"]))
+    if recently_completed_phases:
+        logger.info(
+            "target_id=%s (%s): resuming - phase(s) %s already completed within the last "
+            "%d minutes, skipping re-run",
+            target_id, target, sorted(recently_completed_phases), checkpoint.RESUME_WINDOW_MINUTES,
         )
+
+    for phase_name in PHASES:
+        if phase_name in recently_completed_phases:
+            # Already done this scan attempt (see above) - counts as a
+            # success for the purposes of the loop below (scope-drift
+            # check, dead-target-after-probe check, etc. all still run
+            # normally using the rehydrated state).
+            success = True
+        else:
+            success = await _run_phase_with_retry(
+                pool, project_id, target_id, phase_name, target,
+                discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
+            )
+            if success and phase_name in ("probe", "fuzz"):
+                # Snapshot state right after the two phases that
+                # populate it, so a crash during a LATER phase
+                # (scan/verify/...) can still resume without re-doing
+                # probe/fuzz's work.
+                async with pool.acquire() as conn:
+                    await _persist_pipeline_state(
+                        conn, target_id, live_hosts, discovered_urls, params_found, tech_stack
+                    )
         if not success:
             logger.warning(
                 "Stopping pipeline for target_id=%s after %s phase failed",
@@ -2482,6 +2542,39 @@ async def _save_recon_cache_pooled(pool: asyncpg.Pool, target_id: int, subdomain
             "UPDATE scope_targets SET recon_cache = $1, recon_cached_at = now() WHERE id = $2",
             json.dumps(subdomains), target_id,
         )
+
+
+# Cap how much of each list gets persisted - this is a resume snapshot,
+# not a permanent record (findings/scan_notes already own that job), so
+# keeping it bounded matters more than keeping every last entry.
+_STATE_SNAPSHOT_LIST_CAP = 500
+
+
+async def _persist_pipeline_state(
+    conn: asyncpg.Connection,
+    target_id: int,
+    live_hosts: list[str],
+    discovered_urls: list[str],
+    params_found: dict[str, bool],
+    tech_stack: dict[str, list[str]],
+) -> None:
+    """Batch 26 item 4: snapshots what probe/fuzz discovered so a scan
+    interrupted by a crash/redeploy can resume without re-running them -
+    see checkpoint.get_recently_completed_phases and this function's
+    counterpart, the rehydration block at the top of run_target_pipeline."""
+    await conn.execute(
+        """
+        UPDATE scope_targets
+        SET state_live_hosts = $1, state_discovered_urls = $2,
+            state_params_found = $3, state_tech_stack = $4, state_updated_at = now()
+        WHERE id = $5
+        """,
+        json.dumps(live_hosts[:_STATE_SNAPSHOT_LIST_CAP]),
+        json.dumps(discovered_urls[:_STATE_SNAPSHOT_LIST_CAP]),
+        json.dumps(params_found),
+        json.dumps(tech_stack),
+        target_id,
+    )
 
 
 # 401/403 on an unauthenticated probe is a reasonable (not certain) signal

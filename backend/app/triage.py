@@ -249,7 +249,8 @@ def _apply_impact_evidence_cap(result: dict) -> dict:
 
 async def triage_finding(
     tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None,
-    self_declared_severity: str | None = None,
+    self_declared_severity: str | None = None, project_id: int | None = None,
+    preferred_model_override: str | None = None,
 ) -> dict:
     """
     Returns {"severity": str, "confidence": float, "reasoning": str,
@@ -257,6 +258,20 @@ async def triage_finding(
     small on purpose - evidence is capped, and we send one finding at a
     time rather than dumping unrelated context, so cost scales with
     actual findings, not with everything we happen to know.
+
+    project_id (batch 25, optional): when given, attributes this call's
+    token usage to that project via gemini_rotation's tracking_key, for
+    the per-project cost dashboard. Omitting it (unchanged from before)
+    still works exactly as before - only the GLOBAL usage bucket gets
+    incremented, nothing project-specific.
+
+    preferred_model_override (batch 26, optional): a project's
+    preferred_ai_model setting, if one was configured - used as the
+    starting model for BOTH the first-pass and escalation calls instead
+    of the hardcoded _CHEAP_MODEL/_ESCALATION_MODEL, while keeping the
+    exact same rotation/fallback behavior afterward (generate_with_rotation
+    still rotates through the rest of MODEL_ROTATION if the override
+    itself hits quota). None (the default) behaves exactly as before.
 
     outcome_stats (optional): aggregated past-outcome history for this
     finding's signature, from finding_outcomes via get_signature_stats().
@@ -299,7 +314,10 @@ async def triage_finding(
         # through the rest of MODEL_ROTATION automatically if it hits a
         # 429 quota error - so a single exhausted free-tier model no
         # longer kills triage for the rest of the scan.
-        response, model_used = await generate_with_rotation(client, prompt, preferred_model=_CHEAP_MODEL)
+        response, model_used = await generate_with_rotation(
+            client, prompt, preferred_model=preferred_model_override or _CHEAP_MODEL,
+            tracking_key=f"project:{project_id}" if project_id is not None else None,
+        )
         result = _parse_triage_response(response.text or "")
         result["model_used"] = model_used
     except Exception as exc:
@@ -321,7 +339,8 @@ async def triage_finding(
             # exhausted pro quota falls back through the rest of the
             # chain rather than giving up after one try.
             response, escalation_model_used = await generate_with_rotation(
-                client, prompt, preferred_model=_ESCALATION_MODEL
+                client, prompt, preferred_model=preferred_model_override or _ESCALATION_MODEL,
+                tracking_key=f"project:{project_id}" if project_id is not None else None,
             )
             escalated = _parse_triage_response(response.text or "")
             escalated["model_used"] = escalation_model_used
@@ -426,7 +445,9 @@ async def fetch_signature_stats(conn, signature: str) -> dict | None:
     return dict(row) if row and row["total"] else None
 
 
-async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: list[dict]) -> dict:
+async def _triage_and_store_finding(
+    conn, project_id: int, row, vrt_entries: list[dict], preferred_model_override: str | None = None
+) -> dict:
     """
     Runs triage_finding for ONE finding row, applies the adversarial
     skeptic pass if it qualifies, writes the result to `findings`, and
@@ -439,6 +460,11 @@ async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: lis
     (retry_pending_ai_failures, below) can redo exactly this same work
     for a single previously-failed finding, instead of drifting out of
     sync with a second, hand-copied version of this logic.
+
+    preferred_model_override (batch 26): the project's preferred_ai_model
+    setting, if one was configured - fetched ONCE per triage batch by
+    the caller (not per-finding, to avoid an extra query per row) and
+    passed straight through to triage_finding.
     """
     from . import target_intelligence
 
@@ -450,6 +476,7 @@ async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: lis
         row["tool_name"], clean_evidence,
         outcome_stats=outcome_stats, vrt_entries=vrt_entries,
         self_declared_severity=self_declared_severity,
+        project_id=project_id, preferred_model_override=preferred_model_override,
     )
 
     # Adversarial skeptic pass (#7): only for findings about to sail
@@ -536,6 +563,9 @@ async def triage_project_findings(conn, project_id: int) -> int:
     """
     from . import retry_queue, vrt as vrt_module
 
+    project_row = await conn.fetchrow("SELECT preferred_ai_model FROM projects WHERE id = $1", project_id)
+    preferred_model_override = project_row["preferred_ai_model"] if project_row else None
+
     rows = await conn.fetch(
         """
         SELECT id, target_id, tool_name, vuln_type, evidence FROM findings
@@ -547,7 +577,7 @@ async def triage_project_findings(conn, project_id: int) -> int:
     vrt_entries = await vrt_module.get_vrt_entries()  # fetched once, reused for every finding in this batch
     triaged = 0
     for row in rows:
-        result = await _triage_and_store_finding(conn, project_id, row, vrt_entries)
+        result = await _triage_and_store_finding(conn, project_id, row, vrt_entries, preferred_model_override)
 
         if result.get("ai_call_failed"):
             await retry_queue.enqueue(
@@ -583,6 +613,7 @@ async def retry_pending_ai_failures(pool) -> int:
             return 0
 
         vrt_entries = await vrt_module.get_vrt_entries()
+        preferred_model_by_project: dict[int, str | None] = {}
 
         for item in items:
             payload = item["payload"]
@@ -591,6 +622,12 @@ async def retry_pending_ai_failures(pool) -> int:
                 payload = json.loads(payload)
             finding_id = payload["finding_id"]
             project_id = payload["project_id"]
+
+            if project_id not in preferred_model_by_project:
+                project_row = await conn.fetchrow(
+                    "SELECT preferred_ai_model FROM projects WHERE id = $1", project_id
+                )
+                preferred_model_by_project[project_id] = project_row["preferred_ai_model"] if project_row else None
 
             row = await conn.fetchrow(
                 "SELECT id, target_id, tool_name, vuln_type, evidence, severity FROM findings WHERE id = $1",
@@ -609,7 +646,9 @@ async def retry_pending_ai_failures(pool) -> int:
                 continue
 
             try:
-                result = await _triage_and_store_finding(conn, project_id, row, vrt_entries)
+                result = await _triage_and_store_finding(
+                    conn, project_id, row, vrt_entries, preferred_model_by_project[project_id]
+                )
                 if result.get("ai_call_failed"):
                     # triage_finding itself caught the exception and
                     # returned the "failed" sentinel rather than raising -
