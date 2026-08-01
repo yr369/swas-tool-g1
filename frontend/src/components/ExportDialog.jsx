@@ -21,7 +21,7 @@ const SEVERITY_LABEL = {
   medium: "Medium",
   low: "Low",
   info: "Info",
-  unknown: "Note", // "unknown" severity in the DB - findings with no real severity yet read as "Note" to a human
+  unknown: "Note (untriaged)", // "unknown" severity in the DB - exports as "NOTES FOR MANUAL REVIEW"
 };
 
 const STEPS = ["format", "primaryDim", "primaryValues", "secondaryDim", "secondaryValues"];

@@ -2324,7 +2324,8 @@ async def export_findings_csv(
     for row in rows:
         writer.writerow([
             row["id"], row["target"], row["tool_name"], row["vuln_type"],
-            row["severity"], row["status"], (row["evidence"] or "").replace("\n", " "), row["created_at"],
+            _SEVERITY_DISPLAY.get(row["severity"], row["severity"]),
+            row["status"], (row["evidence"] or "").replace("\n", " "), row["created_at"],
         ])
     buffer.seek(0)
 
@@ -2340,6 +2341,19 @@ async def export_findings_csv(
 # ---------- Markdown report ----------
 
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"]
+
+# "unknown" severity means the finding hasn't been triaged into a real
+# severity yet (raw tool output, e.g. sqlmap) - not a severity level a
+# reviewer should read past without noticing, hence the loud label
+# instead of just "Unknown" in both CSV and the report.
+_SEVERITY_DISPLAY = {
+    "critical": "Critical",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+    "info": "Info",
+    "unknown": "NOTES FOR MANUAL REVIEW",
+}
 
 
 _IMPACT_TEMPLATES = {
@@ -2545,7 +2559,7 @@ async def generate_markdown_report(
             rows_for_sev = by_severity.get(sev)
             if not rows_for_sev:
                 continue
-            lines.append(f"### {sev.title()} ({len(rows_for_sev)})")
+            lines.append(f"### {_SEVERITY_DISPLAY.get(sev, sev.title())} ({len(rows_for_sev)})")
             lines.append("")
             for f in rows_for_sev:
                 lines.append(f"- **{f['target']}** — `{f['tool_name']}` / {f['vuln_type']} _{f['status']}_")
