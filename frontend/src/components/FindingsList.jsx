@@ -13,6 +13,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { Donut } from "./charts/Donut";
+import { ExportDialog } from "./ExportDialog";
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "unknown"];
 
@@ -378,6 +379,11 @@ export function FindingsList({ findings, onTriaged, projectId }) {
     [findings]
   );
 
+  const vulnTypes = useMemo(
+    () => Array.from(new Set(findings.map((f) => f.vuln_type).filter(Boolean))).sort(),
+    [findings]
+  );
+
   function toggleSeverity(sev) {
     setActiveSeverities((prev) => {
       const next = new Set(prev);
@@ -498,21 +504,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
             ))}
           </div>
           {projectId && (
-            <div style={{ display: "flex", gap: 12, fontSize: 12 }}>
-              <span style={{ color: "var(--text-muted)" }}>
-                Export selected severities ({activeSeverities.size} active):
-              </span>
-              <a
-                href={api.reportUrl(projectId, [...activeSeverities])}
-                style={{ color: "var(--accent)" }}
-                title="Only the checked severities above are included - uncheck 'info' etc. before generating if you don't want it in the report"
-              >
-                Report (.md)
-              </a>
-              <a href={api.exportFindingsUrl(projectId, [...activeSeverities])} style={{ color: "var(--accent)" }}>
-                CSV
-              </a>
-            </div>
+            <ExportDialog projectId={projectId} tools={tools} vulnTypes={vulnTypes} defaultSeverities={[...activeSeverities]} />
           )}
           <div style={{ display: "flex", gap: 8 }}>
             <input

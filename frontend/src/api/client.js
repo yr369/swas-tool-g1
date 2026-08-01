@@ -126,10 +126,18 @@ export const api = {
     const qs = params.toString();
     return request(`/findings${qs ? `?${qs}` : ""}`);
   },
-  exportFindingsUrl: (projectId, severities) =>
-    `${BASE}/projects/${projectId}/findings/export${severities?.length ? `?severities=${severities.join(",")}` : ""}`,
-  reportUrl: (projectId, severities) =>
-    `${BASE}/projects/${projectId}/report.md${severities?.length ? `?severities=${severities.join(",")}` : ""}`,
+  buildExportQuery: ({ severities, tools, vulnTypes } = {}) => {
+    const params = new URLSearchParams();
+    if (severities?.length) params.set("severities", severities.join(","));
+    if (tools?.length) params.set("tools", tools.join(","));
+    if (vulnTypes?.length) params.set("vuln_types", vulnTypes.join(","));
+    const qs = params.toString();
+    return qs ? `?${qs}` : "";
+  },
+  exportFindingsUrl: (projectId, filters) =>
+    `${BASE}/projects/${projectId}/findings/export${api.buildExportQuery(filters)}`,
+  reportUrl: (projectId, filters) =>
+    `${BASE}/projects/${projectId}/report.md${api.buildExportQuery(filters)}`,
   bulkUpdateFindingStatus: (findingIds, status) =>
     request("/findings/bulk-status", { method: "PATCH", body: JSON.stringify({ finding_ids: findingIds, status }) }),
 

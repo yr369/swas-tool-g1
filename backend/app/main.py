@@ -2262,18 +2262,37 @@ def _parse_severities_param(severities: Optional[str]) -> Optional[list[str]]:
     return valid or None
 
 
+def _parse_csv_param(value: Optional[str]) -> Optional[list[str]]:
+    """Same shape as _parse_severities_param but for tool_name/vuln_type,
+    which aren't a fixed enum - no allowlist to check against, so
+    anything given through is passed to the query as-is (parameterized,
+    not interpolated, so this is not an injection risk)."""
+    if value is None:
+        return None
+    items = [v.strip() for v in value.split(",") if v.strip()]
+    return items or None
+
+
 @app.get("/api/projects/{project_id}/findings/export")
-async def export_findings_csv(project_id: int, severities: Optional[str] = None):
+async def export_findings_csv(
+    project_id: int,
+    severities: Optional[str] = None,
+    tools: Optional[str] = None,
+    vuln_types: Optional[str] = None,
+):
     """
     Exports findings for this project as CSV - meant for pasting into a
     submission draft or archiving outside the tool, not as a
     replacement for the readiness checklist.
 
-    `severities` (optional, comma-separated e.g. "critical,high")
-    filters which severities are included. Omit it to export
-    everything, same as before this param existed.
+    All three filters are optional and comma-separated
+    (e.g. severities="critical,high", tools="nuclei,sqlmap"). Omit any
+    of them to not filter on that dimension - omitting all three
+    exports everything, same as before these params existed.
     """
     sev_filter = _parse_severities_param(severities)
+    tool_filter = _parse_csv_param(tools)
+    vuln_filter = _parse_csv_param(vuln_types)
     pool = database.get_pool()
     async with pool.acquire() as conn:
         project = await conn.fetchrow("SELECT name FROM projects WHERE id = $1", project_id)
@@ -2287,6 +2306,8 @@ async def export_findings_csv(project_id: int, severities: Optional[str] = None)
             JOIN scope_targets st ON st.id = f.target_id
             WHERE f.project_id = $1
               AND ($2::text[] IS NULL OR f.severity = ANY($2::text[]))
+              AND ($3::text[] IS NULL OR f.tool_name = ANY($3::text[]))
+              AND ($4::text[] IS NULL OR f.vuln_type = ANY($4::text[]))
             ORDER BY
                 CASE f.severity
                     WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
@@ -2294,7 +2315,7 @@ async def export_findings_csv(project_id: int, severities: Optional[str] = None)
                 END,
                 f.created_at DESC
             """,
-            project_id, sev_filter,
+            project_id, sev_filter, tool_filter, vuln_filter,
         )
 
     buffer = io.StringIO()
@@ -2433,7 +2454,12 @@ async def get_report_draft(finding_id: int):
 
 
 @app.get("/api/projects/{project_id}/report.md")
-async def generate_markdown_report(project_id: int, severities: Optional[str] = None):
+async def generate_markdown_report(
+    project_id: int,
+    severities: Optional[str] = None,
+    tools: Optional[str] = None,
+    vuln_types: Optional[str] = None,
+):
     """
     A submission-ready Markdown report: scope table, then findings
     grouped by severity with evidence in code blocks. Markdown rather
@@ -2442,12 +2468,15 @@ async def generate_markdown_report(project_id: int, severities: Optional[str] = 
     rendering dependency (weasyprint/wkhtmltopdf) to the Docker image
     just for this. Paste-and-go for a report body, or open in any editor.
 
-    `severities` (optional, comma-separated e.g. "critical,high")
-    limits which findings are included - 'info' rarely belongs in a
-    submission-ready report and is worth excluding by default from the
-    UI, though the API itself still defaults to everything if omitted.
+    All three filters are optional and comma-separated
+    (severities="critical,high", tools="nuclei,sqlmap",
+    vuln_types="sqli,xss"). Omit any of them to skip filtering on that
+    dimension - omitting all three exports everything, same as before
+    these params existed.
     """
     sev_filter = _parse_severities_param(severities)
+    tool_filter = _parse_csv_param(tools)
+    vuln_filter = _parse_csv_param(vuln_types)
     pool = database.get_pool()
     async with pool.acquire() as conn:
         project = await conn.fetchrow(
@@ -2471,6 +2500,8 @@ async def generate_markdown_report(project_id: int, severities: Optional[str] = 
             JOIN scope_targets st ON st.id = f.target_id
             WHERE f.project_id = $1
               AND ($2::text[] IS NULL OR f.severity = ANY($2::text[]))
+              AND ($3::text[] IS NULL OR f.tool_name = ANY($3::text[]))
+              AND ($4::text[] IS NULL OR f.vuln_type = ANY($4::text[]))
             ORDER BY
                 CASE f.severity
                     WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
@@ -2478,7 +2509,7 @@ async def generate_markdown_report(project_id: int, severities: Optional[str] = 
                 END,
                 f.created_at DESC
             """,
-            project_id, sev_filter,
+            project_id, sev_filter, tool_filter, vuln_filter,
         )
 
     lines: list[str] = []
