@@ -1,9 +1,13 @@
--- batch25_26_migration.sql
--- Batch 25: synthetic canary target support.
--- Batch 26: per-project AI model override.
+-- 016_canary_and_resume_state.sql
 --
--- Apply the same way as prior migrations:
---   docker compose exec -T postgres bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < batch25_26_migration.sql
+-- Batch 25: synthetic canary target support.
+-- Batch 26: per-project AI model override + idempotent scan resume.
+--
+-- Folded in from the loose batch25_26_migration.sql that used to sit at
+-- repo root outside the numbered sequence (repo compaction pass).
+--
+-- Run manually, same as every other migration:
+--   docker compose exec -T postgres bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < backend/db/migrations/016_canary_and_resume_state.sql
 
 -- Batch 26 item 3: per-project AI model override. NULL (the default)
 -- means "use the hardcoded _CHEAP_MODEL/_ESCALATION_MODEL as before" -

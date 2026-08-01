@@ -6,6 +6,7 @@ const GROUPS = [
       ["G then H", "Chronology"],
       ["G then T", "Triage queue"],
       ["G then D", "Dashboard"],
+      ["G then O", "System"],
       ["G then C", "Scheduled scans"],
       ["G then S", "Signature stats"],
       ["G then N", "New project"],

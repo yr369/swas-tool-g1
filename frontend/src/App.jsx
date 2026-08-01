@@ -5,6 +5,7 @@ import { Chronology } from "./pages/Chronology";
 import { NewProject } from "./pages/NewProject";
 import { ProjectDetail } from "./pages/ProjectDetail";
 import { Dashboard } from "./pages/Dashboard";
+import { Observability } from "./pages/Observability";
 import { SignatureStats } from "./pages/SignatureStats";
 import { ScheduledScans } from "./pages/ScheduledScans";
 import { TriageQueue } from "./pages/TriageQueue";
@@ -37,7 +38,7 @@ function Shell() {
       if (gPending.current) {
         gPending.current = false;
         clearTimeout(gTimer.current);
-        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new", t: "/triage", h: "/chronology" }[
+        const dest = { p: "/", d: "/dashboard", c: "/scheduled", s: "/signatures", n: "/new", t: "/triage", h: "/chronology", o: "/system" }[
           e.key.toLowerCase()
         ];
         if (dest) {
@@ -107,6 +108,7 @@ function Shell() {
               <Route path="/" element={<ProjectList />} />
               <Route path="/chronology" element={<Chronology />} />
               <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/system" element={<Observability />} />
               <Route path="/scheduled" element={<ScheduledScans />} />
               <Route path="/triage" element={<TriageQueue />} />
               <Route path="/report/:findingId" element={<ReportBuilder />} />

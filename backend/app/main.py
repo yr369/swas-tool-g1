@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 import os
 
-from . import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+from . import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, readiness, report_writer, retry_queue, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
 from .models import (
     Project,
     ProjectCreate,
@@ -714,6 +714,47 @@ async def health_dashboard():
             """
         )
 
+        # Batch 27: retry queue depth (batch 20) and evidence-lifecycle
+        # signals (batch 24) weren't visible anywhere before this - both
+        # only existed as DB state a worker consumed silently. Surfacing
+        # them here means "AI calls are backed up" or "evidence is rotting
+        # faster than usual" shows up on the same dashboard as everything
+        # else, instead of requiring a manual SQL query to notice.
+        retry_queue_rows = await conn.fetch(
+            """
+            SELECT kind,
+                   count(*) FILTER (WHERE status = 'pending') AS pending,
+                   count(*) FILTER (WHERE status = 'failed'
+                                     AND updated_at > now() - interval '24 hours') AS failed_24h,
+                   min(next_attempt_at) FILTER (WHERE status = 'pending') AS oldest_pending_due_at
+            FROM ai_retry_queue
+            GROUP BY kind
+            ORDER BY pending DESC
+            """
+        )
+
+        evidence_rot_row = await conn.fetchrow(
+            """
+            SELECT
+                count(*) FILTER (WHERE evidence_integrity = 'rotted'
+                                  AND evidence_checked_at > now() - interval '7 days') AS rotted_7d,
+                count(*) FILTER (WHERE evidence_integrity = 'reproducible'
+                                  AND evidence_checked_at > now() - interval '7 days') AS reproducible_7d
+            FROM findings
+            """
+        )
+
+        dead_target_rows = await conn.fetch(
+            """
+            SELECT t.id, t.target, t.dead_since, p.id AS project_id, p.name AS project_name
+            FROM scope_targets t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.dead_since IS NOT NULL
+            ORDER BY t.dead_since DESC
+            LIMIT 10
+            """
+        )
+
     canaries = []
     for row in canary_rows:
         baseline = row["canary_baseline_finding_count"]
@@ -727,6 +768,17 @@ async def health_dashboard():
         })
 
     tool_versions = await _safe(tools.check_tool_version_drift())
+
+    dead_targets = [
+        {
+            "target_id": r["id"],
+            "target": r["target"],
+            "project_id": r["project_id"],
+            "project_name": r["project_name"],
+            "dead_since": r["dead_since"].isoformat() if r["dead_since"] else None,
+        }
+        for r in dead_target_rows
+    ]
 
     return {
         "database_ok": db_ok,
@@ -744,6 +796,20 @@ async def health_dashboard():
             {"phase": r["phase_name"], "status": r["status"], "count": r["n"]} for r in recent_failures
         ],
         "canary_targets": canaries,
+        "retry_queue": [
+            {
+                "kind": r["kind"],
+                "pending": r["pending"],
+                "failed_24h": r["failed_24h"],
+                "oldest_pending_due_at": r["oldest_pending_due_at"].isoformat() if r["oldest_pending_due_at"] else None,
+            }
+            for r in retry_queue_rows
+        ],
+        "evidence": {
+            "rotted_7d": evidence_rot_row["rotted_7d"] if evidence_rot_row else 0,
+            "reproducible_7d": evidence_rot_row["reproducible_7d"] if evidence_rot_row else 0,
+            "dead_targets": dead_targets,
+        },
     }
 
 

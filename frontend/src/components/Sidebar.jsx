@@ -6,6 +6,7 @@ const NAV = [
   { to: "/chronology", label: "Chronology", keys: "G H", icon: "◐" },
   { to: "/triage", label: "Triage Queue", keys: "G T", icon: "▶" },
   { to: "/dashboard", label: "Dashboard", keys: "G D", icon: "◈" },
+  { to: "/system", label: "System", keys: "G O", icon: "◍" },
   { to: "/scheduled", label: "Scheduled", keys: "G C", icon: "◷" },
   { to: "/signatures", label: "Signatures", keys: "G S", icon: "◉" },
   { to: "/new", label: "New Project", keys: "G N", icon: "+" },

@@ -32,6 +32,9 @@ async function request(path, options = {}) {
 }
 
 export const api = {
+  // Ops / observability
+  healthDashboard: () => request("/health/dashboard"),
+
   // Projects
   listProjects: () => request("/projects"),
   listChronology: () => request("/projects/chronology"),

@@ -66,6 +66,7 @@ export function CommandPalette() {
       { id: "action:new-project", label: "New project", hint: "Create", go: () => navigate("/new") },
       { id: "action:triage", label: "Triage queue", hint: "Go to", go: () => navigate("/triage") },
       { id: "action:dashboard", label: "Dashboard", hint: "Go to", go: () => navigate("/dashboard") },
+      { id: "action:system", label: "System", hint: "Go to", go: () => navigate("/system") },
       { id: "action:scheduled", label: "Scheduled scans", hint: "Go to", go: () => navigate("/scheduled") },
       { id: "action:signatures", label: "Signature stats", hint: "Go to", go: () => navigate("/signatures") },
       { id: "action:projects", label: "All projects", hint: "Go to", go: () => navigate("/") },
