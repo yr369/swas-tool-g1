@@ -504,7 +504,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
             ))}
           </div>
           {projectId && (
-            <ExportDialog projectId={projectId} tools={tools} vulnTypes={vulnTypes} defaultSeverities={[...activeSeverities]} />
+            <ExportDialog projectId={projectId} tools={tools} vulnTypes={vulnTypes} />
           )}
           <div style={{ display: "flex", gap: 8 }}>
             <input

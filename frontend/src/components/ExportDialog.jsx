@@ -1,9 +1,14 @@
 /**
- * ExportDialog.jsx - "Export" button that opens a panel to pick format
- * (Markdown report or CSV) and narrow exactly which findings go into
- * it, by severity / tool / bug type. Nothing is exported until the
- * operator explicitly picks a format and hits Export - unlike the old
- * always-on links, an unopened dialog exports nothing.
+ * ExportDialog.jsx - "Export" button that walks through a step wizard
+ * before generating anything:
+ *   1. format (Markdown / CSV)
+ *   2. primary sort-by (Tool or Severity)
+ *   3. tick which values of that dimension to include
+ *   4. secondary sort-by (whichever dimension wasn't picked in step 2)
+ *   5. tick which values of THAT dimension to include
+ * Both tick-sets are ANDed together server-side - e.g. severity in
+ * {critical, high} AND tool in {nuclei, sqlmap}. Nothing is generated
+ * until the final step's Export button is pressed.
  */
 
 import { useState } from "react";
@@ -16,51 +21,49 @@ const SEVERITY_LABEL = {
   medium: "Medium",
   low: "Low",
   info: "Info",
-  unknown: "Note", // "unknown" severity in the DB, "Note" is how findings without a real severity read to a human
+  unknown: "Note", // "unknown" severity in the DB - findings with no real severity yet read as "Note" to a human
 };
 
-function CheckboxGroup({ title, options, labelFor, selected, onToggle, onSelectAll, onSelectNone }) {
-  if (options.length === 0) return null;
-  return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-        <span style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: "var(--text-muted)" }}>
-          {title}
-        </span>
-        <span style={{ display: "flex", gap: 8 }}>
-          <button type="button" onClick={onSelectAll} style={linkButtonStyle}>
-            all
-          </button>
-          <button type="button" onClick={onSelectNone} style={linkButtonStyle}>
-            none
-          </button>
-        </span>
-      </div>
-      <div
-        style={{
-          display: "flex", flexDirection: "column", gap: 4, maxHeight: 140, overflowY: "auto",
-          border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "6px 8px",
-        }}
-      >
-        {options.map((opt) => (
-          <label key={opt} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-            <input type="checkbox" checked={selected.has(opt)} onChange={() => onToggle(opt)} />
-            {labelFor ? labelFor(opt) : opt}
-          </label>
-        ))}
-      </div>
-    </div>
-  );
+const STEPS = ["format", "primaryDim", "primaryValues", "secondaryDim", "secondaryValues"];
+
+function optionsFor(dimension, tools, vulnTypes) {
+  return dimension === "severity" ? SEVERITY_ORDER : dimension === "tool" ? tools : vulnTypes;
 }
 
-export function ExportDialog({ projectId, tools, vulnTypes, defaultSeverities }) {
-  const [open, setOpen] = useState(false);
-  const [format, setFormat] = useState("md");
-  const [severities, setSeverities] = useState(() => new Set(defaultSeverities ?? SEVERITY_ORDER.filter((s) => s !== "info" && s !== "unknown")));
-  const [selectedTools, setSelectedTools] = useState(() => new Set(tools));
-  const [selectedVulnTypes, setSelectedVulnTypes] = useState(() => new Set(vulnTypes));
+function labelFor(dimension, value) {
+  return dimension === "severity" ? SEVERITY_LABEL[value] : value;
+}
 
-  function toggle(setFn, value) {
+function dimensionName(dimension) {
+  return dimension === "severity" ? "Severity" : dimension === "tool" ? "Tool" : "Bug type";
+}
+
+export function ExportDialog({ projectId, tools, vulnTypes }) {
+  const [open, setOpen] = useState(false);
+  const [stepIdx, setStepIdx] = useState(0);
+  const [format, setFormat] = useState("csv");
+  const [primaryDim, setPrimaryDim] = useState("severity");
+  const [primaryValues, setPrimaryValues] = useState(new Set());
+  const [secondaryDim, setSecondaryDim] = useState("tool");
+  const [secondaryValues, setSecondaryValues] = useState(new Set());
+
+  const step = STEPS[stepIdx];
+
+  function reset() {
+    setStepIdx(0);
+    setFormat("csv");
+    setPrimaryDim("severity");
+    setPrimaryValues(new Set());
+    setSecondaryDim("tool");
+    setSecondaryValues(new Set());
+  }
+
+  function close() {
+    setOpen(false);
+    reset();
+  }
+
+  function toggleValue(setFn, value) {
     setFn((prev) => {
       const next = new Set(prev);
       if (next.has(value)) next.delete(value);
@@ -69,23 +72,38 @@ export function ExportDialog({ projectId, tools, vulnTypes, defaultSeverities })
     });
   }
 
+  function goNext() {
+    if (step === "primaryDim") {
+      // Secondary dimension is whatever wasn't picked as primary - the
+      // remaining two options if primary was "tool" or "severity", but
+      // this UI only ever offers tool/severity as the two top-level
+      // choices, so secondary is simply the other one of those two.
+      setSecondaryDim(primaryDim === "severity" ? "tool" : "severity");
+      setPrimaryValues(new Set(optionsFor(primaryDim, tools, vulnTypes)));
+    }
+    if (step === "secondaryDim") {
+      setSecondaryValues(new Set(optionsFor(secondaryDim, tools, vulnTypes)));
+    }
+    setStepIdx((i) => Math.min(i + 1, STEPS.length - 1));
+  }
+
+  function goBack() {
+    setStepIdx((i) => Math.max(i - 1, 0));
+  }
+
   function handleExport() {
-    if (severities.size === 0) {
-      alert("Select at least one severity to export."); // eslint-disable-line no-alert -- simple enough not to need a toast system
+    if (primaryValues.size === 0 || secondaryValues.size === 0) {
+      alert("Tick at least one value in both filter steps."); // eslint-disable-line no-alert -- simple enough not to need a toast system
       return;
     }
     const filters = {
-      severities: [...severities],
-      // Only send tools/vulnTypes filters if something was deselected -
-      // "everything selected" and "no filter" produce the same export,
-      // and omitting the param when nothing was excluded keeps the URL
-      // short and matches what a fresh dialog would export by default.
-      tools: selectedTools.size < tools.length ? [...selectedTools] : undefined,
-      vulnTypes: selectedVulnTypes.size < vulnTypes.length ? [...selectedVulnTypes] : undefined,
+      severities: primaryDim === "severity" ? [...primaryValues] : [...secondaryValues],
+      tools: primaryDim === "tool" ? [...primaryValues] : secondaryDim === "tool" ? [...secondaryValues] : undefined,
+      vulnTypes: undefined, // bug-type drill-down not offered as a top-level step yet - only tool/severity are
     };
     const url = format === "md" ? api.reportUrl(projectId, filters) : api.exportFindingsUrl(projectId, filters);
     window.open(url, "_blank");
-    setOpen(false);
+    close();
   }
 
   return (
@@ -95,67 +113,130 @@ export function ExportDialog({ projectId, tools, vulnTypes, defaultSeverities })
       </button>
       {open && (
         <>
-          {/* click-outside catcher */}
-          <div style={{ position: "fixed", inset: 0, zIndex: 9 }} onClick={() => setOpen(false)} />
+          <div style={{ position: "fixed", inset: 0, zIndex: 9 }} onClick={close} />
           <div
             style={{
-              position: "absolute", right: 0, top: "calc(100% + 6px)", zIndex: 10, width: 280,
+              position: "absolute", right: 0, top: "calc(100% + 6px)", zIndex: 10, width: 300,
               background: "var(--bg-surface-raised)", border: "1px solid var(--border)",
-              borderRadius: "var(--radius)", padding: 14, boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+              borderRadius: "var(--radius)", padding: 16, boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
             }}
           >
-            <div style={{ marginBottom: 14 }}>
-              <span style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: "var(--text-muted)" }}>
-                Format
-              </span>
-              <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
-                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-                  <input type="radio" name="export-format" checked={format === "md"} onChange={() => setFormat("md")} />
-                  Markdown report
-                </label>
-                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
-                  <input type="radio" name="export-format" checked={format === "csv"} onChange={() => setFormat("csv")} />
-                  CSV
-                </label>
-              </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 10 }}>
+              Step {stepIdx + 1} of {STEPS.length}
             </div>
 
-            <CheckboxGroup
-              title="Severity"
-              options={SEVERITY_ORDER}
-              labelFor={(s) => SEVERITY_LABEL[s]}
-              selected={severities}
-              onToggle={(s) => toggle(setSeverities, s)}
-              onSelectAll={() => setSeverities(new Set(SEVERITY_ORDER))}
-              onSelectNone={() => setSeverities(new Set())}
-            />
-            <CheckboxGroup
-              title="Tool"
-              options={tools}
-              selected={selectedTools}
-              onToggle={(t) => toggle(setSelectedTools, t)}
-              onSelectAll={() => setSelectedTools(new Set(tools))}
-              onSelectNone={() => setSelectedTools(new Set())}
-            />
-            <CheckboxGroup
-              title="Bug type"
-              options={vulnTypes}
-              selected={selectedVulnTypes}
-              onToggle={(v) => toggle(setSelectedVulnTypes, v)}
-              onSelectAll={() => setSelectedVulnTypes(new Set(vulnTypes))}
-              onSelectNone={() => setSelectedVulnTypes(new Set())}
-            />
+            {step === "format" && (
+              <div>
+                <div style={labelStyle}>Format</div>
+                <label style={radioRowStyle}>
+                  <input type="radio" name="fmt" checked={format === "csv"} onChange={() => setFormat("csv")} />
+                  CSV
+                </label>
+                <label style={radioRowStyle}>
+                  <input type="radio" name="fmt" checked={format === "md"} onChange={() => setFormat("md")} />
+                  Markdown report
+                </label>
+              </div>
+            )}
 
-            <button
-              type="button"
-              onClick={handleExport}
-              style={{ ...smallButtonStyle, width: "100%", background: "var(--accent)", color: "var(--bg-base)", marginTop: 4 }}
-            >
-              Export
-            </button>
+            {step === "primaryDim" && (
+              <div>
+                <div style={labelStyle}>Sort by</div>
+                <label style={radioRowStyle}>
+                  <input type="radio" name="pdim" checked={primaryDim === "severity"} onChange={() => setPrimaryDim("severity")} />
+                  Severity
+                </label>
+                <label style={radioRowStyle}>
+                  <input type="radio" name="pdim" checked={primaryDim === "tool"} onChange={() => setPrimaryDim("tool")} />
+                  Tool
+                </label>
+              </div>
+            )}
+
+            {step === "primaryValues" && (
+              <ValueChecklist
+                title={`Tick ${dimensionName(primaryDim).toLowerCase()} values`}
+                options={optionsFor(primaryDim, tools, vulnTypes)}
+                dimension={primaryDim}
+                selected={primaryValues}
+                onToggle={(v) => toggleValue(setPrimaryValues, v)}
+                onAll={() => setPrimaryValues(new Set(optionsFor(primaryDim, tools, vulnTypes)))}
+                onNone={() => setPrimaryValues(new Set())}
+              />
+            )}
+
+            {step === "secondaryDim" && (
+              <div>
+                <div style={labelStyle}>Then further sort by</div>
+                <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 4 }}>
+                  {dimensionName(secondaryDim)} (the remaining dimension)
+                </div>
+              </div>
+            )}
+
+            {step === "secondaryValues" && (
+              <ValueChecklist
+                title={`Tick ${dimensionName(secondaryDim).toLowerCase()} values`}
+                options={optionsFor(secondaryDim, tools, vulnTypes)}
+                dimension={secondaryDim}
+                selected={secondaryValues}
+                onToggle={(v) => toggleValue(setSecondaryValues, v)}
+                onAll={() => setSecondaryValues(new Set(optionsFor(secondaryDim, tools, vulnTypes)))}
+                onNone={() => setSecondaryValues(new Set())}
+              />
+            )}
+
+            <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+              {stepIdx > 0 && (
+                <button type="button" onClick={goBack} style={{ ...smallButtonStyle, flex: 1 }}>
+                  Back
+                </button>
+              )}
+              {step !== "secondaryValues" ? (
+                <button type="button" onClick={goNext} style={{ ...smallButtonStyle, flex: 1 }}>
+                  Next
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleExport}
+                  style={{ ...smallButtonStyle, flex: 1, background: "var(--accent)", color: "var(--bg-base)" }}
+                >
+                  Export
+                </button>
+              )}
+            </div>
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function ValueChecklist({ title, options, dimension, selected, onToggle, onAll, onNone }) {
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={labelStyle}>{title}</span>
+        <span style={{ display: "flex", gap: 8 }}>
+          <button type="button" onClick={onAll} style={linkButtonStyle}>all</button>
+          <button type="button" onClick={onNone} style={linkButtonStyle}>none</button>
+        </span>
+      </div>
+      <div
+        style={{
+          display: "flex", flexDirection: "column", gap: 4, maxHeight: 160, overflowY: "auto",
+          border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "6px 8px",
+        }}
+      >
+        {options.length === 0 && <span style={{ fontSize: 12, color: "var(--text-muted)" }}>None available</span>}
+        {options.map((opt) => (
+          <label key={opt} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={selected.has(opt)} onChange={() => onToggle(opt)} />
+            {labelFor(dimension, opt)}
+          </label>
+        ))}
+      </div>
     </div>
   );
 }
@@ -177,4 +258,20 @@ const linkButtonStyle = {
   fontSize: 11,
   cursor: "pointer",
   padding: 0,
+};
+
+const labelStyle = {
+  fontSize: 11,
+  textTransform: "uppercase",
+  letterSpacing: 0.5,
+  color: "var(--text-muted)",
+};
+
+const radioRowStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  fontSize: 13,
+  cursor: "pointer",
+  padding: "4px 0",
 };
