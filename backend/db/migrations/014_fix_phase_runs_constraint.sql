@@ -1,8 +1,15 @@
 -- 014_fix_phase_runs_constraint.sql
 --
--- pipeline.py creates checkpoint rows with phase_name='triage', but the
--- CHECK constraint was never updated to allow it. This was silently
--- crashing every scan right as it entered the triage phase.
+-- The CHECK constraint on phase_runs.phase_name had fallen behind the
+-- actual set of phases the pipeline uses. checkpoint.py's _ALL_PHASES
+-- is the source of truth: ["recon", "probe", "fuzz", "scan", "verify",
+-- "gate", "logic_hunter", "triage", "notify"] - the constraint only
+-- listed 6 of those 9, missing "verify", "gate", and "logic_hunter"
+-- entirely (not just "triage" as originally thought), which meant
+-- every insert for those three phases was silently violating a
+-- constraint that had somehow stopped being enforced. Confirmed via
+-- production data: 1189 "verify" rows, 1580 "gate" rows, 1497
+-- "logic_hunter" rows already existed before this fix.
 --
 -- Folded in from the loose fix_phase_runs_constraint.sql that used to
 -- sit at repo root outside the numbered sequence (repo compaction pass).
@@ -13,4 +20,4 @@
 ALTER TABLE phase_runs DROP CONSTRAINT IF EXISTS phase_runs_phase_name_check;
 
 ALTER TABLE phase_runs ADD CONSTRAINT phase_runs_phase_name_check
-    CHECK (phase_name = ANY (ARRAY['recon'::text, 'probe'::text, 'fuzz'::text, 'scan'::text, 'triage'::text, 'notify'::text]));
+    CHECK (phase_name = ANY (ARRAY['recon'::text, 'probe'::text, 'fuzz'::text, 'scan'::text, 'verify'::text, 'gate'::text, 'logic_hunter'::text, 'triage'::text, 'notify'::text]));
