@@ -37,6 +37,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 _TAKEOVER_FINGERPRINTS: list[tuple[str, str, str]] = [
@@ -78,41 +79,41 @@ async def check_subdomain_takeover(hostname: str) -> dict | None:
         return None  # not a real hostname - scope-import junk, skip quietly
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            logger.info("detective: checking subdomain takeover for %s", hostname)
-            dns_resp = await client.get(
-                "https://cloudflare-dns.com/dns-query",
-                params={"name": hostname, "type": "CNAME"},
-                headers={"accept": "application/dns-json"},
-            )
-            if dns_resp.status_code != 200:
-                return None
-            answers = dns_resp.json().get("Answer", [])
-            cname_targets = [a["data"].rstrip(".") for a in answers if a.get("type") == 5]
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        logger.info("detective: checking subdomain takeover for %s", hostname)
+        dns_resp = await client.get(
+            "https://cloudflare-dns.com/dns-query",
+            params={"name": hostname, "type": "CNAME"},
+            headers={"accept": "application/dns-json"},
+        )
+        if dns_resp.status_code != 200:
+            return None
+        answers = dns_resp.json().get("Answer", [])
+        cname_targets = [a["data"].rstrip(".") for a in answers if a.get("type") == 5]
 
-            if not cname_targets:
-                return None
+        if not cname_targets:
+            return None
 
-            for cname in cname_targets:
-                for fingerprint, unclaimed_marker, service in _TAKEOVER_FINGERPRINTS:
-                    if fingerprint not in cname:
-                        continue
-                    try:
-                        page_resp = await client.get(
-                            f"https://{hostname}", follow_redirects=True
-                        )
-                        body = page_resp.text
-                    except httpx.HTTPError:
-                        body = ""
-                    if unclaimed_marker.lower() in body.lower():
-                        return {
-                            "vuln_type": "subdomain_takeover",
-                            "severity": "high",
-                            "evidence": (
-                                f"{hostname} CNAMEs to {cname} ({service}), which returns "
-                                f"an unclaimed-resource page. Likely takeover candidate."
-                            ),
-                        }
+        for cname in cname_targets:
+            for fingerprint, unclaimed_marker, service in _TAKEOVER_FINGERPRINTS:
+                if fingerprint not in cname:
+                    continue
+                try:
+                    page_resp = await client.get(
+                        f"https://{hostname}", follow_redirects=True
+                    )
+                    body = page_resp.text
+                except httpx.HTTPError:
+                    body = ""
+                if unclaimed_marker.lower() in body.lower():
+                    return {
+                        "vuln_type": "subdomain_takeover",
+                        "severity": "high",
+                        "evidence": (
+                            f"{hostname} CNAMEs to {cname} ({service}), which returns "
+                            f"an unclaimed-resource page. Likely takeover candidate."
+                        ),
+                    }
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("detective: takeover check failed for %s: %s", hostname, exc)
     return None
@@ -147,41 +148,41 @@ async def check_cache_deception(url: str) -> dict | None:
         # static-extension path isn't actually being served/cached as
         # its own resource - it's just bouncing to the homepage or a
         # catch-all, which is normal CDN caching, not deception.
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
-            first = await client.get(probe_url)
-            if first.status_code != 200:
-                return None
-            # A cache-deception candidate: the fake-static-extension path
-            # returned 200 with a body, AND either an explicit cache HIT
-            # header shows up, or the response looks like real page
-            # content (html) rather than a generic 404/error page.
-            cache_status = (
-                first.headers.get("x-cache", "")
-                or first.headers.get("cf-cache-status", "")
-                or first.headers.get("x-cache-status", "")
-            ).lower()
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        first = await client.get(probe_url)
+        if first.status_code != 200:
+            return None
+        # A cache-deception candidate: the fake-static-extension path
+        # returned 200 with a body, AND either an explicit cache HIT
+        # header shows up, or the response looks like real page
+        # content (html) rather than a generic 404/error page.
+        cache_status = (
+            first.headers.get("x-cache", "")
+            or first.headers.get("cf-cache-status", "")
+            or first.headers.get("x-cache-status", "")
+        ).lower()
 
-            second = await client.get(probe_url)
-            cache_status_2 = (
-                second.headers.get("x-cache", "")
-                or second.headers.get("cf-cache-status", "")
-                or second.headers.get("x-cache-status", "")
-            ).lower()
+        second = await client.get(probe_url)
+        cache_status_2 = (
+            second.headers.get("x-cache", "")
+            or second.headers.get("cf-cache-status", "")
+            or second.headers.get("x-cache-status", "")
+        ).lower()
 
-            looks_cached = "hit" in cache_status_2 and first.text == second.text
-            looks_like_real_page = "<html" in first.text.lower() and len(first.text) > 200
+        looks_cached = "hit" in cache_status_2 and first.text == second.text
+        looks_like_real_page = "<html" in first.text.lower() and len(first.text) > 200
 
-            if looks_cached and looks_like_real_page:
-                return {
-                    "vuln_type": "cache_deception",
-                    "severity": "high",
-                    "evidence": (
-                        f"{probe_url} returned HTTP 200 with page content and was served "
-                        f"from cache on a second request (cache status: {cache_status_2}). "
-                        f"Possible Web Cache Deception - private content may be cached and "
-                        f"served to other users."
-                    ),
-                }
+        if looks_cached and looks_like_real_page:
+            return {
+                "vuln_type": "cache_deception",
+                "severity": "high",
+                "evidence": (
+                    f"{probe_url} returned HTTP 200 with page content and was served "
+                    f"from cache on a second request (cache status: {cache_status_2}). "
+                    f"Possible Web Cache Deception - private content may be cached and "
+                    f"served to other users."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: cache deception check failed for %s: %s", url, exc)
     return None
@@ -212,8 +213,8 @@ async def check_file_entropy(url: str) -> dict | None:
         # else, we'd otherwise be scanning an unrelated landing page for
         # entropy and misattributing any hit to this path (the same bug
         # class that caused false heapdump findings).
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: entropy check fetch failed for %s: %s", url, exc)
         return None
@@ -274,8 +275,8 @@ async def check_open_redirect(url: str) -> dict | None:
     logger.info("detective: checking open redirect for %s", mutated)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
-            resp = await client.get(mutated)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        resp = await client.get(mutated)
     except httpx.HTTPError as exc:
         logger.info("detective: open redirect check failed for %s: %s", mutated, exc)
         return None
@@ -308,8 +309,8 @@ async def check_csp_weakness(url: str) -> str | None:
     effort. See the module docstring for why.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        resp = await client.get(url)
     except httpx.HTTPError:
         return None
 
@@ -342,37 +343,37 @@ async def check_graphql_introspection(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            for path in _GRAPHQL_PATHS:
-                url = base + path
-                logger.info("detective: checking GraphQL introspection for %s", url)
-                try:
-                    resp = await client.post(url, json=_INTROSPECTION_QUERY)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    data = resp.json()
-                except ValueError:
-                    continue
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        for path in _GRAPHQL_PATHS:
+            url = base + path
+            logger.info("detective: checking GraphQL introspection for %s", url)
+            try:
+                resp = await client.post(url, json=_INTROSPECTION_QUERY)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
 
-                schema = (data.get("data") or {}).get("__schema")
-                if not schema or not schema.get("types"):
-                    continue
+            schema = (data.get("data") or {}).get("__schema")
+            if not schema or not schema.get("types"):
+                continue
 
-                type_names = [t["name"] for t in schema["types"] if t.get("name")][:10]
-                mutation_type = (schema.get("mutationType") or {}).get("name")
-                return {
-                    "vuln_type": "graphql_introspection_exposed",
-                    "severity": "medium",
-                    "evidence": (
-                        f"{url} allows unauthenticated GraphQL introspection - "
-                        f"{len(schema['types'])} types exposed, including: "
-                        f"{', '.join(type_names)}"
-                        + (f". Mutation root: {mutation_type}" if mutation_type else "")
-                    ),
-                }
+            type_names = [t["name"] for t in schema["types"] if t.get("name")][:10]
+            mutation_type = (schema.get("mutationType") or {}).get("name")
+            return {
+                "vuln_type": "graphql_introspection_exposed",
+                "severity": "medium",
+                "evidence": (
+                    f"{url} allows unauthenticated GraphQL introspection - "
+                    f"{len(schema['types'])} types exposed, including: "
+                    f"{', '.join(type_names)}"
+                    + (f". Mutation root: {mutation_type}" if mutation_type else "")
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: GraphQL introspection check failed for %s: %s", host, exc)
     return None
@@ -398,8 +399,8 @@ async def check_waf_fingerprint(host: str) -> str | None:
     findings by less careful heuristics.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            resp = await client.get(host)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        resp = await client.get(host)
     except httpx.HTTPError:
         return None
 
@@ -544,15 +545,15 @@ async def check_apache_optionsbleed(host: str) -> dict | None:
     logger.info("detective: checking Apache OptionsBleed for %s", url)
     allow_headers: set[str] = set()
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            for _ in range(_OPTIONSBLEED_PROBE_COUNT):
-                try:
-                    resp = await client.request("OPTIONS", url)
-                except httpx.HTTPError:
-                    return None
-                allow = resp.headers.get("allow")
-                if allow:
-                    allow_headers.add(allow)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        for _ in range(_OPTIONSBLEED_PROBE_COUNT):
+            try:
+                resp = await client.request("OPTIONS", url)
+            except httpx.HTTPError:
+                return None
+            allow = resp.headers.get("allow")
+            if allow:
+                allow_headers.add(allow)
     except httpx.HTTPError as exc:
         logger.info("detective: OptionsBleed check failed for %s: %s", url, exc)
         return None
@@ -616,29 +617,29 @@ async def check_open_redirect_encoding_bypass(url: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            for param_name in redirect_params:
-                for payload in _OPEN_REDIRECT_ENCODED_PAYLOADS:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = payload
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    location = resp.headers.get("location", "")
-                    if resp.status_code in (301, 302, 303, 307, 308) and "evil-swas-redirect-probe.test" in location:
-                        return {
-                            "vuln_type": "open_redirect_encoding_bypass",
-                            "severity": "medium",
-                            "evidence": (
-                                f"{test_url}: parameter '{param_name}' with encoding-trick "
-                                f"payload {payload!r} produced a {resp.status_code} redirect to "
-                                f"Location: {location!r} - a naive prefix/domain validator was "
-                                f"bypassed. Note: open redirect is commonly rated Informative "
-                                f"without demonstrated chained impact - check program policy."
-                            ),
-                        }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        for param_name in redirect_params:
+            for payload in _OPEN_REDIRECT_ENCODED_PAYLOADS:
+                test_params = dict(existing_params)
+                test_params[param_name] = payload
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                location = resp.headers.get("location", "")
+                if resp.status_code in (301, 302, 303, 307, 308) and "evil-swas-redirect-probe.test" in location:
+                    return {
+                        "vuln_type": "open_redirect_encoding_bypass",
+                        "severity": "medium",
+                        "evidence": (
+                            f"{test_url}: parameter '{param_name}' with encoding-trick "
+                            f"payload {payload!r} produced a {resp.status_code} redirect to "
+                            f"Location: {location!r} - a naive prefix/domain validator was "
+                            f"bypassed. Note: open redirect is commonly rated Informative "
+                            f"without demonstrated chained impact - check program policy."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: open redirect encoding bypass check failed for %s: %s", url, exc)
     return None
@@ -663,15 +664,15 @@ async def check_unauthenticated_graphql_mutation(url: str) -> dict | None:
     disclosure.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.post(
-                    url,
-                    content=_GRAPHQL_BLIND_MUTATION_PROBES[0],
-                    headers={"Content-Type": "application/json"},
-                )
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.post(
+                url,
+                content=_GRAPHQL_BLIND_MUTATION_PROBES[0],
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: unauthenticated GraphQL mutation check failed for %s: %s", url, exc)
         return None
@@ -718,33 +719,33 @@ async def check_negative_number_business_logic_candidate(url: str) -> str | None
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if baseline_resp.status_code != 200:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if baseline_resp.status_code != 200:
+            return None
 
-            for param_name, value in numeric_params.items():
-                test_params = dict(existing_params)
-                test_params[param_name] = "-" + value
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                body_lower = resp.text[:2000].lower()
-                error_language = any(
-                    kw in body_lower for kw in ("invalid", "must be positive", "error", "bad request")
+        for param_name, value in numeric_params.items():
+            test_params = dict(existing_params)
+            test_params[param_name] = "-" + value
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            body_lower = resp.text[:2000].lower()
+            error_language = any(
+                kw in body_lower for kw in ("invalid", "must be positive", "error", "bad request")
+            )
+            if resp.status_code == 200 and not error_language:
+                return (
+                    f"{test_url}: numeric parameter '{param_name}' (originally {value!r}) "
+                    f"accepted a negative value with a 200 response and no obvious "
+                    f"validation-error language - candidate for manual business-logic "
+                    f"testing (price/quantity/balance manipulation)"
                 )
-                if resp.status_code == 200 and not error_language:
-                    return (
-                        f"{test_url}: numeric parameter '{param_name}' (originally {value!r}) "
-                        f"accepted a negative value with a 200 response and no obvious "
-                        f"validation-error language - candidate for manual business-logic "
-                        f"testing (price/quantity/balance manipulation)"
-                    )
     except httpx.HTTPError as exc:
         logger.info("detective: negative number business logic check failed for %s: %s", url, exc)
     return None
@@ -763,26 +764,26 @@ async def check_web_cache_poisoning_unkeyed_header(url: str) -> dict | None:
     """
     marker = "swas-cache-poison-" + uuid.uuid4().hex[:10]
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                await client.get(url, headers={"X-Forwarded-Host": marker})
-            except httpx.HTTPError:
-                return None
-            try:
-                followup_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if marker in followup_resp.text:
-                return {
-                    "vuln_type": "web_cache_poisoning_unkeyed_header",
-                    "severity": "high",
-                    "evidence": (
-                        f"{url}: sending X-Forwarded-Host: {marker} once, then making a "
-                        f"completely plain follow-up request with no special headers, still "
-                        f"returned the marker - the poisoned response was cached and would be "
-                        f"served to any other visitor of this URL."
-                    ),
-                }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            await client.get(url, headers={"X-Forwarded-Host": marker})
+        except httpx.HTTPError:
+            return None
+        try:
+            followup_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if marker in followup_resp.text:
+            return {
+                "vuln_type": "web_cache_poisoning_unkeyed_header",
+                "severity": "high",
+                "evidence": (
+                    f"{url}: sending X-Forwarded-Host: {marker} once, then making a "
+                    f"completely plain follow-up request with no special headers, still "
+                    f"returned the marker - the poisoned response was cached and would be "
+                    f"served to any other visitor of this URL."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: cache poisoning check failed for %s: %s", url, exc)
     return None
@@ -805,8 +806,8 @@ async def check_websocket_downgrade(url: str) -> dict | None:
         return None  # only meaningful as a downgrade if the page itself is HTTPS
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: WebSocket downgrade check failed for %s: %s", url, exc)
         return None
@@ -841,11 +842,11 @@ async def check_graphql_query_via_get(url: str) -> str | None:
     """
     probe_url = url.rstrip("/") + '?query={__typename}'
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(probe_url)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(probe_url)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: GraphQL GET query check failed for %s: %s", url, exc)
         return None
@@ -907,57 +908,57 @@ async def check_origin_ip_waf_bypass(host: str) -> dict | None:
         return None  # already a bare IP
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            try:
-                dns_resp = await client.get(
-                    f"https://cloudflare-dns.com/dns-query?name={domain}&type=A",
-                    headers={"Accept": "application/dns-json"},
-                )
-                dns_data = dns_resp.json()
-            except Exception:
-                return None
-            answers = [a.get("data") for a in dns_data.get("Answer", []) if a.get("type") == 1]
-            if not answers:
-                return None
-            origin_ip = answers[0]
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        try:
+            dns_resp = await client.get(
+                f"https://cloudflare-dns.com/dns-query?name={domain}&type=A",
+                headers={"Accept": "application/dns-json"},
+            )
+            dns_data = dns_resp.json()
+        except Exception:
+            return None
+        answers = [a.get("data") for a in dns_data.get("Answer", []) if a.get("type") == 1]
+        if not answers:
+            return None
+        origin_ip = answers[0]
 
-            if _is_known_cdn_edge_ip(origin_ip):
-                # The public DNS record points at a CDN edge node, not the
-                # real origin - hitting this IP directly still goes through
-                # the same CDN/WAF layer, so there's nothing to bypass.
-                # (This is expected and correct for any site behind
-                # Cloudflare/Akamai/Fastly/CloudFront - not a finding.)
-                return None
+        if _is_known_cdn_edge_ip(origin_ip):
+            # The public DNS record points at a CDN edge node, not the
+            # real origin - hitting this IP directly still goes through
+            # the same CDN/WAF layer, so there's nothing to bypass.
+            # (This is expected and correct for any site behind
+            # Cloudflare/Akamai/Fastly/CloudFront - not a finding.)
+            return None
 
-            try:
-                hostname_resp = await client.get(host)
-            except httpx.HTTPError:
-                return None
+        try:
+            hostname_resp = await client.get(host)
+        except httpx.HTTPError:
+            return None
 
-            scheme = "https" if host.startswith("https") else "http"
-            ip_url = f"{scheme}://{origin_ip}/"
-            try:
-                ip_resp = await client.get(ip_url, headers={"Host": domain})
-            except httpx.HTTPError:
-                return None
+        scheme = "https" if host.startswith("https") else "http"
+        ip_url = f"{scheme}://{origin_ip}/"
+        try:
+            ip_resp = await client.get(ip_url, headers={"Host": domain})
+        except httpx.HTTPError:
+            return None
 
-            if (
-                ip_resp.status_code == 200
-                and len(ip_resp.text) > 200
-                and abs(len(ip_resp.text) - len(hostname_resp.text)) < max(200, len(hostname_resp.text) * 0.3)
-            ):
-                return {
-                    "vuln_type": "origin_ip_waf_cdn_bypass",
-                    "severity": "high",
-                    "evidence": (
-                        f"{domain} resolves to {origin_ip}, and requesting that IP directly "
-                        f"(with Host: {domain} set explicitly) returned a "
-                        f"{len(ip_resp.text)}-byte response closely matching the real "
-                        f"hostname-based response ({len(hostname_resp.text)} bytes) - the "
-                        f"origin server is directly reachable, bypassing any WAF/CDN/rate-"
-                        f"limiting that only protects the hostname."
-                    ),
-                }
+        if (
+            ip_resp.status_code == 200
+            and len(ip_resp.text) > 200
+            and abs(len(ip_resp.text) - len(hostname_resp.text)) < max(200, len(hostname_resp.text) * 0.3)
+        ):
+            return {
+                "vuln_type": "origin_ip_waf_cdn_bypass",
+                "severity": "high",
+                "evidence": (
+                    f"{domain} resolves to {origin_ip}, and requesting that IP directly "
+                    f"(with Host: {domain} set explicitly) returned a "
+                    f"{len(ip_resp.text)}-byte response closely matching the real "
+                    f"hostname-based response ({len(hostname_resp.text)} bytes) - the "
+                    f"origin server is directly reachable, bypassing any WAF/CDN/rate-"
+                    f"limiting that only protects the hostname."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: origin IP WAF bypass check failed for %s: %s", host, exc)
     return None
@@ -987,31 +988,31 @@ async def check_open_redirect_via_meta_refresh(url: str) -> dict | None:
 
     marker_domain = f"evil-swas-meta-{uuid.uuid4().hex[:8]}.test"
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for param_name in redirect_params:
-                test_params = dict(existing_params)
-                test_params[param_name] = f"http://{marker_domain}/"
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                match = re.search(
-                    r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*' + re.escape(marker_domain),
-                    resp.text, re.IGNORECASE,
-                )
-                if match:
-                    return {
-                        "vuln_type": "open_redirect_meta_refresh",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{test_url}: parameter '{param_name}' was reflected unescaped "
-                            f"into a <meta http-equiv=\"refresh\"> tag pointing at an "
-                            f"attacker-controlled domain - client-side redirect that bypasses "
-                            f"Location-header-only validation. Note: open redirect is commonly "
-                            f"rated Informative without chained impact."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for param_name in redirect_params:
+            test_params = dict(existing_params)
+            test_params[param_name] = f"http://{marker_domain}/"
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            match = re.search(
+                r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*' + re.escape(marker_domain),
+                resp.text, re.IGNORECASE,
+            )
+            if match:
+                return {
+                    "vuln_type": "open_redirect_meta_refresh",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{test_url}: parameter '{param_name}' was reflected unescaped "
+                        f"into a <meta http-equiv=\"refresh\"> tag pointing at an "
+                        f"attacker-controlled domain - client-side redirect that bypasses "
+                        f"Location-header-only validation. Note: open redirect is commonly "
+                        f"rated Informative without chained impact."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: meta-refresh open redirect check failed for %s: %s", url, exc)
     return None
@@ -1091,52 +1092,52 @@ async def check_dangling_ns_delegation_takeover(hostname: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            ns_resp = await client.get(
-                "https://cloudflare-dns.com/dns-query",
-                params={"name": hostname, "type": "NS"},
-                headers={"accept": "application/dns-json"},
-            )
-            if ns_resp.status_code != 200:
-                return None
-            ns_answers = ns_resp.json().get("Answer", [])
-            ns_hosts = [a["data"].rstrip(".") for a in ns_answers if a.get("type") == 2]
-            if not ns_hosts:
-                return None  # no explicit NS delegation for this subdomain - nothing to check
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        ns_resp = await client.get(
+            "https://cloudflare-dns.com/dns-query",
+            params={"name": hostname, "type": "NS"},
+            headers={"accept": "application/dns-json"},
+        )
+        if ns_resp.status_code != 200:
+            return None
+        ns_answers = ns_resp.json().get("Answer", [])
+        ns_hosts = [a["data"].rstrip(".") for a in ns_answers if a.get("type") == 2]
+        if not ns_hosts:
+            return None  # no explicit NS delegation for this subdomain - nothing to check
 
-            for ns_host in ns_hosts:
-                labels = ns_host.split(".")
-                if len(labels) < 2:
-                    continue
-                parent_domain = ".".join(labels[-2:])  # e.g. ns1.example-dns-provider.com -> example-dns-provider.com
+        for ns_host in ns_hosts:
+            labels = ns_host.split(".")
+            if len(labels) < 2:
+                continue
+            parent_domain = ".".join(labels[-2:])  # e.g. ns1.example-dns-provider.com -> example-dns-provider.com
 
-                try:
-                    parent_resp = await client.get(
-                        "https://cloudflare-dns.com/dns-query",
-                        params={"name": parent_domain, "type": "NS"},
-                        headers={"accept": "application/dns-json"},
-                    )
-                except httpx.HTTPError:
-                    continue
-                if parent_resp.status_code != 200:
-                    continue
-                parent_data = parent_resp.json()
-                # DNS RCODE 3 == NXDOMAIN - the nameserver's own parent
-                # domain doesn't exist at all, meaning it's registerable.
-                if parent_data.get("Status") == 3:
-                    return {
-                        "vuln_type": "dangling_ns_delegation_takeover",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{hostname} is NS-delegated to {ns_host}, but {ns_host}'s own "
-                            f"parent domain ({parent_domain}) returns NXDOMAIN - that domain is "
-                            f"unregistered and available, and whoever registers it can stand up "
-                            f"a nameserver answering DNS for the entire {hostname} subdomain, "
-                            f"not just a single hijackable CNAME target. Higher-severity than a "
-                            f"standard CNAME-based takeover; detected read-only via DNS lookups "
-                            f"only, nothing registered."
-                        ),
-                    }
+            try:
+                parent_resp = await client.get(
+                    "https://cloudflare-dns.com/dns-query",
+                    params={"name": parent_domain, "type": "NS"},
+                    headers={"accept": "application/dns-json"},
+                )
+            except httpx.HTTPError:
+                continue
+            if parent_resp.status_code != 200:
+                continue
+            parent_data = parent_resp.json()
+            # DNS RCODE 3 == NXDOMAIN - the nameserver's own parent
+            # domain doesn't exist at all, meaning it's registerable.
+            if parent_data.get("Status") == 3:
+                return {
+                    "vuln_type": "dangling_ns_delegation_takeover",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{hostname} is NS-delegated to {ns_host}, but {ns_host}'s own "
+                        f"parent domain ({parent_domain}) returns NXDOMAIN - that domain is "
+                        f"unregistered and available, and whoever registers it can stand up "
+                        f"a nameserver answering DNS for the entire {hostname} subdomain, "
+                        f"not just a single hijackable CNAME target. Higher-severity than a "
+                        f"standard CNAME-based takeover; detected read-only via DNS lookups "
+                        f"only, nothing registered."
+                    ),
+                }
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("detective: dangling NS delegation check failed for %s: %s", hostname, exc)
     return None

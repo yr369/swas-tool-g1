@@ -36,6 +36,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 _SECRET_KEYWORD_PATTERN = re.compile(
@@ -62,8 +63,8 @@ async def check_source_map_leak(js_url: str) -> dict | None:
     logger.info("detective: checking source map leak for %s", map_url)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            resp = await client.get(map_url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        resp = await client.get(map_url)
     except httpx.HTTPError as exc:
         logger.info("detective: source map check failed for %s: %s", map_url, exc)
         return None
@@ -128,35 +129,35 @@ async def check_exposed_container_api(host: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, verify=False) as client:
-            for port, kind, path, scheme in _CONTAINER_API_TARGETS:
-                url = f"{scheme}://{hostname}:{port}{path}"
-                try:
-                    resp = await client.get(url)
-                except httpx.HTTPError:
-                    continue  # port closed/filtered/refused - the overwhelmingly common case
+        client = httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, transport=get_transport())
+        for port, kind, path, scheme in _CONTAINER_API_TARGETS:
+            url = f"{scheme}://{hostname}:{port}{path}"
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                continue  # port closed/filtered/refused - the overwhelmingly common case
 
-                if resp.status_code != 200:
-                    continue
+            if resp.status_code != 200:
+                continue
 
-                if kind == "docker" and '"ApiVersion"' in resp.text:
-                    return {
-                        "vuln_type": "exposed_docker_api",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{url} responds with a live Docker daemon API version string - "
-                            f"unauthenticated Docker control endpoint exposed."
-                        ),
-                    }
-                if kind == "kubelet" and '"items"' in resp.text:
-                    return {
-                        "vuln_type": "exposed_kubelet_api",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{url} responds with a live pod listing - "
-                            f"unauthenticated kubelet API exposed."
-                        ),
-                    }
+            if kind == "docker" and '"ApiVersion"' in resp.text:
+                return {
+                    "vuln_type": "exposed_docker_api",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{url} responds with a live Docker daemon API version string - "
+                        f"unauthenticated Docker control endpoint exposed."
+                    ),
+                }
+            if kind == "kubelet" and '"items"' in resp.text:
+                return {
+                    "vuln_type": "exposed_kubelet_api",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{url} responds with a live pod listing - "
+                        f"unauthenticated kubelet API exposed."
+                    ),
+                }
     except Exception as exc:  # noqa: BLE001 - this check touches raw sockets on
         # arbitrary ports across many hosts; a narrow except here would miss
         # legitimate low-level connection failures that httpx doesn't always
@@ -178,8 +179,8 @@ async def check_git_exposure(host: str) -> dict | None:
     url = host.rstrip("/") + "/.git/HEAD"
     logger.info("detective: checking git exposure for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: git exposure check failed for %s: %s", url, exc)
         return None
@@ -212,8 +213,8 @@ async def check_elasticsearch_exposure(host: str) -> dict | None:
     url = f"http://{hostname}:9200/_cat/indices?format=json"
     logger.info("detective: checking Elasticsearch exposure for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, verify=False) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, transport=get_transport())
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: Elasticsearch check failed for %s: %s", url, exc)
         return None
@@ -253,50 +254,50 @@ async def check_actuator_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            for path in _ACTUATOR_PATHS:
-                url = base + path
-                logger.info("detective: checking actuator/metrics exposure for %s", url)
-                try:
-                    resp = await client.get(url)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        for path in _ACTUATOR_PATHS:
+            url = base + path
+            logger.info("detective: checking actuator/metrics exposure for %s", url)
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text
 
-                if path == "/actuator/env" and '"propertySources"' in body:
-                    keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(body))
-                    entropy_hits = {
-                        m.group(1) for m in _TOKEN_PATTERN.finditer(body)
-                        if _shannon_entropy(m.group(2)) > 4.0
-                    }
-                    all_hits = keyword_hits | entropy_hits
-                    severity = "critical" if all_hits else "high"
-                    hits_note = (
-                        f" Includes secret-shaped values: {', '.join(sorted(all_hits)[:5])}."
-                        if all_hits else ""
-                    )
-                    return {
-                        "vuln_type": "exposed_spring_actuator_env",
-                        "severity": severity,
-                        "evidence": (
-                            f"{url} exposes the full Spring Boot runtime environment "
-                            f"(config, property sources) with no authentication.{hits_note}"
-                        ),
-                    }
+            if path == "/actuator/env" and '"propertySources"' in body:
+                keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(body))
+                entropy_hits = {
+                    m.group(1) for m in _TOKEN_PATTERN.finditer(body)
+                    if _shannon_entropy(m.group(2)) > 4.0
+                }
+                all_hits = keyword_hits | entropy_hits
+                severity = "critical" if all_hits else "high"
+                hits_note = (
+                    f" Includes secret-shaped values: {', '.join(sorted(all_hits)[:5])}."
+                    if all_hits else ""
+                )
+                return {
+                    "vuln_type": "exposed_spring_actuator_env",
+                    "severity": severity,
+                    "evidence": (
+                        f"{url} exposes the full Spring Boot runtime environment "
+                        f"(config, property sources) with no authentication.{hits_note}"
+                    ),
+                }
 
-                if path in ("/actuator", "/actuator/prometheus", "/metrics") and (
-                    '"_links"' in body or body.startswith("# HELP") or body.startswith("# TYPE")
-                ):
-                    return {
-                        "vuln_type": "exposed_actuator_metrics",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{url} exposes application metrics/actuator endpoints with no "
-                            f"authentication - review the raw output manually for anything sensitive."
-                        ),
-                    }
+            if path in ("/actuator", "/actuator/prometheus", "/metrics") and (
+                '"_links"' in body or body.startswith("# HELP") or body.startswith("# TYPE")
+            ):
+                return {
+                    "vuln_type": "exposed_actuator_metrics",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{url} exposes application metrics/actuator endpoints with no "
+                        f"authentication - review the raw output manually for anything sensitive."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: actuator check failed for %s: %s", host, exc)
     return None
@@ -306,8 +307,8 @@ async def _check_couchdb_exposure(hostname: str) -> dict | None:
     url = f"http://{hostname}:5984/_all_dbs"
     logger.info("detective: checking CouchDB exposure for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, verify=False) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_CONTAINER_PROBE_TIMEOUT, transport=get_transport())
+        resp = await client.get(url)
     except httpx.HTTPError:
         return None
     if resp.status_code != 200:
@@ -451,38 +452,38 @@ async def check_swagger_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            for path in _SWAGGER_PATHS:
-                url = base + path
-                logger.info("detective: checking Swagger/OpenAPI exposure for %s", url)
-                try:
-                    resp = await client.get(url)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    spec = resp.json()
-                except ValueError:
-                    continue
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        for path in _SWAGGER_PATHS:
+            url = base + path
+            logger.info("detective: checking Swagger/OpenAPI exposure for %s", url)
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                spec = resp.json()
+            except ValueError:
+                continue
 
-                paths = spec.get("paths") if isinstance(spec, dict) else None
-                if not isinstance(paths, dict) or not paths:
-                    continue
+            paths = spec.get("paths") if isinstance(spec, dict) else None
+            if not isinstance(paths, dict) or not paths:
+                continue
 
-                sensitive_paths = [p for p in paths if _SENSITIVE_API_PATH_HINTS.search(p)][:10]
-                if not sensitive_paths:
-                    continue  # a plain public API spec alone isn't worth filing
+            sensitive_paths = [p for p in paths if _SENSITIVE_API_PATH_HINTS.search(p)][:10]
+            if not sensitive_paths:
+                continue  # a plain public API spec alone isn't worth filing
 
-                return {
-                    "vuln_type": "exposed_api_documentation",
-                    "severity": "medium",
-                    "evidence": (
-                        f"{url} is a publicly accessible API spec ({len(paths)} total paths) "
-                        f"including admin/internal-looking endpoints with no visible auth "
-                        f"requirement documented: {', '.join(sensitive_paths)}"
-                    ),
-                }
+            return {
+                "vuln_type": "exposed_api_documentation",
+                "severity": "medium",
+                "evidence": (
+                    f"{url} is a publicly accessible API spec ({len(paths)} total paths) "
+                    f"including admin/internal-looking endpoints with no visible auth "
+                    f"requirement documented: {', '.join(sensitive_paths)}"
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: Swagger exposure check failed for %s: %s", host, exc)
     return None
@@ -525,54 +526,54 @@ async def check_heapdump_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
-            for path in _HEAPDUMP_PATHS:
-                url = base + path
-                logger.info("detective: checking heapdump exposure for %s", url)
-                chunk = b""
-                try:
-                    async with client.stream("GET", url) as resp:
-                        if resp.status_code != 200:
-                            # includes 3xx redirects - not a real exposure
-                            continue
-                        async for data in resp.aiter_bytes():
-                            chunk += data
-                            if len(chunk) >= _HEAPDUMP_MAX_BYTES:
-                                break
-                except httpx.HTTPError:
-                    continue
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        for path in _HEAPDUMP_PATHS:
+            url = base + path
+            logger.info("detective: checking heapdump exposure for %s", url)
+            chunk = b""
+            try:
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        # includes 3xx redirects - not a real exposure
+                        continue
+                    async for data in resp.aiter_bytes():
+                        chunk += data
+                        if len(chunk) >= _HEAPDUMP_MAX_BYTES:
+                            break
+            except httpx.HTTPError:
+                continue
 
-                if len(chunk) < 1000:
-                    continue  # too small to be a real heapdump - likely a 404/error page
+            if len(chunk) < 1000:
+                continue  # too small to be a real heapdump - likely a 404/error page
 
-                if _HPROF_MAGIC not in chunk[:64]:
-                    # Doesn't look like an actual Java heap dump - skip,
-                    # even if it superficially resembles secret-shaped text.
-                    continue
+            if _HPROF_MAGIC not in chunk[:64]:
+                # Doesn't look like an actual Java heap dump - skip,
+                # even if it superficially resembles secret-shaped text.
+                continue
 
-                # Heapdumps are binary, but Java stores strings as
-                # contiguous readable runs - lenient latin-1 decode lets
-                # the existing regex-based detectors work against it.
-                text_sample = chunk.decode("latin-1", errors="ignore")
-                keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(text_sample))
-                entropy_hits = {
-                    m.group(1) for m in _TOKEN_PATTERN.finditer(text_sample)
-                    if _shannon_entropy(m.group(2)) > 4.0
-                }
-                all_hits = keyword_hits | entropy_hits
-                if not all_hits:
-                    continue
+            # Heapdumps are binary, but Java stores strings as
+            # contiguous readable runs - lenient latin-1 decode lets
+            # the existing regex-based detectors work against it.
+            text_sample = chunk.decode("latin-1", errors="ignore")
+            keyword_hits = set(_SECRET_KEYWORD_PATTERN.findall(text_sample))
+            entropy_hits = {
+                m.group(1) for m in _TOKEN_PATTERN.finditer(text_sample)
+                if _shannon_entropy(m.group(2)) > 4.0
+            }
+            all_hits = keyword_hits | entropy_hits
+            if not all_hits:
+                continue
 
-                return {
-                    "vuln_type": "exposed_heapdump",
-                    "severity": "critical",
-                    "evidence": (
-                        f"{url} serves a heapdump file. Secret-shaped values found in the "
-                        f"first {len(chunk)} bytes sampled: {', '.join(sorted(all_hits)[:5])}. "
-                        f"Note: only a small prefix of the file was analyzed - the full dump "
-                        f"likely contains more."
-                    ),
-                }
+            return {
+                "vuln_type": "exposed_heapdump",
+                "severity": "critical",
+                "evidence": (
+                    f"{url} serves a heapdump file. Secret-shaped values found in the "
+                    f"first {len(chunk)} bytes sampled: {', '.join(sorted(all_hits)[:5])}. "
+                    f"Note: only a small prefix of the file was analyzed - the full dump "
+                    f"likely contains more."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: heapdump check failed for %s: %s", host, exc)
     return None
@@ -608,35 +609,35 @@ async def check_debug_console_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            control_path = "/swas-nonexistent-probe-" + uuid.uuid4().hex[:8]
-            try:
-                control_resp = await client.get(base + control_path)
-                control_body_lower = control_resp.text[:5000].lower()
-            except httpx.HTTPError:
-                control_body_lower = ""
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        control_path = "/swas-nonexistent-probe-" + uuid.uuid4().hex[:8]
+        try:
+            control_resp = await client.get(base + control_path)
+            control_body_lower = control_resp.text[:5000].lower()
+        except httpx.HTTPError:
+            control_body_lower = ""
 
-            for path, marker, framework in _DEBUG_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                marker_lower = marker.lower()
-                if (
-                    resp.status_code == 200
-                    and marker_lower in resp.text[:5000].lower()
-                    and marker_lower not in control_body_lower
-                ):
-                    return {
-                        "vuln_type": "exposed_debug_console",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} returned a live {framework} debug/info page "
-                            f"(matched marker: {marker!r}, absent from a control request to a "
-                            f"nonexistent path on the same host). Often exploitable for RCE "
-                            f"(Werkzeug PIN bypass) or full environment/secret disclosure."
-                        ),
-                    }
+        for path, marker, framework in _DEBUG_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            marker_lower = marker.lower()
+            if (
+                resp.status_code == 200
+                and marker_lower in resp.text[:5000].lower()
+                and marker_lower not in control_body_lower
+            ):
+                return {
+                    "vuln_type": "exposed_debug_console",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} returned a live {framework} debug/info page "
+                        f"(matched marker: {marker!r}, absent from a control request to a "
+                        f"nonexistent path on the same host). Often exploitable for RCE "
+                        f"(Werkzeug PIN bypass) or full environment/secret disclosure."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: debug console check failed for %s: %s", host, exc)
     return None
@@ -661,25 +662,25 @@ async def check_env_file_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                resp = await client.get(base + "/.env")
-            except httpx.HTTPError:
-                return None
-            if resp.status_code != 200:
-                return None
-            body = resp.text[:5000]
-            for sig in _ENV_FILE_SIGNATURES:
-                if sig in body:
-                    return {
-                        "vuln_type": "exposed_env_file",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}/.env is publicly accessible and contains a recognized "
-                            f"secret-shaped line (matched on {sig!r} prefix) - full "
-                            f"application credentials exposed."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp = await client.get(base + "/.env")
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 200:
+            return None
+        body = resp.text[:5000]
+        for sig in _ENV_FILE_SIGNATURES:
+            if sig in body:
+                return {
+                    "vuln_type": "exposed_env_file",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}/.env is publicly accessible and contains a recognized "
+                        f"secret-shaped line (matched on {sig!r} prefix) - full "
+                        f"application credentials exposed."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: .env exposure check failed for %s: %s", host, exc)
     return None
@@ -715,8 +716,8 @@ async def check_referrer_policy_sensitive_leak(url: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: referrer policy check failed for %s: %s", url, exc)
         return None
@@ -771,15 +772,15 @@ async def check_graphql_field_suggestion_leak(url: str) -> dict | None:
     the batch 7/9 substring-based checks did.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.post(
-                    url,
-                    content=_GRAPHQL_SUGGESTION_QUERY,
-                    headers={"Content-Type": "application/json"},
-                )
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.post(
+                url,
+                content=_GRAPHQL_SUGGESTION_QUERY,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: GraphQL field suggestion check failed for %s: %s", url, exc)
         return None
@@ -813,8 +814,8 @@ async def check_missing_sri(url: str) -> str | None:
     as-is finding.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: SRI check failed for %s: %s", url, exc)
         return None
@@ -865,8 +866,8 @@ async def check_hardcoded_secrets_and_internal_disclosure(url: str) -> str | Non
     candidates for manual review rather than auto-filing a graded finding.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: hardcoded secrets check failed for %s: %s", url, exc)
         return None
@@ -906,30 +907,30 @@ async def check_missing_spf_dmarc(host: str) -> str | None:
         return None  # bare IP, no domain to check
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            try:
-                spf_resp = await client.get(
-                    f"https://cloudflare-dns.com/dns-query?name={domain}&type=TXT",
-                    headers={"Accept": "application/dns-json"},
-                )
-                spf_data = spf_resp.json()
-            except Exception:
-                spf_data = {}
-            has_spf = any(
-                "v=spf1" in a.get("data", "") for a in spf_data.get("Answer", [])
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        try:
+            spf_resp = await client.get(
+                f"https://cloudflare-dns.com/dns-query?name={domain}&type=TXT",
+                headers={"Accept": "application/dns-json"},
             )
+            spf_data = spf_resp.json()
+        except Exception:
+            spf_data = {}
+        has_spf = any(
+            "v=spf1" in a.get("data", "") for a in spf_data.get("Answer", [])
+        )
 
-            try:
-                dmarc_resp = await client.get(
-                    f"https://cloudflare-dns.com/dns-query?name=_dmarc.{domain}&type=TXT",
-                    headers={"Accept": "application/dns-json"},
-                )
-                dmarc_data = dmarc_resp.json()
-            except Exception:
-                dmarc_data = {}
-            has_dmarc = any(
-                "v=dmarc1" in a.get("data", "").lower() for a in dmarc_data.get("Answer", [])
+        try:
+            dmarc_resp = await client.get(
+                f"https://cloudflare-dns.com/dns-query?name=_dmarc.{domain}&type=TXT",
+                headers={"Accept": "application/dns-json"},
             )
+            dmarc_data = dmarc_resp.json()
+        except Exception:
+            dmarc_data = {}
+        has_dmarc = any(
+            "v=dmarc1" in a.get("data", "").lower() for a in dmarc_data.get("Answer", [])
+        )
     except httpx.HTTPError as exc:
         logger.info("detective: SPF/DMARC check failed for %s: %s", host, exc)
         return None
@@ -963,37 +964,37 @@ async def check_backup_temp_file_disclosure(url: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                nonexistent_probe = parsed.copy_with(path=path + ".swas-nonexistent-" + uuid.uuid4().hex[:8])
-                baseline_404_resp = await client.get(nonexistent_probe)
-                baseline_404_body = baseline_404_resp.text[:2000]
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            nonexistent_probe = parsed.copy_with(path=path + ".swas-nonexistent-" + uuid.uuid4().hex[:8])
+            baseline_404_resp = await client.get(nonexistent_probe)
+            baseline_404_body = baseline_404_resp.text[:2000]
+        except httpx.HTTPError:
+            return None
 
-            for suffix in _BACKUP_FILE_SUFFIXES:
-                test_url = parsed.copy_with(path=path + suffix)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:3000]
-                if body[:2000] == baseline_404_body:
-                    continue  # same content as a real 404 - server returns 200 for everything
-                for marker in _SOURCE_CODE_MARKERS:
-                    if marker in body:
-                        return {
-                            "vuln_type": "backup_temp_file_disclosure",
-                            "severity": "high",
-                            "evidence": (
-                                f"{test_url}: returned 200 with content distinct from the "
-                                f"server's real 404 response, and containing a source-code "
-                                f"marker ({marker!r}) - a backup/temp copy of source is "
-                                f"publicly readable."
-                            ),
-                        }
+        for suffix in _BACKUP_FILE_SUFFIXES:
+            test_url = parsed.copy_with(path=path + suffix)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:3000]
+            if body[:2000] == baseline_404_body:
+                continue  # same content as a real 404 - server returns 200 for everything
+            for marker in _SOURCE_CODE_MARKERS:
+                if marker in body:
+                    return {
+                        "vuln_type": "backup_temp_file_disclosure",
+                        "severity": "high",
+                        "evidence": (
+                            f"{test_url}: returned 200 with content distinct from the "
+                            f"server's real 404 response, and containing a source-code "
+                            f"marker ({marker!r}) - a backup/temp copy of source is "
+                            f"publicly readable."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: backup/temp file check failed for %s: %s", url, exc)
     return None
@@ -1012,11 +1013,11 @@ async def check_exposed_prometheus_metrics(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/metrics")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/metrics")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Prometheus metrics check failed for %s: %s", host, exc)
         return None
@@ -1058,30 +1059,30 @@ async def check_dependency_manifest_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path, marker in _DEPENDENCY_MANIFEST_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path, marker in _DEPENDENCY_MANIFEST_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:5000]
+            if marker is not None:
+                if marker not in body:
                     continue
-                if resp.status_code != 200:
+            else:
+                if not re.search(r"^[A-Za-z0-9_.\-]+\s*[=<>!~]{1,2}=\s*[\d.]+", body, re.MULTILINE):
                     continue
-                body = resp.text[:5000]
-                if marker is not None:
-                    if marker not in body:
-                        continue
-                else:
-                    if not re.search(r"^[A-Za-z0-9_.\-]+\s*[=<>!~]{1,2}=\s*[\d.]+", body, re.MULTILINE):
-                        continue
-                return {
-                    "vuln_type": "exposed_dependency_manifest",
-                    "severity": "medium",
-                    "evidence": (
-                        f"{base}{path} is publicly accessible and contains a real dependency "
-                        f"manifest - exact package/version intel usable for known-CVE matching "
-                        f"against this application's stack."
-                    ),
-                }
+            return {
+                "vuln_type": "exposed_dependency_manifest",
+                "severity": "medium",
+                "evidence": (
+                    f"{base}{path} is publicly accessible and contains a real dependency "
+                    f"manifest - exact package/version intel usable for known-CVE matching "
+                    f"against this application's stack."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: dependency manifest check failed for %s: %s", host, exc)
     return None
@@ -1099,8 +1100,8 @@ async def check_hsts_missing(url: str) -> str | None:
     if not url.lower().startswith("https://"):
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: HSTS check failed for %s: %s", url, exc)
         return None
@@ -1128,26 +1129,26 @@ async def check_swagger_path_enumeration_unauth(host: str) -> str | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _SWAGGER_SPEC_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    spec = resp.json()
-                except Exception:
-                    continue
-                paths = spec.get("paths")
-                if isinstance(paths, dict) and paths:
-                    sample = list(paths.keys())[:8]
-                    return (
-                        f"{base}{path}: documented API spec lists {len(paths)} endpoint(s) - "
-                        f"sample: {sample} - candidates for manual authorization/access-"
-                        f"control testing"
-                    )
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _SWAGGER_SPEC_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                spec = resp.json()
+            except Exception:
+                continue
+            paths = spec.get("paths")
+            if isinstance(paths, dict) and paths:
+                sample = list(paths.keys())[:8]
+                return (
+                    f"{base}{path}: documented API spec lists {len(paths)} endpoint(s) - "
+                    f"sample: {sample} - candidates for manual authorization/access-"
+                    f"control testing"
+                )
     except httpx.HTTPError as exc:
         logger.info("detective: Swagger path enumeration failed for %s: %s", host, exc)
     return None
@@ -1163,11 +1164,11 @@ async def check_exposed_wsdl_soap_service(url: str) -> dict | None:
     """
     probe_url = url + ("&wsdl" if "?" in url else "?wsdl")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(probe_url)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(probe_url)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: WSDL exposure check failed for %s: %s", url, exc)
         return None
@@ -1197,11 +1198,11 @@ async def check_http_trace_method_enabled(host: str) -> str | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                resp = await client.request("TRACE", base + "/")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp = await client.request("TRACE", base + "/")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: TRACE method check failed for %s: %s", host, exc)
         return None
@@ -1226,26 +1227,26 @@ async def check_exposed_docker_compose_file(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in ("/docker-compose.yml", "/docker-compose.yaml"):
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:5000]
-                if re.search(r"^services:\s*$", body, re.MULTILINE) and re.search(r"^\s*image:\s*\S+", body, re.MULTILINE):
-                    return {
-                        "vuln_type": "exposed_docker_compose_file",
-                        "severity": "high",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and contains a real "
-                            f"docker-compose services definition - full service "
-                            f"architecture disclosed, frequently including inline "
-                            f"environment variables/secrets."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in ("/docker-compose.yml", "/docker-compose.yaml"):
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:5000]
+            if re.search(r"^services:\s*$", body, re.MULTILINE) and re.search(r"^\s*image:\s*\S+", body, re.MULTILINE):
+                return {
+                    "vuln_type": "exposed_docker_compose_file",
+                    "severity": "high",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and contains a real "
+                        f"docker-compose services definition - full service "
+                        f"architecture disclosed, frequently including inline "
+                        f"environment variables/secrets."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: docker-compose exposure check failed for %s: %s", host, exc)
     return None
@@ -1270,25 +1271,25 @@ async def check_wordpress_config_backup_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _WP_CONFIG_BACKUP_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:5000]
-                if any(marker in body for marker in _WP_CONFIG_MARKERS):
-                    return {
-                        "vuln_type": "wordpress_config_backup_exposure",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and contains WordPress "
-                            f"config constants (DB credentials, auth keys) - full database "
-                            f"and site secret compromise."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _WP_CONFIG_BACKUP_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:5000]
+            if any(marker in body for marker in _WP_CONFIG_MARKERS):
+                return {
+                    "vuln_type": "wordpress_config_backup_exposure",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and contains WordPress "
+                        f"config constants (DB credentials, auth keys) - full database "
+                        f"and site secret compromise."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: wp-config backup check failed for %s: %s", host, exc)
     return None
@@ -1310,15 +1311,15 @@ async def check_graphql_error_stack_trace_leak(url: str) -> dict | None:
     diffing the way a short English-word substring would.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.post(
-                    url,
-                    content='{"query": "{ this is not valid graphql syntax !!!"}',
-                    headers={"Content-Type": "application/json"},
-                )
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.post(
+                url,
+                content='{"query": "{ this is not valid graphql syntax !!!"}',
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: GraphQL stack trace leak check failed for %s: %s", url, exc)
         return None
@@ -1357,23 +1358,23 @@ async def check_exposed_devops_tool_panel(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path, marker, tool in _DEVOPS_PANEL_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and marker in resp.text[:5000]:
-                    return {
-                        "vuln_type": "exposed_devops_tool_panel",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{base}{path}: a live {tool} instance is reachable "
-                            f"(matched marker: {marker!r}) - further attack surface, "
-                            f"potential RCE if unauthenticated script/admin access is also "
-                            f"open (not tested here)."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path, marker, tool in _DEVOPS_PANEL_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and marker in resp.text[:5000]:
+                return {
+                    "vuln_type": "exposed_devops_tool_panel",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{base}{path}: a live {tool} instance is reachable "
+                        f"(matched marker: {marker!r}) - further attack surface, "
+                        f"potential RCE if unauthenticated script/admin access is also "
+                        f"open (not tested here)."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: DevOps panel check failed for %s: %s", host, exc)
     return None
@@ -1392,22 +1393,22 @@ async def check_exposed_phpmyadmin(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _PHPMYADMIN_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and re.search(r"phpMyAdmin", resp.text[:5000], re.IGNORECASE):
-                    return {
-                        "vuln_type": "exposed_phpmyadmin",
-                        "severity": "high",
-                        "evidence": (
-                            f"{base}{path}: a live phpMyAdmin instance is reachable - direct "
-                            f"database administration interface exposed. Credentials not "
-                            f"attempted; most programs exclude credential guessing."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _PHPMYADMIN_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and re.search(r"phpMyAdmin", resp.text[:5000], re.IGNORECASE):
+                return {
+                    "vuln_type": "exposed_phpmyadmin",
+                    "severity": "high",
+                    "evidence": (
+                        f"{base}{path}: a live phpMyAdmin instance is reachable - direct "
+                        f"database administration interface exposed. Credentials not "
+                        f"attempted; most programs exclude credential guessing."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: phpMyAdmin check failed for %s: %s", host, exc)
     return None
@@ -1422,11 +1423,11 @@ async def check_exposed_elmah_axd(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/elmah.axd")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/elmah.axd")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: ELMAH check failed for %s: %s", host, exc)
         return None
@@ -1454,11 +1455,11 @@ async def check_exposed_trace_axd(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/trace.axd")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/trace.axd")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Trace.axd check failed for %s: %s", host, exc)
         return None
@@ -1492,11 +1493,11 @@ async def check_laravel_debug_mode_exposure(host: str) -> dict | None:
     base = host.rstrip("/")
     probe_path = "/swas-laravel-debug-probe-" + uuid.uuid4().hex[:8]
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + probe_path)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + probe_path)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Laravel debug mode check failed for %s: %s", host, exc)
         return None
@@ -1532,11 +1533,11 @@ async def check_git_config_credentials_leak(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/.git/config")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/.git/config")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: .git/config credentials check failed for %s: %s", host, exc)
         return None
@@ -1572,25 +1573,25 @@ async def check_aws_credentials_file_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _AWS_CREDENTIALS_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:3000]
-                if re.search(r"^\[\w+\]\s*$", body, re.MULTILINE) and "aws_access_key_id" in body:
-                    return {
-                        "vuln_type": "exposed_aws_credentials_file",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and contains a real AWS "
-                            f"credentials file (profile header + aws_access_key_id present) "
-                            f"- full cloud account access potentially exposed."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _AWS_CREDENTIALS_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:3000]
+            if re.search(r"^\[\w+\]\s*$", body, re.MULTILINE) and "aws_access_key_id" in body:
+                return {
+                    "vuln_type": "exposed_aws_credentials_file",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and contains a real AWS "
+                        f"credentials file (profile header + aws_access_key_id present) "
+                        f"- full cloud account access potentially exposed."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: AWS credentials file check failed for %s: %s", host, exc)
     return None
@@ -1609,29 +1610,29 @@ async def check_kubeconfig_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _KUBECONFIG_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:5000]
-                if (
-                    "kind: Config" in body
-                    and "clusters:" in body
-                    and ("certificate-authority-data" in body or "token:" in body or "client-certificate-data" in body)
-                ):
-                    return {
-                        "vuln_type": "exposed_kubeconfig",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and is a real kubeconfig "
-                            f"file (kind: Config + clusters: + embedded credential material) "
-                            f"- potential full Kubernetes cluster access exposed."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _KUBECONFIG_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:5000]
+            if (
+                "kind: Config" in body
+                and "clusters:" in body
+                and ("certificate-authority-data" in body or "token:" in body or "client-certificate-data" in body)
+            ):
+                return {
+                    "vuln_type": "exposed_kubeconfig",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and is a real kubeconfig "
+                        f"file (kind: Config + clusters: + embedded credential material) "
+                        f"- potential full Kubernetes cluster access exposed."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: kubeconfig exposure check failed for %s: %s", host, exc)
     return None
@@ -1653,23 +1654,23 @@ async def check_exposed_nexus_artifactory(host: str) -> dict | None:
         ("/artifactory/webapp/", "JFrog Artifactory", "Artifactory"),
     ]
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path, marker, tool in probes:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and marker in resp.text[:3000]:
-                    return {
-                        "vuln_type": "exposed_artifact_repository_manager",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{base}{path}: a live {tool} instance is reachable (matched "
-                            f"{marker!r}) - internal package names/versions disclosed, "
-                            f"potential supply-chain attack surface if anonymous deploy is "
-                            f"also enabled (not tested here)."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path, marker, tool in probes:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and marker in resp.text[:3000]:
+                return {
+                    "vuln_type": "exposed_artifact_repository_manager",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{base}{path}: a live {tool} instance is reachable (matched "
+                        f"{marker!r}) - internal package names/versions disclosed, "
+                        f"potential supply-chain attack surface if anonymous deploy is "
+                        f"also enabled (not tested here)."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Nexus/Artifactory check failed for %s: %s", host, exc)
     return None
@@ -1686,11 +1687,11 @@ async def check_exposed_rabbitmq_management(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/api/overview")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/api/overview")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: RabbitMQ management check failed for %s: %s", host, exc)
         return None
@@ -1720,11 +1721,11 @@ async def check_exposed_grafana(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/api/health")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/api/health")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Grafana check failed for %s: %s", host, exc)
         return None
@@ -1756,11 +1757,11 @@ async def check_exposed_minio_console(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/minio/health/live")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/minio/health/live")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: MinIO check failed for %s: %s", host, exc)
         return None
@@ -1913,11 +1914,11 @@ async def check_exposed_couchdb_fauxton(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/_utils/")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/_utils/")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: CouchDB Fauxton check failed for %s: %s", host, exc)
         return None
@@ -1968,11 +1969,11 @@ async def check_exposed_solr_admin(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/solr/admin/info/system?wt=json")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/solr/admin/info/system?wt=json")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Solr admin check failed for %s: %s", host, exc)
         return None
@@ -2008,11 +2009,11 @@ async def check_jenkins_script_console_unauth(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                resp = await client.get(base + "/script")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp = await client.get(base + "/script")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Jenkins script console check failed for %s: %s", host, exc)
         return None
@@ -2044,11 +2045,11 @@ async def check_couchdb_all_dbs_unauth(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/_all_dbs")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/_all_dbs")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: CouchDB _all_dbs check failed for %s: %s", host, exc)
         return None
@@ -2080,28 +2081,28 @@ async def check_spring_boot_env_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in ("/actuator/env", "/env"):
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    data = resp.json()
-                except Exception:
-                    continue
-                if isinstance(data, dict) and ("propertySources" in data or "systemEnvironment" in data):
-                    return {
-                        "vuln_type": "spring_boot_env_exposure",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} is reachable without authentication and returns "
-                            f"full environment/property-source data - DB passwords, API "
-                            f"keys, and cloud credentials are routinely present in this dump."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in ("/actuator/env", "/env"):
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+            if isinstance(data, dict) and ("propertySources" in data or "systemEnvironment" in data):
+                return {
+                    "vuln_type": "spring_boot_env_exposure",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} is reachable without authentication and returns "
+                        f"full environment/property-source data - DB passwords, API "
+                        f"keys, and cloud credentials are routinely present in this dump."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Spring Boot env exposure check failed for %s: %s", host, exc)
     return None
@@ -2122,11 +2123,11 @@ async def check_django_debug_mode_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                resp = await client.get(base + "/", headers={"Host": "swas-django-debug-probe.invalid"})
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp = await client.get(base + "/", headers={"Host": "swas-django-debug-probe.invalid"})
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Django debug mode check failed for %s: %s", host, exc)
         return None
@@ -2160,11 +2161,11 @@ async def check_aspnet_debug_mode_exposure(host: str) -> dict | None:
     base = host.rstrip("/")
     probe_path = "/swas-aspnet-debug-probe-" + uuid.uuid4().hex[:8] + ".aspx"
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + probe_path)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + probe_path)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: ASP.NET debug mode check failed for %s: %s", host, exc)
         return None
@@ -2195,11 +2196,11 @@ async def check_express_stack_trace_leak(host: str) -> dict | None:
     base = host.rstrip("/")
     probe_path = "/swas-express-debug-probe-" + uuid.uuid4().hex[:8]
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + probe_path)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + probe_path)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Express stack trace check failed for %s: %s", host, exc)
         return None
@@ -2228,25 +2229,25 @@ async def check_npm_debug_log_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in ("/npm-debug.log", "/yarn-error.log"):
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:3000]
-                if re.search(r"^\d+ (info|verbose|error) ", body, re.MULTILINE) or "yarn install" in body.lower():
-                    return {
-                        "vuln_type": "exposed_npm_debug_log",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and is a real npm/yarn "
-                            f"install log - discloses internal package registry URLs and "
-                            f"potentially auth tokens from a failed private-registry install."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in ("/npm-debug.log", "/yarn-error.log"):
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:3000]
+            if re.search(r"^\d+ (info|verbose|error) ", body, re.MULTILINE) or "yarn install" in body.lower():
+                return {
+                    "vuln_type": "exposed_npm_debug_log",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and is a real npm/yarn "
+                        f"install log - discloses internal package registry URLs and "
+                        f"potentially auth tokens from a failed private-registry install."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: npm-debug.log check failed for %s: %s", host, exc)
     return None
@@ -2261,11 +2262,11 @@ async def check_travis_yml_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/.travis.yml")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/.travis.yml")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: .travis.yml check failed for %s: %s", host, exc)
         return None
@@ -2293,11 +2294,11 @@ async def check_circleci_config_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/.circleci/config.yml")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/.circleci/config.yml")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: CircleCI config check failed for %s: %s", host, exc)
         return None
@@ -2329,26 +2330,26 @@ async def check_github_workflow_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for filename in _GITHUB_WORKFLOW_COMMON_NAMES:
-                try:
-                    resp = await client.get(f"{base}/.github/workflows/{filename}")
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:3000]
-                if "on:" in body and "jobs:" in body:
-                    return {
-                        "vuln_type": "exposed_github_workflow_file",
-                        "severity": "low",
-                        "evidence": (
-                            f"{base}/.github/workflows/{filename} is publicly accessible - "
-                            f"CI/CD pipeline structure and external service integrations "
-                            f"disclosed (secrets are referenced by name, not embedded, so "
-                            f"this is architecture disclosure rather than a direct leak)."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for filename in _GITHUB_WORKFLOW_COMMON_NAMES:
+            try:
+                resp = await client.get(f"{base}/.github/workflows/{filename}")
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:3000]
+            if "on:" in body and "jobs:" in body:
+                return {
+                    "vuln_type": "exposed_github_workflow_file",
+                    "severity": "low",
+                    "evidence": (
+                        f"{base}/.github/workflows/{filename} is publicly accessible - "
+                        f"CI/CD pipeline structure and external service integrations "
+                        f"disclosed (secrets are referenced by name, not embedded, so "
+                        f"this is architecture disclosure rather than a direct leak)."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: GitHub workflow exposure check failed for %s: %s", host, exc)
     return None
@@ -2366,29 +2367,29 @@ async def check_terraform_state_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in ("/terraform.tfstate", "/.terraform/terraform.tfstate"):
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    data = resp.json()
-                except Exception:
-                    continue
-                if isinstance(data, dict) and "terraform_version" in data and "resources" in data:
-                    return {
-                        "vuln_type": "exposed_terraform_state",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and is a real Terraform "
-                            f"state file (terraform_version + resources present) - state "
-                            f"files routinely contain plaintext secrets recorded during "
-                            f"provisioning, even when the source config never hardcodes them."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in ("/terraform.tfstate", "/.terraform/terraform.tfstate"):
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+            if isinstance(data, dict) and "terraform_version" in data and "resources" in data:
+                return {
+                    "vuln_type": "exposed_terraform_state",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and is a real Terraform "
+                        f"state file (terraform_version + resources present) - state "
+                        f"files routinely contain plaintext secrets recorded during "
+                        f"provisioning, even when the source config never hardcodes them."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Terraform state check failed for %s: %s", host, exc)
     return None
@@ -2406,25 +2407,25 @@ async def check_ansible_vault_exposure(host: str) -> dict | None:
     base = host.rstrip("/")
     paths = ["/vault.yml", "/secrets.yml", "/group_vars/all/vault.yml", "/vault.yaml"]
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in paths:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                if resp.text.startswith("$ANSIBLE_VAULT;1.1;AES256"):
-                    return {
-                        "vuln_type": "exposed_ansible_vault_file",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and is a real Ansible "
-                            f"Vault-encrypted file - contents remain encrypted, but exposure "
-                            f"confirms exactly what secrets exist and where, and a weak/"
-                            f"reused vault password would fully compromise it."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in paths:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            if resp.text.startswith("$ANSIBLE_VAULT;1.1;AES256"):
+                return {
+                    "vuln_type": "exposed_ansible_vault_file",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and is a real Ansible "
+                        f"Vault-encrypted file - contents remain encrypted, but exposure "
+                        f"confirms exactly what secrets exist and where, and a weak/"
+                        f"reused vault password would fully compromise it."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Ansible Vault check failed for %s: %s", host, exc)
     return None
@@ -2439,26 +2440,26 @@ async def check_helm_values_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in ("/values.yaml", "/helm/values.yaml", "/chart/values.yaml"):
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:3000]
-                if "image:" in body and ("replicaCount:" in body or "service:" in body):
-                    return {
-                        "vuln_type": "exposed_helm_values_yaml",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and is a real Helm "
-                            f"values.yaml - Kubernetes deployment configuration disclosed, "
-                            f"sometimes including inline secrets not properly sourced from a "
-                            f"Secret resource."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in ("/values.yaml", "/helm/values.yaml", "/chart/values.yaml"):
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:3000]
+            if "image:" in body and ("replicaCount:" in body or "service:" in body):
+                return {
+                    "vuln_type": "exposed_helm_values_yaml",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and is a real Helm "
+                        f"values.yaml - Kubernetes deployment configuration disclosed, "
+                        f"sometimes including inline secrets not properly sourced from a "
+                        f"Secret resource."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Helm values.yaml check failed for %s: %s", host, exc)
     return None
@@ -2474,11 +2475,11 @@ async def check_serverless_yml_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/serverless.yml")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/serverless.yml")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: serverless.yml check failed for %s: %s", host, exc)
         return None
@@ -2511,11 +2512,11 @@ async def check_exposed_docker_daemon_api(host: str) -> dict | None:
     if not hostname:
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            try:
-                resp = await client.get(f"http://{hostname}:2375/version")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        try:
+            resp = await client.get(f"http://{hostname}:2375/version")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Docker daemon API check failed for %s: %s", host, exc)
         return None
@@ -2606,13 +2607,13 @@ async def check_exposed_influxdb_no_auth(host: str) -> dict | None:
     if not hostname:
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            try:
-                resp = await client.get(
-                    f"http://{hostname}:8086/query", params={"q": "SHOW DATABASES"}
-                )
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        try:
+            resp = await client.get(
+                f"http://{hostname}:8086/query", params={"q": "SHOW DATABASES"}
+            )
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: InfluxDB check failed for %s: %s", host, exc)
         return None
@@ -2645,11 +2646,11 @@ async def check_exposed_kibana_no_auth(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/api/status")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/api/status")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Kibana check failed for %s: %s", host, exc)
         return None
@@ -2688,26 +2689,26 @@ async def check_backup_archive_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _BACKUP_ARCHIVE_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                content = resp.content[:8]
-                if content.startswith(_ZIP_MAGIC) or content.startswith(_GZIP_MAGIC):
-                    return {
-                        "vuln_type": "exposed_backup_archive",
-                        "severity": "high",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and its content starts "
-                            f"with a real archive-format magic byte sequence - a genuine "
-                            f"site backup archive, not an unrelated 200 response, is "
-                            f"downloadable."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _BACKUP_ARCHIVE_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            content = resp.content[:8]
+            if content.startswith(_ZIP_MAGIC) or content.startswith(_GZIP_MAGIC):
+                return {
+                    "vuln_type": "exposed_backup_archive",
+                    "severity": "high",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and its content starts "
+                        f"with a real archive-format magic byte sequence - a genuine "
+                        f"site backup archive, not an unrelated 200 response, is "
+                        f"downloadable."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: backup archive check failed for %s: %s", host, exc)
     return None
@@ -2726,25 +2727,25 @@ async def check_sql_dump_file_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _SQL_DUMP_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:5000]
-                matches = [m for m in _SQL_DUMP_MARKERS if m in body]
-                if len(matches) >= 2:
-                    return {
-                        "vuln_type": "exposed_sql_dump_file",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and is a real SQL database "
-                            f"dump (matched {matches}) - full database contents disclosed."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _SQL_DUMP_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:5000]
+            matches = [m for m in _SQL_DUMP_MARKERS if m in body]
+            if len(matches) >= 2:
+                return {
+                    "vuln_type": "exposed_sql_dump_file",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and is a real SQL database "
+                        f"dump (matched {matches}) - full database contents disclosed."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: SQL dump exposure check failed for %s: %s", host, exc)
     return None
@@ -2766,25 +2767,25 @@ async def check_log_file_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _LOG_FILE_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body = resp.text[:5000]
-                if _ACCESS_LOG_LINE_RE.search(body):
-                    return {
-                        "vuln_type": "exposed_server_log_file",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{base}{path} is publicly accessible and contains real access-"
-                            f"log-formatted entries - internal paths, client IPs, and "
-                            f"potentially session tokens logged in URLs are disclosed."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _LOG_FILE_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body = resp.text[:5000]
+            if _ACCESS_LOG_LINE_RE.search(body):
+                return {
+                    "vuln_type": "exposed_server_log_file",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{base}{path} is publicly accessible and contains real access-"
+                        f"log-formatted entries - internal paths, client IPs, and "
+                        f"potentially session tokens logged in URLs are disclosed."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: log file exposure check failed for %s: %s", host, exc)
     return None
@@ -2803,11 +2804,11 @@ async def check_htpasswd_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(base + "/.htpasswd")
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(base + "/.htpasswd")
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: .htpasswd exposure check failed for %s: %s", host, exc)
         return None
@@ -2850,68 +2851,68 @@ async def check_graphql_sensitive_field_exposure(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            for path in _GRAPHQL_PATHS:
-                url = base + path
-                try:
-                    resp = await client.post(url, json=_INTROSPECTION_QUERY)
-                except httpx.HTTPError:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        for path in _GRAPHQL_PATHS:
+            url = base + path
+            try:
+                resp = await client.post(url, json=_INTROSPECTION_QUERY)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                continue
+            schema = (data.get("data") or {}).get("__schema")
+            if not schema or not schema.get("types"):
+                continue
+
+            for gql_type in schema["types"]:
+                type_name = gql_type.get("name")
+                fields = gql_type.get("fields") or []
+                if not type_name or type_name.startswith("__") or not fields:
                     continue
-                if resp.status_code != 200:
-                    continue
-                try:
-                    data = resp.json()
-                except ValueError:
-                    continue
-                schema = (data.get("data") or {}).get("__schema")
-                if not schema or not schema.get("types"):
+                field_names = [f["name"] for f in fields if f.get("name")]
+                sensitive_field = next(
+                    (f for f in field_names if any(kw in f.lower() for kw in _GRAPHQL_SENSITIVE_FIELD_KEYWORDS)),
+                    None,
+                )
+                id_field = next((f for f in field_names if f.lower() == "id"), None)
+                if not sensitive_field or not id_field:
                     continue
 
-                for gql_type in schema["types"]:
-                    type_name = gql_type.get("name")
-                    fields = gql_type.get("fields") or []
-                    if not type_name or type_name.startswith("__") or not fields:
+                query_field = type_name[0].lower() + type_name[1:]
+                for guess_id in ("1", "2"):
+                    query = {
+                        "query": (
+                            f"{{ {query_field}(id: \"{guess_id}\") "
+                            f"{{ {id_field} {sensitive_field} }} }}"
+                        )
+                    }
+                    try:
+                        q_resp = await client.post(url, json=query)
+                    except httpx.HTTPError:
                         continue
-                    field_names = [f["name"] for f in fields if f.get("name")]
-                    sensitive_field = next(
-                        (f for f in field_names if any(kw in f.lower() for kw in _GRAPHQL_SENSITIVE_FIELD_KEYWORDS)),
-                        None,
-                    )
-                    id_field = next((f for f in field_names if f.lower() == "id"), None)
-                    if not sensitive_field or not id_field:
+                    try:
+                        q_data = q_resp.json()
+                    except ValueError:
                         continue
-
-                    query_field = type_name[0].lower() + type_name[1:]
-                    for guess_id in ("1", "2"):
-                        query = {
-                            "query": (
-                                f"{{ {query_field}(id: \"{guess_id}\") "
-                                f"{{ {id_field} {sensitive_field} }} }}"
-                            )
+                    obj = (q_data.get("data") or {}).get(query_field)
+                    if isinstance(obj, dict) and obj.get(sensitive_field):
+                        value_preview = str(obj[sensitive_field])[:6] + "…"
+                        return {
+                            "vuln_type": "graphql_sensitive_field_overexposure",
+                            "severity": "high",
+                            "evidence": (
+                                f"{url}: querying `{query_field}(id: {guess_id!r})` for "
+                                f"type '{type_name}' returned a non-empty value for the "
+                                f"sensitive-named field '{sensitive_field}' ({value_preview}) "
+                                f"with no additional authorization - unauthenticated "
+                                f"over-fetch of sensitive data via GraphQL, not just an "
+                                f"exposed schema."
+                            ),
                         }
-                        try:
-                            q_resp = await client.post(url, json=query)
-                        except httpx.HTTPError:
-                            continue
-                        try:
-                            q_data = q_resp.json()
-                        except ValueError:
-                            continue
-                        obj = (q_data.get("data") or {}).get(query_field)
-                        if isinstance(obj, dict) and obj.get(sensitive_field):
-                            value_preview = str(obj[sensitive_field])[:6] + "…"
-                            return {
-                                "vuln_type": "graphql_sensitive_field_overexposure",
-                                "severity": "high",
-                                "evidence": (
-                                    f"{url}: querying `{query_field}(id: {guess_id!r})` for "
-                                    f"type '{type_name}' returned a non-empty value for the "
-                                    f"sensitive-named field '{sensitive_field}' ({value_preview}) "
-                                    f"with no additional authorization - unauthenticated "
-                                    f"over-fetch of sensitive data via GraphQL, not just an "
-                                    f"exposed schema."
-                                ),
-                            }
     except httpx.HTTPError as exc:
         logger.info("detective: GraphQL sensitive field exposure check failed for %s: %s", host, exc)
     return None

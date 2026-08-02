@@ -173,6 +173,32 @@ async def _trigger_scan_for_project(project_id: int) -> dict:
     }
 
 
+# Tasks fired via asyncio.create_task() are only weakly referenced by the
+# event loop - if nothing else holds a reference, the task can be garbage
+# collected mid-run (a documented asyncio gotcha), and even when it isn't,
+# an exception raised inside it is swallowed except for an
+# "Task exception was never retrieved" log line nobody's watching. This set
+# holds a strong reference until each task finishes, and logs failures the
+# same way _finalize_scan_status does for the batch-scan path below.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro, *, description: str) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("background task failed (%s): %r", description, exc, exc_info=exc)
+
+    task.add_done_callback(_on_done)
+    return task
+
+
 async def _finalize_scan_status(pool, project_id: int, tasks: list) -> None:
     """Waits for every per-target pipeline task from a single scan kickoff
     to finish, then flips the project out of 'scanning'.
@@ -1260,8 +1286,9 @@ async def rescan_target(project_id: int, target_id: int):
                 detail="This host already has a scan in progress - wait for it to finish before rescanning",
             )
 
-    asyncio.create_task(
-        _run_target_pipeline_limited(pool, project_id, target_id, target_row["target"])
+    _spawn_background_task(
+        _run_target_pipeline_limited(pool, project_id, target_id, target_row["target"]),
+        description=f"rescan target_id={target_id} project_id={project_id}",
     )
 
     return {

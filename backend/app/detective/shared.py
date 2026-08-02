@@ -5,6 +5,7 @@ Split out of the original monolithic detective.py - see detective/__init__.py
 for the package-level docstring and full batch history.
 """
 
+import asyncio
 import logging
 import math
 import re
@@ -14,6 +15,55 @@ import httpx
 logger = logging.getLogger("swas.detective")
 
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+# --------------------------------------------------------------------------
+# Shared connection pool
+# --------------------------------------------------------------------------
+# Every check in this package used to open its own `httpx.AsyncClient()`,
+# meaning every single check did its own fresh TCP+TLS handshake even when
+# ten other checks were about to (or had just) hit the exact same host.
+# With 140+ checks per target that's a lot of redundant handshakes - slower
+# scans, more load on our own box, and more repeated-connection noise that
+# can trip a target's rate limiting before we've even gotten to the checks
+# that matter.
+#
+# get_transport() hands back one process-wide httpx.AsyncHTTPTransport
+# whose underlying connection pool is what actually gets reused. Callers
+# still create their own `httpx.AsyncClient(transport=get_transport())` per
+# check (cheap - it's just a thin wrapper), but MUST NOT call
+# `client.aclose()` / use `async with ... as client:` on it, because
+# AsyncClient.aclose() unconditionally closes its transport - including one
+# it doesn't own - which would tear down the shared pool for every other
+# in-flight check. The per-check client object itself is left for the
+# garbage collector; the pooled connections it borrowed live on in the
+# shared transport for the next check to reuse.
+_shared_transport: httpx.AsyncHTTPTransport | None = None
+_shared_transport_lock = asyncio.Lock()
+
+
+async def get_transport() -> httpx.AsyncHTTPTransport:
+    global _shared_transport
+    if _shared_transport is None:
+        async with _shared_transport_lock:
+            if _shared_transport is None:
+                _shared_transport = httpx.AsyncHTTPTransport(
+                    verify=False,
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=20,
+                        keepalive_expiry=30.0,
+                    ),
+                    retries=0,
+                )
+    return _shared_transport
+
+
+async def close_shared_transport() -> None:
+    """Call once from app shutdown. Not needed between individual checks."""
+    global _shared_transport
+    if _shared_transport is not None:
+        await _shared_transport.aclose()
+        _shared_transport = None
 
 # Every httpx.AsyncClient below is created with verify=False. This matches
 # the rest of this stack (nuclei, httpx-pd, sqlmap - all Go/CLI tools that

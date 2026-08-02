@@ -35,6 +35,7 @@ from .shared import (
     _looks_like_sane_url,
     _shannon_entropy,
     _replace_query_param,
+    get_transport,
 )
 
 async def check_reflected_xss(url: str) -> dict | None:
@@ -56,29 +57,29 @@ async def check_reflected_xss(url: str) -> dict | None:
     existing_params = dict(parsed.params)
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for param_name in existing_params:
-                test_params = dict(existing_params)
-                test_params[param_name] = payload
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for param_name in existing_params:
+            test_params = dict(existing_params)
+            test_params[param_name] = payload
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
 
-                content_type = resp.headers.get("content-type", "")
-                if "html" not in content_type.lower():
-                    continue  # JSON/plain-text APIs aren't a browser-execution context here
-                if payload in resp.text:
-                    return {
-                        "vuln_type": "reflected_xss",
-                        "severity": "high",
-                        "evidence": (
-                            f"{test_url}: parameter '{param_name}' reflected the payload "
-                            f"{payload!r} completely unescaped in a text/html response - "
-                            f"browser would execute this as markup/script."
-                        ),
-                    }
+            content_type = resp.headers.get("content-type", "")
+            if "html" not in content_type.lower():
+                continue  # JSON/plain-text APIs aren't a browser-execution context here
+            if payload in resp.text:
+                return {
+                    "vuln_type": "reflected_xss",
+                    "severity": "high",
+                    "evidence": (
+                        f"{test_url}: parameter '{param_name}' reflected the payload "
+                        f"{payload!r} completely unescaped in a text/html response - "
+                        f"browser would execute this as markup/script."
+                    ),
+                }
     except httpx.HTTPError as exc:
         logger.info("detective: reflected XSS check failed for %s: %s", url, exc)
     return None
@@ -106,8 +107,8 @@ async def check_dom_xss_sink_flagging(url: str) -> str | None:
     verdict.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: DOM XSS sink check failed for %s: %s", url, exc)
         return None
@@ -142,8 +143,8 @@ async def check_clickjacking_missing_protection(url: str) -> str | None:
     reasoning already applied to check_csp_weakness and check_missing_sri.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: clickjacking check failed for %s: %s", url, exc)
         return None
@@ -178,8 +179,8 @@ async def check_file_upload_form_candidate(url: str) -> str | None:
     surface is so you can test it manually and clean up after yourself.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: file upload form check failed for %s: %s", url, exc)
         return None
@@ -211,8 +212,8 @@ async def check_insecure_svg_upload_flagging(url: str) -> str | None:
     same reasoning as the general file-upload check.
     """
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            resp = await client.get(url)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
     except httpx.HTTPError as exc:
         logger.info("detective: SVG upload flagging check failed for %s: %s", url, exc)
         return None
@@ -249,38 +250,38 @@ async def check_jsonp_callback_xss(url: str) -> dict | None:
     payload = f"alert(/swas{marker_id}/)//"
 
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
-            for param_name in _JSONP_PARAM_NAMES:
-                test_params = dict(existing_params)
-                test_params[param_name] = payload
-                test_url = parsed.copy_with(params=test_params)
-                try:
-                    resp = await client.get(test_url)
-                except httpx.HTTPError:
-                    continue
-                content_type = resp.headers.get("content-type", "").lower()
-                if "javascript" not in content_type and "json" not in content_type:
-                    continue
-                if payload not in resp.text:
-                    continue
-                # Confirm the payload wasn't JSON-string-escaped into harmlessness
-                # (e.g. "alert(\/swas...\/)//" inside a quoted string literal) -
-                # check the few characters immediately before it for an escaping
-                # backslash-quote, which would mean it's inert data, not live code.
-                idx = resp.text.find(payload)
-                preceding = resp.text[max(0, idx - 5):idx]
-                if '\\"' in preceding or "\\'" in preceding:
-                    continue
-                return {
-                    "vuln_type": "jsonp_callback_xss",
-                    "severity": "high",
-                    "evidence": (
-                        f"{test_url}: JSONP parameter '{param_name}' with payload "
-                        f"{payload!r} was reflected unescaped into a "
-                        f"javascript/json-typed response - executes as script when "
-                        f"loaded via <script src>."
-                    ),
-                }
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for param_name in _JSONP_PARAM_NAMES:
+            test_params = dict(existing_params)
+            test_params[param_name] = payload
+            test_url = parsed.copy_with(params=test_params)
+            try:
+                resp = await client.get(test_url)
+            except httpx.HTTPError:
+                continue
+            content_type = resp.headers.get("content-type", "").lower()
+            if "javascript" not in content_type and "json" not in content_type:
+                continue
+            if payload not in resp.text:
+                continue
+            # Confirm the payload wasn't JSON-string-escaped into harmlessness
+            # (e.g. "alert(\/swas...\/)//" inside a quoted string literal) -
+            # check the few characters immediately before it for an escaping
+            # backslash-quote, which would mean it's inert data, not live code.
+            idx = resp.text.find(payload)
+            preceding = resp.text[max(0, idx - 5):idx]
+            if '\\"' in preceding or "\\'" in preceding:
+                continue
+            return {
+                "vuln_type": "jsonp_callback_xss",
+                "severity": "high",
+                "evidence": (
+                    f"{test_url}: JSONP parameter '{param_name}' with payload "
+                    f"{payload!r} was reflected unescaped into a "
+                    f"javascript/json-typed response - executes as script when "
+                    f"loaded via <script src>."
+                ),
+            }
     except httpx.HTTPError as exc:
         logger.info("detective: JSONP callback XSS check failed for %s: %s", url, exc)
     return None
