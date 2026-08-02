@@ -106,6 +106,14 @@ export const api = {
   listPhaseRuns: (projectId) => request(`/projects/${projectId}/phase-runs`),
   listScanRuns: (projectId) => request(`/projects/${projectId}/scan-runs`),
 
+  // Execution queue
+  listQueue: () => request("/queue"),
+  enqueueProject: (projectId, priority = false) =>
+    request("/queue", { method: "POST", body: JSON.stringify({ project_id: projectId, priority }) }),
+  reorderQueueItem: (queueId, newPosition) =>
+    request(`/queue/${queueId}/reorder`, { method: "PATCH", body: JSON.stringify({ new_position: newPosition }) }),
+  cancelQueueItem: (queueId) => request(`/queue/${queueId}`, { method: "DELETE" }),
+
   // Live scan progress - returns a plain WebSocket URL (not JSON), for
   // components to open themselves via `new WebSocket(...)`. Derives ws://
   // vs wss:// from the page's own protocol so it works the same behind

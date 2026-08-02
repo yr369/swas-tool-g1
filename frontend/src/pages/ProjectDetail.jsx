@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import { PipelineTracker } from "../components/PipelineTracker";
 import { FindingsList } from "../components/FindingsList";
@@ -34,23 +34,27 @@ export function ProjectDetail() {
   const [error, setError] = useState(null);
   const [liveConnected, setLiveConnected] = useState(false);
   const [diffHasContent, setDiffHasContent] = useState(false);
+  const [queueEntry, setQueueEntry] = useState(null);
+  const [queueBusy, setQueueBusy] = useState(false);
   const pollRef = useRef(null);
   const wsRef = useRef(null);
 
   const loadAll = useCallback(async () => {
     try {
-      const [proj, scopeList, runs, findingsList, notesList] = await Promise.all([
+      const [proj, scopeList, runs, findingsList, notesList, queue] = await Promise.all([
         api.getProject(id),
         api.listScope(id),
         api.listPhaseRuns(id),
         api.listFindings(id),
         api.listScanNotes(id),
+        api.listQueue(),
       ]);
       setProject(proj);
       setScope(scopeList);
       setPhaseRuns(runs);
       setFindings(findingsList);
       setScanNotes(notesList);
+      setQueueEntry(queue.find((q) => q.project_id === Number(id)) || null);
     } catch (err) {
       setError(err.message);
     }
@@ -189,6 +193,33 @@ export function ProjectDetail() {
     }
   }
 
+  async function handleEnqueue() {
+    setQueueBusy(true);
+    setError(null);
+    try {
+      await api.enqueueProject(id);
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setQueueBusy(false);
+    }
+  }
+
+  async function handleRemoveFromQueue() {
+    if (!queueEntry) return;
+    setQueueBusy(true);
+    setError(null);
+    try {
+      await api.cancelQueueItem(queueEntry.id);
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setQueueBusy(false);
+    }
+  }
+
   async function handleTriageAll() {
     setTriagingAll(true);
     setError(null);
@@ -210,7 +241,15 @@ export function ProjectDetail() {
 
   return (
     <div>
-      <ProjectHeader project={project} inScopeCount={inScopeCount} onSaved={loadAll} />
+      <ProjectHeader
+        project={project}
+        inScopeCount={inScopeCount}
+        onSaved={loadAll}
+        queueEntry={queueEntry}
+        queueBusy={queueBusy}
+        onEnqueue={handleEnqueue}
+        onRemoveFromQueue={handleRemoveFromQueue}
+      />
 
       <Section
         title="Pipeline"
@@ -405,7 +444,7 @@ export function ProjectDetail() {
   );
 }
 
-function ProjectHeader({ project, inScopeCount, onSaved }) {
+function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy, onEnqueue, onRemoveFromQueue }) {
   const [editing, setEditing] = useState(false);
   const [nameValue, setNameValue] = useState(project.name);
   const [platformValue, setPlatformValue] = useState(project.platform);
@@ -484,6 +523,59 @@ function ProjectHeader({ project, inScopeCount, onSaved }) {
         <button className="btn" onClick={startEditing} style={{ padding: "3px 9px", fontSize: 11 }}>
           Edit
         </button>
+        <div style={{ marginLeft: "auto" }}>
+          {!queueEntry && (
+            <button
+              className="btn"
+              onClick={onEnqueue}
+              disabled={queueBusy}
+              style={{ padding: "5px 11px", fontSize: 11 }}
+            >
+              {queueBusy ? "…" : "+ Add to Execution Queue"}
+            </button>
+          )}
+          {queueEntry && queueEntry.status === "running" && (
+            <span
+              className="mono"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 11,
+                color: "var(--signal)",
+                border: "1px solid var(--signal)",
+                borderRadius: 999,
+                padding: "4px 10px",
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--signal)", animation: "signal-pulse 1.6s ease-out infinite" }}
+              />
+              Running (queue)
+            </span>
+          )}
+          {queueEntry && queueEntry.status === "queued" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <Link
+                to="/queue"
+                className="mono"
+                style={{ fontSize: 11, color: "var(--text-secondary)" }}
+                title="View execution queue"
+              >
+                Queued #{queueEntry.position}
+              </Link>
+              <button
+                className="btn"
+                onClick={onRemoveFromQueue}
+                disabled={queueBusy}
+                style={{ padding: "3px 9px", fontSize: 11, color: "var(--status-fail)" }}
+              >
+                {queueBusy ? "…" : "Remove"}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
       <p style={{ color: "var(--text-muted)", fontSize: 13, margin: 0 }}>
         {platformLabel(project.platform)} · {inScopeCount} in-scope target

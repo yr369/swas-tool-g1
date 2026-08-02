@@ -4,6 +4,7 @@ const GROUPS = [
     items: [
       ["G then P", "Projects"],
       ["G then H", "Chronology"],
+      ["G then Q", "Execution queue"],
       ["G then T", "Triage queue"],
       ["G then D", "Dashboard"],
       ["G then O", "System"],

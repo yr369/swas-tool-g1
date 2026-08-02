@@ -4,6 +4,7 @@ import { Link, useLocation } from "react-router-dom";
 const NAV = [
   { to: "/", label: "Projects", keys: "G P", icon: "▣" },
   { to: "/chronology", label: "Chronology", keys: "G H", icon: "◐" },
+  { to: "/queue", label: "Execution Queue", keys: "G Q", icon: "▤" },
   { to: "/triage", label: "Triage Queue", keys: "G T", icon: "▶" },
   { to: "/dashboard", label: "Dashboard", keys: "G D", icon: "◈" },
   { to: "/system", label: "System", keys: "G O", icon: "◍" },
