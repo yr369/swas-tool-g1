@@ -38,7 +38,7 @@ import os
 
 import asyncpg
 
-from . import auth_policy, auth_sessions
+from .. import auth_policy, auth_sessions
 
 
 async def main():

@@ -26,7 +26,7 @@ responses) and the real agent_loop code path:
 import asyncio
 import urllib.parse
 
-from . import agent_loop
+from .. import agent_loop
 
 
 class _FakeResponse:

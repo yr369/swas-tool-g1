@@ -34,7 +34,7 @@ import os
 
 import asyncpg
 
-from . import gate
+from .. import gate
 
 
 async def _seed_outcomes(conn, signature: str, outcomes: list[str]):

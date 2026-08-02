@@ -42,7 +42,7 @@ import os
 
 import asyncpg
 
-from . import agent_loop, auth_policy, auth_sessions
+from .. import agent_loop, auth_policy, auth_sessions
 
 
 class _FakeResponse:

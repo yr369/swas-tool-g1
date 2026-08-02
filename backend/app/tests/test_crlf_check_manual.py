@@ -27,7 +27,7 @@ the check's baseline-diff step has something realistic to diff against.
 import asyncio
 import urllib.parse
 
-from . import detective
+from .. import detective
 
 
 async def _false_positive_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):

@@ -14,7 +14,7 @@ import shutil
 import sys
 import tempfile
 
-from . import config
+from .. import config
 
 _REQUIRED = {
     "GEMINI_API_KEY": "real_key_value",

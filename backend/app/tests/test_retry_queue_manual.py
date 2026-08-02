@@ -30,7 +30,7 @@ import asyncpg
 
 os.environ.setdefault("GEMINI_API_KEY", "test-key-not-used")
 
-from . import retry_queue, triage  # noqa: E402 (env var must be set first)
+from .. import retry_queue, triage  # noqa: E402 (env var must be set first)
 
 DB_DSN = os.environ.get(
     "TEST_DB_DSN", "postgresql://swas_test:testpass@localhost/swas_test_db"

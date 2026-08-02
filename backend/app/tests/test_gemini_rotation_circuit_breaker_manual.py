@@ -23,7 +23,7 @@ import sys
 import requests
 from google.genai import errors as genai_errors
 
-from . import gemini_rotation
+from .. import gemini_rotation
 
 
 def _make_error(cls, code: int, status: str):

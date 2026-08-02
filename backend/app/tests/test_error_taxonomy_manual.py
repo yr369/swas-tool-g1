@@ -32,7 +32,7 @@ import httpx
 import requests
 from google.genai import errors as genai_errors
 
-from . import auth_policy, checkpoint, config, error_taxonomy
+from .. import auth_policy, checkpoint, config, error_taxonomy
 
 DB_DSN = os.environ.get(
     "TEST_DB_DSN", "postgresql://swas_test:testpass@localhost/swas_test_db"

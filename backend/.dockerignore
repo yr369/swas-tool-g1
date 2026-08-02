@@ -1,0 +1,13 @@
+# Keeps the backend image lean and prevents accidental leaks of local/dev
+# artifacts into the built image (COPY app/ ./app/ in the Dockerfile would
+# otherwise grab all of this too).
+
+app/tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.env
+.env
+.git/
+*.md
+*.sql
