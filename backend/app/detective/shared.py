@@ -5,7 +5,6 @@ Split out of the original monolithic detective.py - see detective/__init__.py
 for the package-level docstring and full batch history.
 """
 
-import asyncio
 import logging
 import math
 import re
@@ -38,23 +37,20 @@ _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # garbage collector; the pooled connections it borrowed live on in the
 # shared transport for the next check to reuse.
 _shared_transport: httpx.AsyncHTTPTransport | None = None
-_shared_transport_lock = asyncio.Lock()
 
 
-async def get_transport() -> httpx.AsyncHTTPTransport:
+def get_transport() -> httpx.AsyncHTTPTransport:
     global _shared_transport
     if _shared_transport is None:
-        async with _shared_transport_lock:
-            if _shared_transport is None:
-                _shared_transport = httpx.AsyncHTTPTransport(
-                    verify=False,
-                    limits=httpx.Limits(
-                        max_connections=100,
-                        max_keepalive_connections=20,
-                        keepalive_expiry=30.0,
-                    ),
-                    retries=0,
-                )
+        _shared_transport = httpx.AsyncHTTPTransport(
+            verify=False,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            ),
+            retries=0,
+        )
     return _shared_transport
 
 

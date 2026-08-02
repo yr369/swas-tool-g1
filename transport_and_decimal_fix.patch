@@ -1,0 +1,58 @@
+diff --git a/backend/app/detective/shared.py b/backend/app/detective/shared.py
+index 35c6e00..36d3c9f 100644
+--- a/backend/app/detective/shared.py
++++ b/backend/app/detective/shared.py
+@@ -5,7 +5,6 @@ Split out of the original monolithic detective.py - see detective/__init__.py
+ for the package-level docstring and full batch history.
+ """
+ 
+-import asyncio
+ import logging
+ import math
+ import re
+@@ -38,23 +37,20 @@ _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+ # garbage collector; the pooled connections it borrowed live on in the
+ # shared transport for the next check to reuse.
+ _shared_transport: httpx.AsyncHTTPTransport | None = None
+-_shared_transport_lock = asyncio.Lock()
+ 
+ 
+-async def get_transport() -> httpx.AsyncHTTPTransport:
++def get_transport() -> httpx.AsyncHTTPTransport:
+     global _shared_transport
+     if _shared_transport is None:
+-        async with _shared_transport_lock:
+-            if _shared_transport is None:
+-                _shared_transport = httpx.AsyncHTTPTransport(
+-                    verify=False,
+-                    limits=httpx.Limits(
+-                        max_connections=100,
+-                        max_keepalive_connections=20,
+-                        keepalive_expiry=30.0,
+-                    ),
+-                    retries=0,
+-                )
++        _shared_transport = httpx.AsyncHTTPTransport(
++            verify=False,
++            limits=httpx.Limits(
++                max_connections=100,
++                max_keepalive_connections=20,
++                keepalive_expiry=30.0,
++            ),
++            retries=0,
++        )
+     return _shared_transport
+ 
+ 
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 872f301..9735b5b 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -1984,6 +1984,7 @@ async def _queue_row_to_item(conn, row) -> dict:
+         ) recent
+         """
+     )
++    avg_seconds = float(avg_seconds) if avg_seconds is not None else None
+     estimated_start_at = None
+     if row["status"] == "queued" and avg_seconds:
+         ahead = await conn.fetchval(

@@ -1984,6 +1984,7 @@ async def _queue_row_to_item(conn, row) -> dict:
         ) recent
         """
     )
+    avg_seconds = float(avg_seconds) if avg_seconds is not None else None
     estimated_start_at = None
     if row["status"] == "queued" and avg_seconds:
         ahead = await conn.fetchval(
