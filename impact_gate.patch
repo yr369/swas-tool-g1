@@ -1,0 +1,135 @@
+diff --git a/backend/db/migrations/017_gate_impact_hint.sql b/backend/db/migrations/017_gate_impact_hint.sql
+new file mode 100644
+index 0000000..2414544
+--- /dev/null
++++ b/backend/db/migrations/017_gate_impact_hint.sql
+@@ -0,0 +1,23 @@
++-- 017_gate_impact_hint.sql
++-- Adds impact_hint / impact_signals to findings: a cheap, regex-based
++-- early warning written by gate.py's new impact scorer, BEFORE the
++-- finding ever reaches the expensive triage.py pass or a human.
++--
++-- Deliberately not authoritative: triage.py's LLM-judged impact_evidence
++-- cap (012_impact_evidence.sql) remains the real severity call. This is
++-- only meant to flag, as early and cheaply as possible, findings that
++-- smell like they'll come back Informative - DoS/rate-limit/resource-
++-- exhaustion vuln types, unauthenticated cache purge with no poisoning
++-- evidence, self-XSS, cosmetic-only changes, or a bare missing header
++-- with nothing else backing it.
++--
++-- Nullable, no default beyond NULL: pre-existing rows and any row gate
++-- hasn't touched yet simply have no hint, same pattern as
++-- impact_evidence.
++--
++-- Idempotent, same pattern as prior migrations.
++
++ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact_hint TEXT
++    CHECK (impact_hint IN ('likely_informative', 'has_impact_signal', 'unclear') OR impact_hint IS NULL);
++ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact_signals TEXT;
++CREATE INDEX IF NOT EXISTS idx_findings_impact_hint ON findings (impact_hint);
+diff --git a/backend/app/gate.py b/backend/app/gate.py
+index e31fc48..88befaa 100644
+--- a/backend/app/gate.py
++++ b/backend/app/gate.py
+@@ -48,6 +48,7 @@ threshold and reasoning.
+ import json
+ import logging
+ import os
++import re
+ 
+ from google import genai
+ 
+@@ -123,6 +124,78 @@ def _format_gate_outcome_context(stats: dict | None) -> str:
+     )
+ 
+ 
++# --- Impact-hint scorer -----------------------------------------------
++#
++# Purely informational, non-LLM, regex-based. Does NOT affect gate
++# pass/fail (that stays "is there a real signal", unchanged) and does
++# NOT replace triage.py's LLM-judged impact_evidence cap, which remains
++# the authoritative severity call. This exists to surface an early,
++# cheap "this smells like it'll come back Informative" warning on
++# every finding the moment it's gated - before a human or the more
++# expensive triage pass ever looks at it.
++
++_DOS_VULN_KEYWORDS = (
++    "dos", "denial_of_service", "denial-of-service", "rate_limit",
++    "rate-limit", "resource_exhaustion", "resource-exhaustion",
++)
++
++_IMPACT_SIGNAL_PATTERNS = [
++    (re.compile(r"(?i)\bpassword\b\s*[:=]"), "password value present"),
++    (re.compile(r"(?i)api[_-]?key"), "API key present"),
++    (re.compile(r"(?i)secret[_-]?key|aws_secret_access_key|AKIA[0-9A-Z]{16}"), "cloud/secret key present"),
++    (re.compile(r"(?i)access[_-]?token|bearer\s+[a-zA-Z0-9\-_.]{10,}"), "auth token present"),
++    (re.compile(r"(?i)-----BEGIN (RSA |EC |)PRIVATE KEY-----"), "private key present"),
++    (re.compile(r"(?i)\bssn\b|social security"), "SSN/PII present"),
++    (re.compile(r"(?i)credit[_ ]?card|card[_ ]?number"), "payment card data present"),
++    (re.compile(r"(?i)/etc/passwd"), "server file read"),
++    (re.compile(r"(?i)another user'?s|different user'?s|victim'?s (data|account)"), "cross-user data access shown"),
++]
++
++_NO_IMPACT_SIGNAL_PATTERNS = [
++    (re.compile(r"(?i)self[- ]?xss"), "self-XSS (not triggerable on another user)"),
++    (re.compile(r"(?i)requires physical (access|device)"), "requires physical access"),
++    (re.compile(r"(?i)\btheme\b.{0,20}(changed|updated)"), "cosmetic-only change (theme)"),
++    (re.compile(r"(?i)missing (security )?header"), "missing header with no working exploit shown"),
++]
++
++
++def _score_impact_hint(vuln_type: str | None, evidence: str | None) -> dict:
++    """
++    Fast heuristic pre-check, not a policy verdict. Three outcomes:
++    - "likely_informative": commonly-excluded bug type (DoS/rate-limit/
++      resource-exhaustion, or an unauthenticated cache purge with no
++      poisoning evidence), or evidence only shows no-impact markers
++      (self-XSS, cosmetic change, bare missing header) - warn before
++      any report gets written.
++    - "has_impact_signal": evidence contains a concrete sensitive-data
++      or cross-user-access marker.
++    - "unclear": neither - most findings land here, and that's fine;
++      triage.py's impact_evidence cap is the real judgment call.
++    """
++    vt = (vuln_type or "").lower()
++    ev = (evidence or "")[:3000]
++
++    if any(kw in vt for kw in _DOS_VULN_KEYWORDS):
++        return {
++            "hint": "likely_informative",
++            "signals": ["vuln_type is DoS/rate-limit/resource-exhaustion - commonly excluded by policy regardless of technical validity"],
++        }
++    if "cache" in vt and "purg" in vt and not re.search(r"(?i)poison|malicious.{0,20}(content|response) served|injected content", ev):
++        return {
++            "hint": "likely_informative",
++            "signals": ["unauthenticated cache purge with no demonstrated poisoning - commonly Informative"],
++        }
++
++    positive = [label for pat, label in _IMPACT_SIGNAL_PATTERNS if pat.search(ev)]
++    negative = [label for pat, label in _NO_IMPACT_SIGNAL_PATTERNS if pat.search(ev)]
++
++    if positive and not negative:
++        return {"hint": "has_impact_signal", "signals": positive[:5]}
++    if negative and not positive:
++        return {"hint": "likely_informative", "signals": negative[:5]}
++    return {"hint": "unclear", "signals": (positive or negative)[:3]}
++
++
+ def _get_client() -> genai.Client:
+     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+ 
+@@ -227,9 +300,12 @@ async def gate_project_findings(conn, project_id: int) -> int:
+         outcome_stats = await triage_module.fetch_signature_stats(conn, signature)
+         result = await run_gate(row["tool_name"], row["evidence"] or "", outcome_stats=outcome_stats)
+         status = "passed" if result["pass"] else "failed"
++        impact = _score_impact_hint(row["vuln_type"], row["evidence"])
+         await conn.execute(
+-            "UPDATE findings SET gate_status = $1, gate_reasoning = $2 WHERE id = $3",
+-            status, (result.get("reasoning") or "")[:500], row["id"],
++            "UPDATE findings SET gate_status = $1, gate_reasoning = $2, "
++            "impact_hint = $3, impact_signals = $4 WHERE id = $5",
++            status, (result.get("reasoning") or "")[:500],
++            impact["hint"], "; ".join(impact["signals"])[:500], row["id"],
+         )
+         gated += 1
+ 

@@ -299,7 +299,7 @@ async def get_recently_completed_phases(conn: asyncpg.Connection, target_id: int
         """
         SELECT DISTINCT phase_name FROM phase_runs
         WHERE target_id = $1 AND status = 'completed'
-          AND completed_at > now() - ($2 || ' minutes')::interval
+          AND completed_at > now() - make_interval(mins => $2)
         """,
         target_id, RESUME_WINDOW_MINUTES,
     )

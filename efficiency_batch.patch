@@ -1,0 +1,369 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index bdb2196..6c43170 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -548,16 +548,22 @@ async def get_project(project_id: int):
+ @app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
+ async def bulk_project_action(payload: ProjectBulkActionRequest):
+     """
+-    Archives or deletes several projects at once from the project list -
+-    meant for cleaning up test/duplicate projects without clicking into
+-    each one individually.
+-
+-    Archive is always safe (just flips status, keeps everything).
+-    Delete is guarded the same way scope-target delete is guarded:
+-    projects cascade to scope_targets/findings/phase_runs/scan_runs on
+-    delete, so any project with at least one finding is skipped rather
+-    than silently destroyed - it shows up in "blocked" instead, with the
+-    finding count, so a bulk click can't accidentally erase real results.
++    Archives or unarchives several projects at once from the project
++    list, or deletes them - meant for cleaning up test/duplicate
++    projects without clicking into each one individually.
++
++    Archive/unarchive are always safe (just flips status, keeps
++    everything). Unarchive sets status back to 'completed' rather than
++    trying to guess whether it should be 'created' or 'scanning' - both
++    of those imply an active/pending scan state that isn't true right
++    after unarchiving, and 'completed' is what every archived project
++    actually was immediately before archiving in practice (you archive
++    finished work, not projects mid-scan). Delete is guarded the same
++    way scope-target delete is guarded: projects cascade to
++    scope_targets/findings/phase_runs/scan_runs on delete, so any
++    project with at least one finding is skipped rather than silently
++    destroyed - it shows up in "blocked" instead, with the finding
++    count, so a bulk click can't accidentally erase real results.
+     Nonexistent project ids are silently ignored (already gone is fine).
+     """
+     pool = database.get_pool()
+@@ -579,6 +585,13 @@ async def bulk_project_action(payload: ProjectBulkActionRequest):
+                 succeeded.append(project_id)
+                 continue
+ 
++            if payload.action == "unarchive":
++                await conn.execute(
++                    "UPDATE projects SET status = 'completed' WHERE id = $1", project_id
++                )
++                succeeded.append(project_id)
++                continue
++
+             # action == "delete"
+             finding_count = await conn.fetchval(
+                 "SELECT COUNT(*) FROM findings WHERE project_id = $1", project_id
+diff --git a/backend/app/models.py b/backend/app/models.py
+index fc5cdf2..a32a819 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -65,7 +65,7 @@ class ProjectDeleteRequest(BaseModel):
+ 
+ class ProjectBulkActionRequest(BaseModel):
+     project_ids: list[int]
+-    action: Literal["archive", "delete"]
++    action: Literal["archive", "unarchive", "delete"]
+ 
+ 
+ class ProjectBulkBlocked(BaseModel):
+@@ -79,7 +79,7 @@ class ProjectBulkBlocked(BaseModel):
+ 
+ 
+ class ProjectBulkActionResult(BaseModel):
+-    action: Literal["archive", "delete"]
++    action: Literal["archive", "unarchive", "delete"]
+     succeeded: list[int]
+     blocked: list[ProjectBulkBlocked]
+ 
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 516b8cb..14183d9 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -320,14 +320,34 @@ async def _phase_recon(
+     target: str,
+     discovered_subdomains: list[str],
+ ) -> None:
+-    """Subdomain enumeration, then check which ones are actually alive."""
+-    result = await tools.run_subfinder(target)
+-    if not result.success:
+-        raise RuntimeError(f"subfinder failed: {result.error}")
++    """
++    Subdomain enumeration, then check which ones are actually alive.
++
++    Reuses a recent subfinder result (see _get_recon_cache_if_fresh)
++    when one exists within RECON_CACHE_HOURS instead of re-querying
++    every OSINT source again - see that function's docstring for why.
++    The takeover check below still runs every single time regardless of
++    cache hit/miss: CNAME state (the thing that check actually cares
++    about) can change independently of the subdomain list itself, and
++    it's cheap enough that skipping it would save little while risking
++    a missed takeover.
++    """
++    cached = await _get_recon_cache_if_fresh(pool, target_id)
++    if cached is not None:
++        discovered_subdomains.extend(cached)
++        logger.info(
++            "recon: reused cached subdomain list (%d found, within %.0fh) for target_id=%s - skipped subfinder",
++            len(cached), _RECON_CACHE_HOURS, target_id,
++        )
++    else:
++        result = await tools.run_subfinder(target)
++        if not result.success:
++            raise RuntimeError(f"subfinder failed: {result.error}")
+ 
+-    found = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+-    discovered_subdomains.extend(found or [target])  # fall back to the target itself
+-    logger.info("recon: found %d subdomains for %s", len(discovered_subdomains), target)
++        found = [line.strip() for line in result.stdout.splitlines() if line.strip()]
++        discovered_subdomains.extend(found or [target])  # fall back to the target itself
++        logger.info("recon: found %d subdomains for %s", len(discovered_subdomains), target)
++        await _save_recon_cache_pooled(pool, target_id, discovered_subdomains)
+ 
+     # Detective check: subdomain takeover via CNAME fingerprinting. Cheap
+     # (one DoH lookup + one conditional HTTP fetch per host) and among
+@@ -2089,6 +2109,50 @@ async def _save_scan_note_pooled(
+         await _save_scan_note(conn, project_id, target_id, check_name, note)
+ 
+ 
++# How long a subfinder result stays reusable before recon re-runs it for
++# real. Subdomain sets for a given root domain rarely change hour to
++# hour, so a target on a 6-hourly schedule (or someone repeatedly
++# clicking manual rescan) was paying full subfinder cost - which hits
++# many external OSINT sources per run - for the same answer every time.
++# Default (12h) means: 6-hourly schedules reuse the cache ~3 of 4 runs,
++# daily/weekly schedules always get fresh recon (their interval already
++# exceeds the cache window), and single-target manual rescans get the
++# same speedup as scheduled ones. Set RECON_CACHE_HOURS=0 to disable and
++# always run fresh subfinder.
++_RECON_CACHE_HOURS = float(os.environ.get("RECON_CACHE_HOURS", "12"))
++
++
++async def _get_recon_cache_if_fresh(pool: asyncpg.Pool, target_id: int) -> list[str] | None:
++    """
++    Returns the cached subdomain list for this target if one exists and
++    is younger than _RECON_CACHE_HOURS, else None (meaning: run subfinder
++    for real). A disabled cache (_RECON_CACHE_HOURS <= 0) always returns
++    None so recon behaves exactly as it did before this feature.
++    """
++    if _RECON_CACHE_HOURS <= 0:
++        return None
++    async with pool.acquire() as conn:
++        row = await conn.fetchrow(
++            "SELECT recon_cache FROM scope_targets "
++            "WHERE id = $1 AND recon_cached_at > now() - ($2 || ' hours')::interval",
++            target_id, str(_RECON_CACHE_HOURS),
++        )
++    if row is None or not row["recon_cache"]:
++        return None
++    try:
++        return json.loads(row["recon_cache"])
++    except (ValueError, TypeError):
++        return None  # corrupt cache row - fail open to a fresh subfinder run, not a crash
++
++
++async def _save_recon_cache_pooled(pool: asyncpg.Pool, target_id: int, subdomains: list[str]) -> None:
++    async with pool.acquire() as conn:
++        await conn.execute(
++            "UPDATE scope_targets SET recon_cache = $1, recon_cached_at = now() WHERE id = $2",
++            json.dumps(subdomains), target_id,
++        )
++
++
+ async def _save_detective_finding_pooled(
+     pool: asyncpg.Pool, project_id: int, target_id: int, result: dict
+ ) -> None:
+diff --git a/backend/app/tools.py b/backend/app/tools.py
+index 757759b..561a1b8 100644
+--- a/backend/app/tools.py
++++ b/backend/app/tools.py
+@@ -277,6 +277,23 @@ async def run_ffuf(url: str, wordlist_path: str) -> ToolResult:
+ # whose brief explicitly wants these can still opt back in.
+ _DEFAULT_NUCLEI_EXCLUDE_TAGS = "ssl,tls"
+ 
++# Confirmed by pulling real scan data: the overwhelming majority of
++# nuclei output that's pure noise (DNS record fingerprinting, tech-
++# detect, robots.txt/options-method discovery templates, etc.) is
++# nuclei's own severity: "info" tier - and essentially none of it is
++# ever reportable. Rather than maintain a growing, easy-to-miss list of
++# individual noisy tags (dns, tech, headers, misc, ...), this filters by
++# severity directly at the nuclei level via -severity, so nuclei simply
++# never runs (or at least never reports) an info-tier template match in
++# the first place - same "save the cost, not just the noise" reasoning
++# as the tag exclusion above, and it automatically covers any new
++# info-tier template ProjectDiscovery adds later without this file
++# needing an update. "unknown" stays included since that's nuclei's
++# severity for templates that legitimately don't declare one, not a
++# noise signal. Set NUCLEI_MIN_SEVERITY="" to disable and see everything
++# again (e.g. while debugging why a specific template isn't firing).
++_DEFAULT_NUCLEI_MIN_SEVERITY = "low,medium,high,critical,unknown"
++
+ 
+ async def run_nuclei(target: str) -> ToolResult:
+     """
+@@ -289,9 +306,12 @@ async def run_nuclei(target: str) -> ToolResult:
+     against scanme.nmap.org.
+ 
+     -etags excludes noisy, low-value template categories by default (see
+-    _DEFAULT_NUCLEI_EXCLUDE_TAGS above). Set NUCLEI_EXCLUDE_TAGS="" in
+-    .env to disable and scan everything, or override with a different
+-    comma-separated tag list for a specific program's needs.
++    _DEFAULT_NUCLEI_EXCLUDE_TAGS above). -severity additionally drops
++    the whole info tier (see _DEFAULT_NUCLEI_MIN_SEVERITY above) - the
++    two are complementary, not redundant: -etags catches specific
++    categories we never want regardless of severity (SSL/TLS), -severity
++    catches the broad "this is recon, not a finding" tier regardless of
++    category. Both configurable via env, same override pattern.
+     """
+     args = ["nuclei", "-u", target, "-silent", "-no-color"]
+     if header := _research_header():
+@@ -301,6 +321,10 @@ async def run_nuclei(target: str) -> ToolResult:
+     if exclude_tags.strip():
+         args += ["-etags", exclude_tags.strip()]
+ 
++    min_severity = os.environ.get("NUCLEI_MIN_SEVERITY", _DEFAULT_NUCLEI_MIN_SEVERITY)
++    if min_severity.strip():
++        args += ["-severity", min_severity.strip()]
++
+     return await run_tool("nuclei", args, timeout_seconds=300)
+ 
+ 
+diff --git a/backend/db/init.sql b/backend/db/init.sql
+index b47f33e..b64329d 100644
+--- a/backend/db/init.sql
++++ b/backend/db/init.sql
+@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS scope_targets (
+     reward_range    TEXT,
+     notes           TEXT,
+     last_scanned_at TIMESTAMPTZ,
++    recon_cache     JSONB,
++    recon_cached_at TIMESTAMPTZ,
+     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+ );
+ 
+diff --git a/backend/db/migrations/007_recon_cache.sql b/backend/db/migrations/007_recon_cache.sql
+new file mode 100644
+index 0000000..46ddf31
+--- /dev/null
++++ b/backend/db/migrations/007_recon_cache.sql
+@@ -0,0 +1,8 @@
++-- 007_recon_cache.sql
++-- Adds the recon-result cache columns pipeline.py's _phase_recon now
++-- reads/writes (see RECON_CACHE_HOURS) - lets a repeat scan on the same
++-- target reuse a recent subfinder result instead of re-querying every
++-- OSINT source again. Idempotent, same pattern as prior migrations.
++
++ALTER TABLE scope_targets ADD COLUMN IF NOT EXISTS recon_cache JSONB;
++ALTER TABLE scope_targets ADD COLUMN IF NOT EXISTS recon_cached_at TIMESTAMPTZ;
+diff --git a/frontend/src/pages/ProjectList.jsx b/frontend/src/pages/ProjectList.jsx
+index 09bb6fb..4cd65b2 100644
+--- a/frontend/src/pages/ProjectList.jsx
++++ b/frontend/src/pages/ProjectList.jsx
+@@ -18,6 +18,12 @@ export function ProjectList() {
+   // workflow below changes or is at risk of regressing.
+   const [view, setView] = useState("list");
+   const [findings, setFindings] = useState([]);
++  // Archived projects sit in the same table as everything else and
++  // were getting mixed into one flat list with no way to see just them
++  // (or to keep them out of the way while working) - default to hiding
++  // them, with an explicit tab to go look, same as most task trackers
++  // handle a "done"/"archived" bucket.
++  const [statusFilter, setStatusFilter] = useState("active");
+ 
+   function load() {
+     return api
+@@ -59,8 +65,17 @@ export function ProjectList() {
+     });
+   }
+ 
++  const filteredProjects = useMemo(() => {
++    if (!projects) return [];
++    if (statusFilter === "all") return projects;
++    if (statusFilter === "archived") return projects.filter((p) => p.status === "archived");
++    return projects.filter((p) => p.status !== "archived"); // "active"
++  }, [projects, statusFilter]);
++
+   function toggleAll() {
+-    setSelected((prev) => (prev.size === projects.length ? new Set() : new Set(projects.map((p) => p.id))));
++    setSelected((prev) =>
++      prev.size === filteredProjects.length ? new Set() : new Set(filteredProjects.map((p) => p.id))
++    );
+   }
+ 
+   async function handleBulkAction(action) {
+@@ -136,14 +151,32 @@ export function ProjectList() {
+             <AttackSurfaceGraph projects={projects} findings={findings} />
+           ) : (
+             <>
++              <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: "var(--radius)", overflow: "hidden", width: "fit-content", marginBottom: 12 }}>
++                <button onClick={() => setStatusFilter("active")} style={toggleButtonStyle(statusFilter === "active")}>
++                  Active
++                </button>
++                <button onClick={() => setStatusFilter("archived")} style={toggleButtonStyle(statusFilter === "archived")}>
++                  Archived ({statusCounts.archived})
++                </button>
++                <button onClick={() => setStatusFilter("all")} style={toggleButtonStyle(statusFilter === "all")}>
++                  All
++                </button>
++              </div>
++
++              {filteredProjects.length === 0 ? (
++                <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
++                  {statusFilter === "archived" ? "No archived projects." : "Nothing here."}
++                </div>
++              ) : (
++                <>
+               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+                 <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+                   <input
+                     type="checkbox"
+-                    checked={selected.size === projects.length}
++                    checked={selected.size === filteredProjects.length}
+                     onChange={toggleAll}
+                     ref={(el) => {
+-                      if (el) el.indeterminate = selected.size > 0 && selected.size < projects.length;
++                      if (el) el.indeterminate = selected.size > 0 && selected.size < filteredProjects.length;
+                     }}
+                   />
+                   Select all
+@@ -152,9 +185,15 @@ export function ProjectList() {
+                 {selected.size > 0 && (
+                   <>
+                     <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{selected.size} selected</span>
+-                    <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
+-                      {bulkRunning ? "…" : "Archive selected"}
+-                    </button>
++                    {statusFilter === "archived" ? (
++                      <button onClick={() => handleBulkAction("unarchive")} disabled={bulkRunning} style={secondaryButtonStyle}>
++                        {bulkRunning ? "…" : "Unarchive selected"}
++                      </button>
++                    ) : (
++                      <button onClick={() => handleBulkAction("archive")} disabled={bulkRunning} style={secondaryButtonStyle}>
++                        {bulkRunning ? "…" : "Archive selected"}
++                      </button>
++                    )}
+                     <button
+                       onClick={() => handleBulkAction("delete")}
+                       disabled={bulkRunning}
+@@ -170,6 +209,8 @@ export function ProjectList() {
+                 <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
+                   {bulkResult.action === "archive" ? (
+                     <span style={{ color: "var(--status-success)" }}>Archived {bulkResult.succeeded.length}.</span>
++                  ) : bulkResult.action === "unarchive" ? (
++                    <span style={{ color: "var(--status-success)" }}>Unarchived {bulkResult.succeeded.length}.</span>
+                   ) : (
+                     <span style={{ color: "var(--status-success)" }}>Deleted {bulkResult.succeeded.length}.</span>
+                   )}
+@@ -183,7 +224,7 @@ export function ProjectList() {
+               )}
+ 
+               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+-                {projects.map((p) => (
++                {filteredProjects.map((p) => (
+                   <div
+                     key={p.id}
+                     style={{
+@@ -230,6 +271,8 @@ export function ProjectList() {
+                   </div>
+                 ))}
+               </div>
++                </>
++              )}
+             </>
+           )}
+         </>

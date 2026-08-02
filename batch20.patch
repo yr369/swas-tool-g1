@@ -1,0 +1,706 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 1748834..eb7a27b 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -518,6 +518,24 @@ async def _queue_worker_loop() -> None:
+         await asyncio.sleep(10)
+ 
+ 
++async def _ai_retry_queue_worker_loop() -> None:
++    """Runs for the lifetime of the app, checking ai_retry_queue every
++    5 minutes. Slower than the 10s scan queue worker on purpose - retry
++    items already carry their own exponential backoff (2min-4h, see
++    retry_queue._BACKOFF_SCHEDULE_MINUTES), so there is rarely anything
++    due; a tight poll loop would just be near-constant no-op DB round
++    trips."""
++    logger.info("AI retry queue worker started (checks every 5m)")
++    while True:
++        try:
++            processed = await triage.retry_pending_ai_failures(database.get_pool())
++            if processed:
++                logger.info("AI retry queue: processed %d due item(s)", processed)
++        except Exception:
++            logger.exception("AI retry queue worker iteration failed - will retry in 5m")
++        await asyncio.sleep(300)
++
++
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+     # Runs once when the app starts up. Config sanity check comes FIRST,
+@@ -601,6 +619,7 @@ async def lifespan(app: FastAPI):
+     queue_worker_task = asyncio.create_task(_queue_worker_loop())
+     digest_task = asyncio.create_task(_digest_loop())
+     stale_flag_task = asyncio.create_task(_stale_flag_loop())
++    ai_retry_task = asyncio.create_task(_ai_retry_queue_worker_loop())
+ 
+     yield
+     # Runs once when the app shuts down (e.g. container stopping)
+@@ -608,6 +627,7 @@ async def lifespan(app: FastAPI):
+     queue_worker_task.cancel()
+     digest_task.cancel()
+     stale_flag_task.cancel()
++    ai_retry_task.cancel()
+     await database.disconnect_db()
+ 
+ 
+diff --git a/backend/app/retry_queue.py b/backend/app/retry_queue.py
+new file mode 100644
+index 0000000..8a8b50d
+--- /dev/null
++++ b/backend/app/retry_queue.py
+@@ -0,0 +1,129 @@
++"""
++retry_queue.py - generic retry queue for AI calls that failed even after
++generate_with_rotation exhausted every Gemini model AND every tier-2
++provider.
++
++Why this exists: before this, a totally-failed AI call (see
++triage.triage_finding's except block) just stayed failed. For triage
++specifically that's not quite "lost forever" - the finding keeps
++severity='unknown' and gets re-selected by triage_project_findings the
++NEXT time the triage phase runs for that project, which could be the
++next full rescan, hours or days later. This queue closes that gap: a
++background worker (see main.py's ai retry loop, and
++triage.retry_pending_ai_failures) retries queued items every few minutes
++instead of waiting for the next scan.
++
++Kept intentionally generic (kind + JSONB payload) rather than
++triage-specific, since the same "AI call failed after exhausting
++rotation" pattern applies to gate.py, logic_hunter.py, report_writer.py,
++scope_parser.py, and target_intelligence.py too - each just needs its
++own `kind` string and a worker branch that knows how to redo ITS
++specific call. Only "finding_triage" has a worker branch wired up in
++this batch (see triage.retry_pending_ai_failures).
++"""
++import json
++import logging
++from datetime import datetime, timedelta, timezone
++
++import asyncpg
++
++logger = logging.getLogger("swas.retry_queue")
++
++DEFAULT_MAX_ATTEMPTS = 5
++
++# Exponential-ish backoff, capped at 4h - a permanently-exhausted daily
++# quota shouldn't get hammered every few minutes for hours, but a
++# transient blip shouldn't wait 4 hours for its very first retry either.
++# Index = attempts-so-far (post-increment), so the FIRST retry after one
++# failure waits 2 minutes, the fifth waits 4 hours.
++_BACKOFF_SCHEDULE_MINUTES = [2, 5, 15, 60, 240]
++
++
++def _backoff_for(attempts: int) -> timedelta:
++    idx = min(attempts, len(_BACKOFF_SCHEDULE_MINUTES) - 1)
++    return timedelta(minutes=_BACKOFF_SCHEDULE_MINUTES[idx])
++
++
++async def enqueue(
++    conn: asyncpg.Connection, kind: str, payload: dict, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
++) -> int:
++    """Adds an item to the retry queue. Returns the new row's id."""
++    row = await conn.fetchrow(
++        """
++        INSERT INTO ai_retry_queue (kind, payload, max_attempts)
++        VALUES ($1, $2::jsonb, $3)
++        RETURNING id
++        """,
++        kind, json.dumps(payload), max_attempts,
++    )
++    logger.info("Enqueued retry item id=%s kind=%s payload=%s", row["id"], kind, payload)
++    return row["id"]
++
++
++async def fetch_due(conn: asyncpg.Connection, kind: str, limit: int = 20) -> list[asyncpg.Record]:
++    """Returns up to `limit` pending items of `kind` whose next_attempt_at
++    has already passed, oldest first, so a backlog drains in the order
++    it built up rather than newest-first."""
++    return await conn.fetch(
++        """
++        SELECT id, kind, payload, attempts, max_attempts
++        FROM ai_retry_queue
++        WHERE kind = $1 AND status = 'pending' AND next_attempt_at <= now()
++        ORDER BY created_at ASC
++        LIMIT $2
++        """,
++        kind, limit,
++    )
++
++
++async def mark_succeeded(conn: asyncpg.Connection, item_id: int) -> None:
++    await conn.execute(
++        "UPDATE ai_retry_queue SET status = 'succeeded', updated_at = now() WHERE id = $1",
++        item_id,
++    )
++
++
++async def mark_attempt_failed(conn: asyncpg.Connection, item_id: int, error: str, error_type: str) -> None:
++    """
++    Records a failed retry attempt. If max_attempts has now been
++    reached, marks the item permanently 'failed' - this queue stops
++    trying at that point rather than retrying forever; a permanently
++    failed finding_triage item just means that finding keeps
++    severity='unknown' until the project's next full triage phase runs,
++    same as before this feature existed. Otherwise schedules the next
++    attempt with backoff and leaves the item 'pending'.
++    """
++    row = await conn.fetchrow(
++        "SELECT attempts, max_attempts FROM ai_retry_queue WHERE id = $1", item_id
++    )
++    if row is None:
++        logger.warning("mark_attempt_failed called for missing retry item id=%s", item_id)
++        return
++
++    new_attempts = row["attempts"] + 1
++    if new_attempts >= row["max_attempts"]:
++        await conn.execute(
++            """
++            UPDATE ai_retry_queue
++            SET status = 'failed', attempts = $2, last_error = $3, error_type = $4, updated_at = now()
++            WHERE id = $1
++            """,
++            item_id, new_attempts, error[:2000], error_type,
++        )
++        logger.warning(
++            "Retry item id=%s permanently failed after %d attempts (%s)", item_id, new_attempts, error_type,
++        )
++    else:
++        next_attempt_at = datetime.now(timezone.utc) + _backoff_for(new_attempts)
++        await conn.execute(
++            """
++            UPDATE ai_retry_queue
++            SET attempts = $2, last_error = $3, error_type = $4, next_attempt_at = $5, updated_at = now()
++            WHERE id = $1
++            """,
++            item_id, new_attempts, error[:2000], error_type, next_attempt_at,
++        )
++        logger.info(
++            "Retry item id=%s attempt %d/%d failed, retrying at %s (%s)",
++            item_id, new_attempts, row["max_attempts"], next_attempt_at.isoformat(), error_type,
++        )
+diff --git a/backend/app/test_retry_queue_manual.py b/backend/app/test_retry_queue_manual.py
+new file mode 100644
+index 0000000..f2cceca
+--- /dev/null
++++ b/backend/app/test_retry_queue_manual.py
+@@ -0,0 +1,190 @@
++"""
++Manual end-to-end verification for retry_queue.py + the
++triage.py wiring (triage_project_findings enqueueing on total AI
++failure, retry_pending_ai_failures draining the queue) - against a REAL
++local Postgres, real asyncpg, not mocked, per project testing standard.
++
++The ONLY thing swapped out is the actual outbound Gemini network call
++(triage.generate_with_rotation) - swapped for a plain async function we
++control, same pattern already used and validated in
++test_gemini_rotation_circuit_breaker_manual.py. Everything else (DB
++writes, retry_queue's SQL, the real generate_with_rotation call site,
++triage_finding's real parsing/exception-handling logic) is exercised for
++real.
++
++Setup:
++    export PGPASSWORD=testpass GEMINI_API_KEY=test-key-not-used
++    psql -h localhost -U swas_test -d swas_test_db -f backend/db/init.sql
++    (+ all prior migrations/backend/app/*.sql, in order - see batch 19's
++    test file docstring for the full replay list)
++    psql -h localhost -U swas_test -d swas_test_db -f backend/db/migrations/011_ai_retry_queue.sql
++
++Run:
++    cd backend && python3 -m app.test_retry_queue_manual
++"""
++import asyncio
++import os
++import sys
++
++import asyncpg
++
++os.environ.setdefault("GEMINI_API_KEY", "test-key-not-used")
++
++from . import retry_queue, triage  # noqa: E402 (env var must be set first)
++
++DB_DSN = os.environ.get(
++    "TEST_DB_DSN", "postgresql://swas_test:testpass@localhost/swas_test_db"
++)
++
++
++async def _cleanup(conn, project_id):
++    await conn.execute("DELETE FROM projects WHERE id = $1", project_id)  # cascades to findings/scope_targets
++    await conn.execute("DELETE FROM ai_retry_queue")
++
++
++async def _fake_generate_always_fails(client, prompt, preferred_model=None):
++    raise RuntimeError("all Gemini models exhausted (simulated for test)")
++
++
++async def _fake_generate_succeeds(client, prompt, preferred_model=None):
++    class _FakeResponse:
++        text = (
++            '{"severity": "medium", "confidence": 0.9, '
++            '"reasoning": "retried successfully", "likely_program_outcome": "accepted"}'
++        )
++    return _FakeResponse(), "gemini-2.5-flash"
++
++
++async def _run():
++    pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=3)
++    original_generate = triage.generate_with_rotation
++    try:
++        # --- Part 1: retry_queue primitives against real Postgres ---
++        async with pool.acquire() as conn:
++            item_id = await retry_queue.enqueue(
++                conn, "finding_triage", {"finding_id": 999999, "project_id": 1}, max_attempts=2,
++            )
++            due = await retry_queue.fetch_due(conn, "finding_triage")
++            assert any(r["id"] == item_id for r in due), "just-enqueued item should be immediately due"
++            print(f"PASS: enqueue + fetch_due found item id={item_id}")
++
++            await retry_queue.mark_attempt_failed(conn, item_id, "boom", "ai_provider_error")
++            row = await conn.fetchrow("SELECT status, attempts, next_attempt_at FROM ai_retry_queue WHERE id = $1", item_id)
++            assert row["status"] == "pending", row
++            assert row["attempts"] == 1, row
++            now_row = await conn.fetchrow("SELECT now() AS now")
++            assert row["next_attempt_at"] > now_row["now"], (row["next_attempt_at"], now_row["now"])
++            due_now = await retry_queue.fetch_due(conn, "finding_triage")
++            assert not any(r["id"] == item_id for r in due_now), "item with future next_attempt_at should not be due yet"
++            print("PASS: first failed attempt backs off and is no longer immediately due")
++
++            await retry_queue.mark_attempt_failed(conn, item_id, "boom again", "ai_provider_error")
++            row = await conn.fetchrow("SELECT status, attempts FROM ai_retry_queue WHERE id = $1", item_id)
++            assert row["status"] == "failed", row  # max_attempts=2 reached
++            assert row["attempts"] == 2, row
++            print("PASS: reaching max_attempts marks the item permanently 'failed'")
++
++            await conn.execute("DELETE FROM ai_retry_queue WHERE id = $1", item_id)
++
++        # --- Part 2: end-to-end through triage.py with a real finding ---
++        async with pool.acquire() as conn:
++            project_id = await conn.fetchval(
++                "INSERT INTO projects (name, platform) VALUES ($1, $2) RETURNING id",
++                "retry-queue-test-project", "hackerone",
++            )
++            target_id = await conn.fetchval(
++                "INSERT INTO scope_targets (project_id, target) VALUES ($1, $2) RETURNING id",
++                project_id, "retry-test.example.com",
++            )
++            finding_id = await conn.fetchval(
++                """
++                INSERT INTO findings (project_id, target_id, tool_name, vuln_type, evidence)
++                VALUES ($1, $2, $3, $4, $5) RETURNING id
++                """,
++                project_id, target_id, "nuclei", "xss-reflected", "some evidence blob",
++            )
++
++        try:
++            # Simulate total AI failure during the normal triage phase.
++            triage.generate_with_rotation = _fake_generate_always_fails
++            async with pool.acquire() as conn:
++                triaged_count = await triage.triage_project_findings(conn, project_id)
++            assert triaged_count == 1, triaged_count
++
++            async with pool.acquire() as conn:
++                finding_row = await conn.fetchrow("SELECT severity FROM findings WHERE id = $1", finding_id)
++                assert finding_row["severity"] == "unknown", finding_row
++                queue_row = await conn.fetchrow(
++                    "SELECT id, status, payload FROM ai_retry_queue WHERE kind = 'finding_triage' AND status = 'pending'"
++                )
++                assert queue_row is not None, "expected a pending finding_triage retry item"
++                import json as _json
++                payload = queue_row["payload"] if isinstance(queue_row["payload"], dict) else _json.loads(queue_row["payload"])
++                assert payload["finding_id"] == finding_id, payload
++            print(f"PASS: total AI failure during triage_project_findings enqueued a retry item for finding {finding_id}")
++
++            # Force it due right now instead of waiting for backoff, so the
++            # test doesn't need to sleep for real minutes.
++            async with pool.acquire() as conn:
++                await conn.execute(
++                    "UPDATE ai_retry_queue SET next_attempt_at = now() WHERE id = $1", queue_row["id"],
++                )
++
++            # Now simulate the AI recovering, and run the worker function
++            # main.py's background loop calls periodically.
++            triage.generate_with_rotation = _fake_generate_succeeds
++            processed = await triage.retry_pending_ai_failures(pool)
++            assert processed == 1, processed
++
++            async with pool.acquire() as conn:
++                finding_row = await conn.fetchrow(
++                    "SELECT severity, triage_reasoning FROM findings WHERE id = $1", finding_id,
++                )
++                assert finding_row["severity"] == "medium", finding_row
++                queue_row2 = await conn.fetchrow("SELECT status FROM ai_retry_queue WHERE id = $1", queue_row["id"])
++                assert queue_row2["status"] == "succeeded", queue_row2
++            print(
++                f"PASS: retry_pending_ai_failures resolved the queued finding "
++                f"(severity now {finding_row['severity']!r}), marked queue item succeeded"
++            )
++
++            # --- Part 3: an already-resolved finding gets skipped as a no-op ---
++            async with pool.acquire() as conn:
++                other_finding_id = await conn.fetchval(
++                    """
++                    INSERT INTO findings (project_id, target_id, tool_name, vuln_type, evidence, severity)
++                    VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
++                    """,
++                    project_id, target_id, "nuclei", "info-disclosure", "evidence", "unknown",
++                )
++                new_item_id = await retry_queue.enqueue(
++                    conn, "finding_triage", {"finding_id": other_finding_id, "project_id": project_id},
++                )
++                # Someone/something else resolves it before the retry runs.
++                await conn.execute(
++                    "UPDATE findings SET severity = 'low' WHERE id = $1", other_finding_id,
++                )
++
++            processed2 = await triage.retry_pending_ai_failures(pool)
++            assert processed2 == 1, processed2
++            async with pool.acquire() as conn:
++                item_row = await conn.fetchrow("SELECT status FROM ai_retry_queue WHERE id = $1", new_item_id)
++                assert item_row["status"] == "succeeded", item_row
++            print("PASS: a finding resolved by other means before retry runs is skipped as a no-op, not clobbered")
++
++        finally:
++            async with pool.acquire() as conn:
++                await _cleanup(conn, project_id)
++
++    finally:
++        triage.generate_with_rotation = original_generate
++        await pool.close()
++
++
++if __name__ == "__main__":
++    try:
++        asyncio.run(_run())
++    except AssertionError as e:
++        print(f"FAIL: {e}")
++        sys.exit(1)
++    print("\nAll manual retry-queue tests passed")
+diff --git a/backend/app/triage.py b/backend/app/triage.py
+index c95aa45..ace4d63 100644
+--- a/backend/app/triage.py
++++ b/backend/app/triage.py
+@@ -18,6 +18,7 @@ import re
+ 
+ from google import genai
+ 
++from . import error_taxonomy
+ from .gemini_rotation import generate_with_rotation
+ 
+ logger = logging.getLogger("swas.triage")
+@@ -233,7 +234,15 @@ async def triage_finding(
+         result["model_used"] = model_used
+     except Exception as exc:
+         logger.exception("Triage failed on every model in the rotation")
+-        return {"severity": "unknown", "confidence": 0.0, "reasoning": f"Triage failed: {exc}", "model_used": "none"}
++        return {
++            "severity": "unknown", "confidence": 0.0,
++            "reasoning": f"Triage failed: {exc}", "model_used": "none",
++            # Distinguishes "the AI call itself failed" from a model
++            # genuinely, successfully returning severity=unknown/low
++            # confidence - only the former should get queued for retry.
++            "ai_call_failed": True,
++            "error_type": error_taxonomy.classify_error(exc),
++        }
+ 
+     if result.get("confidence", 1.0) < 0.6:
+         logger.info("Low confidence (%.2f) on %s, escalating", result.get("confidence", 0), result["model_used"])
+@@ -347,6 +356,95 @@ async def fetch_signature_stats(conn, signature: str) -> dict | None:
+     return dict(row) if row and row["total"] else None
+ 
+ 
++async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: list[dict]) -> dict:
++    """
++    Runs triage_finding for ONE finding row, applies the adversarial
++    skeptic pass if it qualifies, writes the result to `findings`, and
++    feeds the outcome back into target_intelligence. Returns the raw
++    triage result dict (including "ai_call_failed"/"error_type" if the
++    AI call itself failed on every model/provider) so callers can decide
++    whether to enqueue a retry.
++
++    Factored out of triage_project_findings so the retry-queue worker
++    (retry_pending_ai_failures, below) can redo exactly this same work
++    for a single previously-failed finding, instead of drifting out of
++    sync with a second, hand-copied version of this logic.
++    """
++    from . import target_intelligence
++
++    signature = build_signature(row["tool_name"], row["vuln_type"])
++    outcome_stats = await fetch_signature_stats(conn, signature)
++    clean_evidence, self_declared_severity = _extract_self_declared_severity(row["evidence"] or "")
++
++    result = await triage_finding(
++        row["tool_name"], clean_evidence,
++        outcome_stats=outcome_stats, vrt_entries=vrt_entries,
++        self_declared_severity=self_declared_severity,
++    )
++
++    # Adversarial skeptic pass (#7): only for findings about to sail
++    # through as solid, since that's where a rubber-stamp mistake
++    # costs the most. A strong counter-argument lowers confidence
++    # and gets appended to the reasoning shown to you - it does NOT
++    # change the severity/outcome verdict itself, since this pass
++    # argues against a finding on purpose and shouldn't get the
++    # final word on its own.
++    if qualifies_for_adversarial_review(result.get("severity", ""), result.get("confidence", 0.0)):
++        review = await adversarial_review(
++            row["tool_name"], clean_evidence, result["severity"], result.get("reasoning", ""),
++        )
++        if review.get("counter_argument_is_strong"):
++            result["confidence"] = min(result.get("confidence", 1.0), review.get("revised_confidence", 1.0))
++            result["reasoning"] = (
++                f"{result.get('reasoning', '')} [Skeptic review: {review['counter_argument']}]"
++            )
++
++    outcome = result.get("likely_program_outcome")
++    await conn.execute(
++        """
++        UPDATE findings
++        SET severity = $1,
++            likely_program_outcome = $2,
++            triage_reasoning = $3,
++            triage_confidence = $4
++        WHERE id = $5
++        """,
++        result["severity"] if result["severity"] in
++        ("critical", "high", "medium", "low", "info") else "unknown",
++        outcome if outcome in ("accepted", "informative", "out_of_scope", "duplicate") else None,
++        result.get("reasoning"),
++        result.get("confidence"),
++        row["id"],
++    )
++
++    # Close the loop: what triage decided about this signature on
++    # THIS target feeds back into target_intelligence so later
++    # logic_hunter reasoning and (once #3 in the roadmap builds on
++    # this) scan-technique selection can see it. Fails soft - a
++    # broken write here costs an optimization, never the triage
++    # result itself, which is already committed above.
++    if row["target_id"]:
++        await target_intelligence.record_technique_outcome(
++            conn, row["target_id"], signature, outcome or "unknown",
++            note=result.get("reasoning"),
++        )
++        if result.get("severity") in ("critical", "high", "medium") and outcome == "accepted":
++            surface_summary = await conn.fetchrow(
++                "SELECT tech_stack_union FROM attack_surface_summary WHERE target_id = $1",
++                row["target_id"],
++            )
++            tech_signature = target_intelligence.normalize_tech_signature(
++                surface_summary["tech_stack_union"] if surface_summary else None
++            )
++            if tech_signature:
++                await target_intelligence.record_cross_target_pattern(
++                    conn, project_id, row["vuln_type"], tech_signature, row["target_id"],
++                    note=f"triaged {result.get('severity')}, accepted: {(result.get('reasoning') or '')[:200]}",
++                )
++
++    return result
++
++
+ async def triage_project_findings(conn, project_id: int) -> int:
+     """
+     Triages every 'unknown'-severity finding in a project, one at a
+@@ -357,8 +455,14 @@ async def triage_project_findings(conn, project_id: int) -> int:
+     detective.py findings get the same independent AI review tool
+     findings always got, without you needing to remember to click
+     anything. Returns the number of findings triaged.
++
++    A finding whose AI call fails on every model AND every tier-2
++    provider gets queued in ai_retry_queue (kind="finding_triage")
++    instead of just sitting at severity='unknown' until the next full
++    scan happens to re-triage it - see retry_pending_ai_failures, which
++    a background loop in main.py runs every few minutes.
+     """
+-    from . import target_intelligence, vrt as vrt_module
++    from . import retry_queue, vrt as vrt_module
+ 
+     rows = await conn.fetch(
+         """
+@@ -371,80 +475,86 @@ async def triage_project_findings(conn, project_id: int) -> int:
+     vrt_entries = await vrt_module.get_vrt_entries()  # fetched once, reused for every finding in this batch
+     triaged = 0
+     for row in rows:
+-        signature = build_signature(row["tool_name"], row["vuln_type"])
+-        outcome_stats = await fetch_signature_stats(conn, signature)
+-        clean_evidence, self_declared_severity = _extract_self_declared_severity(row["evidence"] or "")
+-
+-        result = await triage_finding(
+-            row["tool_name"], clean_evidence,
+-            outcome_stats=outcome_stats, vrt_entries=vrt_entries,
+-            self_declared_severity=self_declared_severity,
+-        )
++        result = await _triage_and_store_finding(conn, project_id, row, vrt_entries)
+ 
+-        # Adversarial skeptic pass (#7): only for findings about to sail
+-        # through as solid, since that's where a rubber-stamp mistake
+-        # costs the most. A strong counter-argument lowers confidence
+-        # and gets appended to the reasoning shown to you - it does NOT
+-        # change the severity/outcome verdict itself, since this pass
+-        # argues against a finding on purpose and shouldn't get the
+-        # final word on its own.
+-        if qualifies_for_adversarial_review(result.get("severity", ""), result.get("confidence", 0.0)):
+-            review = await adversarial_review(
+-                row["tool_name"], clean_evidence, result["severity"], result.get("reasoning", ""),
++        if result.get("ai_call_failed"):
++            await retry_queue.enqueue(
++                conn, "finding_triage",
++                {"finding_id": row["id"], "project_id": project_id},
+             )
+-            if review.get("counter_argument_is_strong"):
+-                result["confidence"] = min(result.get("confidence", 1.0), review.get("revised_confidence", 1.0))
+-                result["reasoning"] = (
+-                    f"{result.get('reasoning', '')} [Skeptic review: {review['counter_argument']}]"
+-                )
+-
+-        outcome = result.get("likely_program_outcome")
+-        await conn.execute(
+-            """
+-            UPDATE findings
+-            SET severity = $1,
+-                likely_program_outcome = $2,
+-                triage_reasoning = $3,
+-                triage_confidence = $4
+-            WHERE id = $5
+-            """,
+-            result["severity"] if result["severity"] in
+-            ("critical", "high", "medium", "low", "info") else "unknown",
+-            outcome if outcome in ("accepted", "informative", "out_of_scope", "duplicate") else None,
+-            result.get("reasoning"),
+-            result.get("confidence"),
+-            row["id"],
+-        )
+ 
+-        # Close the loop: what triage decided about this signature on
+-        # THIS target feeds back into target_intelligence so later
+-        # logic_hunter reasoning and (once #3 in the roadmap builds on
+-        # this) scan-technique selection can see it. Fails soft - a
+-        # broken write here costs an optimization, never the triage
+-        # result itself, which is already committed above.
+-        if row["target_id"]:
+-            await target_intelligence.record_technique_outcome(
+-                conn, row["target_id"], signature, outcome or "unknown",
+-                note=result.get("reasoning"),
+-            )
+-            if result.get("severity") in ("critical", "high", "medium") and outcome == "accepted":
+-                surface_summary = await conn.fetchrow(
+-                    "SELECT tech_stack_union FROM attack_surface_summary WHERE target_id = $1",
+-                    row["target_id"],
+-                )
+-                tech_signature = target_intelligence.normalize_tech_signature(
+-                    surface_summary["tech_stack_union"] if surface_summary else None
+-                )
+-                if tech_signature:
+-                    await target_intelligence.record_cross_target_pattern(
+-                        conn, project_id, row["vuln_type"], tech_signature, row["target_id"],
+-                        note=f"triaged {result.get('severity')}, accepted: {(result.get('reasoning') or '')[:200]}",
+-                    )
+         triaged += 1
+ 
+     return triaged
+ 
+ 
++async def retry_pending_ai_failures(pool) -> int:
++    """
++    Called periodically by main.py's background loop. Pulls due
++    "finding_triage" items from ai_retry_queue and redoes the triage
++    call for each - this is what makes a totally-exhausted AI call (all
++    Gemini models AND all tier-2 providers down/quota'd) get retried in
++    minutes instead of waiting for that project's NEXT full scan to
++    happen to re-triage it.
++
++    Skips (marks succeeded, no-op) a queued finding that's no longer
++    severity='unknown' by the time this runs - something else already
++    resolved it (a manual override, a rescan, etc.) and retrying would
++    just clobber that. Returns the number of items processed.
++    """
++    from . import error_taxonomy, retry_queue, vrt as vrt_module
++
++    processed = 0
++    async with pool.acquire() as conn:
++        items = await retry_queue.fetch_due(conn, "finding_triage")
++        if not items:
++            return 0
++
++        vrt_entries = await vrt_module.get_vrt_entries()
++
++        for item in items:
++            payload = item["payload"]
++            if isinstance(payload, str):
++                import json
++                payload = json.loads(payload)
++            finding_id = payload["finding_id"]
++            project_id = payload["project_id"]
++
++            row = await conn.fetchrow(
++                "SELECT id, target_id, tool_name, vuln_type, evidence, severity FROM findings WHERE id = $1",
++                finding_id,
++            )
++            if row is None:
++                # Finding was deleted (project removed, scope pruned) -
++                # nothing left to retry.
++                await retry_queue.mark_succeeded(conn, item["id"])
++                processed += 1
++                continue
++            if row["severity"] != "unknown":
++                # Already resolved some other way since this was queued.
++                await retry_queue.mark_succeeded(conn, item["id"])
++                processed += 1
++                continue
++
++            try:
++                result = await _triage_and_store_finding(conn, project_id, row, vrt_entries)
++                if result.get("ai_call_failed"):
++                    # triage_finding itself caught the exception and
++                    # returned the "failed" sentinel rather than raising -
++                    # treat that the same as a raised exception for
++                    # retry-scheduling purposes.
++                    raise RuntimeError(result.get("reasoning", "AI call failed again"))
++                await retry_queue.mark_succeeded(conn, item["id"])
++                logger.info("Retry queue: finding %s triaged successfully on retry", finding_id)
++            except Exception as exc:
++                error_type = error_taxonomy.classify_error(exc)
++                await retry_queue.mark_attempt_failed(conn, item["id"], str(exc), error_type)
++
++            processed += 1
++
++    return processed
++
++
+ # ---------------------------------------------------------------------
+ # Cluster-aware triage
+ # ---------------------------------------------------------------------
+diff --git a/backend/db/migrations/011_ai_retry_queue.sql b/backend/db/migrations/011_ai_retry_queue.sql
+new file mode 100644
+index 0000000..e4fb1ee
+--- /dev/null
++++ b/backend/db/migrations/011_ai_retry_queue.sql
+@@ -0,0 +1,30 @@
++-- 011_ai_retry_queue.sql
++-- Generic retry queue for AI calls that failed after generate_with_rotation
++-- exhausted every Gemini model AND every tier-2 provider. Kept generic
++-- (kind + JSONB payload) so future callers beyond triage.triage_finding
++-- can reuse the same table instead of each growing their own bespoke
++-- retry mechanism - see retry_queue.py's module docstring.
++--
++-- Idempotent, same pattern as prior migrations.
++
++CREATE TABLE IF NOT EXISTS ai_retry_queue (
++    id              SERIAL PRIMARY KEY,
++    kind            TEXT NOT NULL,
++    payload         JSONB NOT NULL,
++    status          TEXT NOT NULL DEFAULT 'pending'
++                    CHECK (status IN ('pending', 'succeeded', 'failed')),
++    attempts        INTEGER NOT NULL DEFAULT 0,
++    max_attempts    INTEGER NOT NULL DEFAULT 5,
++    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++    last_error      TEXT,
++    error_type      TEXT,
++    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
++    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++-- Partial index: only 'pending' rows are ever queried by fetch_due(),
++-- and there should never be many of those at once - no reason to index
++-- the (potentially large, over time) 'succeeded'/'failed' history too.
++CREATE INDEX IF NOT EXISTS idx_ai_retry_queue_due
++    ON ai_retry_queue (kind, next_attempt_at)
++    WHERE status = 'pending';

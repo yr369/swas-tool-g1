@@ -1,0 +1,795 @@
+diff --git a/backend/app/agent_loop.py b/backend/app/agent_loop.py
+new file mode 100644
+index 0000000..283fdf5
+--- /dev/null
++++ b/backend/app/agent_loop.py
+@@ -0,0 +1,318 @@
++"""
++agent_loop.py - the agentic investigation loop for logic_hunter hypotheses.
++
++Plain-language: batch 2's "bounded auto-verification" could only ever try
++ONE single unauthenticated GET, and only for the narrow slice of
++hypotheses shaped like "is this exact URL reachable with no auth" - so
++most hypotheses (IDOR, most business-logic claims) instantly gave up and
++stayed a pure, unverified hypothesis, even when a FEW more read-only
++requests could have told a human a lot more: does the claimed field even
++exist in the response? does changing an ID in the URL path change
++anything about the response shape, even unauthenticated? does a
++documented-but-unused parameter change behavior?
++
++This module generalizes that one bolted-on verification step into a real
++multi-step agent: given a hypothesis and the target's known attack
++surface, a strong model can issue up to `_MAX_STEPS` safe, read-only
++probes, look at each result, and decide what to check next - then hands
++back (a) an investigation summary appended to the finding's evidence,
++same spirit as before, and (b) every endpoint it touched, so the caller
++can write those back into the attack-surface model. That's the point
++called out in the handoff notes: the agent should WRITE to the surface
++model as it investigates, not just read from it - the next hypothesis on
++this same target (or the next scan entirely) should benefit from what
++this investigation actually learned, not just whatever detective.py/gate
++happened to observe on their own separate passes.
++
++SAFETY - this is the single most important property of this file, more
++important than investigation depth or cleverness:
++  - The only HTTP methods ever actually issued are GET and HEAD, and
++    that choice is made IN CODE (see `_execute_tool_call` /
++    `_ALLOWED_ACTIONS`), never derived from anything the model returns.
++    A model asking for an action outside {get, head, compare, finish} -
++    including "post", "put", "delete", or anything else - gets a plain
++    tool-result string saying that action doesn't exist. It is not
++    silently upgraded, downgraded, or ignored-but-attempted; no network
++    call happens for it at all. See `test_agent_loop_manual.py` for a
++    reproducible check of this specific property.
++  - No request ever carries a cookie, Authorization header, session
++    token, or any other credential - every probe this loop issues is
++    fully anonymous. That matches the "single-session" limitation
++    called out in the handoff doc; authenticated/multi-account testing
++    is deliberately a separate, later phase (item #3) that needs its
++    own explicit credential-scoping and a per-program policy check
++    before it ever touches real accounts.
++  - A hard step ceiling (`_MAX_STEPS`) is enforced by the Python loop
++    itself, not just mentioned in the prompt - the loop physically
++    cannot issue more than this many model calls or requests no matter
++    what the model asks for or how the response is phrased.
++  - Every probe uses the same short, fixed timeout (`_STEP_TIMEOUT`)
++    used elsewhere in this codebase; a single slow/hanging endpoint
++    can't stall the whole loop.
++"""
++
++import json
++import logging
++import os
++
++import httpx
++from google import genai
++
++from .gemini_rotation import generate_with_rotation
++
++logger = logging.getLogger("swas.agent_loop")
++
++# Same strong model already used for logic_hunter's initial hypothesis
++# reasoning (hunt_cluster) - this is the other half of that same
++# reasoning-heavy, low-volume budget (only runs per saved hypothesis,
++# capped at _MAX_STEPS calls each), so it stays on the strong model
++# rather than the cheap gate-tier one the old single-GET verifier used.
++_MODEL = "gemini-2.5-pro"
++
++_MAX_STEPS = 6
++_STEP_TIMEOUT = 10.0
++_BODY_SAMPLE_CHARS = 800
++_HISTORY_RESULT_CHARS = 500
++
++_ALLOWED_ACTIONS = {"get", "head", "compare", "finish"}
++
++_INTERESTING_HEADERS = (
++    "content-type", "content-length", "location", "set-cookie",
++    "www-authenticate", "server", "cache-control",
++)
++
++_AGENT_STEP_PROMPT = """You are investigating ONE specific security hypothesis about a target \
++through a bounded, read-only agentic loop. You get up to {max_steps} total actions (this is \
++action {step_num} of {max_steps}) before you must conclude either way.
++
++Target: {target_name} ({target_type})
++Attack surface context: {surface_context}
++
++Hypothesis under investigation: {hypothesis}
++
++Available actions - respond with ONLY one JSON object, no markdown fences, no other text:
++  {{"action": "get", "url": "https://full/url", "why": "one short phrase"}}
++  {{"action": "head", "url": "https://full/url", "why": "one short phrase"}}
++  {{"action": "compare", "url_a": "https://...", "url_b": "https://...", "why": "one short phrase"}}
++  {{"action": "finish", "conclusion": "one paragraph: what the probes actually showed and whether \
++they support, weaken, or are inconclusive about the hypothesis - be specific about what was and \
++wasn't confirmed", "confidence": 0.0}}
++
++Rules:
++- Every request is ANONYMOUS - no cookies, no auth headers, no session. This loop can only test \
++what an unauthenticated, single-session attacker could see. If the hypothesis genuinely requires \
++comparing two different authenticated accounts, say so plainly in "finish" rather than treating an \
++anonymous probe as having settled it either way.
++- Only GET/HEAD exist - there is no state-changing action in this loop at all; asking for one just \
++wastes a step, it will not be executed.
++- Prefer 'compare' over two separate 'get's when you specifically want to know whether changing one \
++thing (an ID, a parameter value) changes the response - it's cheaper and the diff is computed for you.
++- Call 'finish' as soon as you have enough signal either way - do not pad out to {max_steps} steps \
++out of habit. Most real investigations conclude in 2-4 steps.
++- confidence in 'finish' means "how confident are you in the CONCLUSION you just wrote" - a confident \
++refutation is just as valid an outcome as a confident confirmation.
++
++Investigation so far:
++{history_block}
++
++What do you do next?
++"""
++
++_FORCE_CONCLUDE_PROMPT = """Your investigation budget is exhausted ({max_steps} actions used). \
++Based on everything below, respond with ONLY this JSON now - no other action is available:
++  {{"conclusion": "one paragraph summarizing what the probes showed and whether they support, \
++weaken, or are inconclusive about the hypothesis", "confidence": 0.0}}
++
++Target: {target_name} ({target_type})
++Hypothesis: {hypothesis}
++
++Investigation so far:
++{history_block}
++"""
++
++
++def _get_client() -> genai.Client:
++    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
++
++
++def _parse_json_response(text: str) -> dict:
++    text = (text or "").strip()
++    if text.startswith("```"):
++        text = text.strip("`")
++        if text.startswith("json"):
++            text = text[4:].strip()
++    return json.loads(text)
++
++
++def _summarize_headers(headers: httpx.Headers) -> str:
++    parts = []
++    for name in _INTERESTING_HEADERS:
++        value = headers.get(name)
++        if value:
++            parts.append(f"{name}={value[:120]}")
++    return "; ".join(parts) if parts else "(no notable headers)"
++
++
++def _record_endpoint(endpoints_seen: list[dict], url: str, status_code: int | None) -> None:
++    endpoints_seen.append({
++        "url": url,
++        "source": "logic_hunter_agent",
++        "is_live": status_code is not None,
++        "status_code": status_code,
++    })
++
++
++async def _do_get(url: str, endpoints_seen: list[dict]) -> str:
++    if not url or not url.startswith(("http://", "https://")):
++        return "Invalid or missing URL - must be a full http(s) URL. No request sent."
++    try:
++        async with httpx.AsyncClient(timeout=_STEP_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url)  # GET hardcoded - never derived from model output
++    except httpx.HTTPError as exc:
++        _record_endpoint(endpoints_seen, url, None)
++        return f"GET {url} failed: {exc}"
++
++    _record_endpoint(endpoints_seen, url, resp.status_code)
++    body_sample = resp.text[:_BODY_SAMPLE_CHARS]
++    return (
++        f"GET {url} -> {resp.status_code}, {len(resp.content)} bytes. "
++        f"Headers: {_summarize_headers(resp.headers)}. Body sample: {body_sample!r}"
++    )
++
++
++async def _do_head(url: str, endpoints_seen: list[dict]) -> str:
++    if not url or not url.startswith(("http://", "https://")):
++        return "Invalid or missing URL - must be a full http(s) URL. No request sent."
++    try:
++        async with httpx.AsyncClient(timeout=_STEP_TIMEOUT, verify=False, follow_redirects=True) as client:
++            resp = await client.head(url)  # HEAD hardcoded - never derived from model output
++    except httpx.HTTPError as exc:
++        _record_endpoint(endpoints_seen, url, None)
++        return f"HEAD {url} failed: {exc}"
++
++    _record_endpoint(endpoints_seen, url, resp.status_code)
++    return f"HEAD {url} -> {resp.status_code}. Headers: {_summarize_headers(resp.headers)}"
++
++
++async def _do_compare(url_a: str, url_b: str, endpoints_seen: list[dict]) -> str:
++    if not url_a or not url_b:
++        return "compare requires both url_a and url_b. No requests sent."
++    result_a = await _do_get(url_a, endpoints_seen)
++    result_b = await _do_get(url_b, endpoints_seen)
++    return f"A) {result_a}\nB) {result_b}"
++
++
++async def _execute_tool_call(action: dict, endpoints_seen: list[dict]) -> str:
++    """
++    The enforcement point. `action` is untrusted model output - only the
++    four literal strings in _ALLOWED_ACTIONS ever cause a real HTTP call,
++    and get/head/compare each hardcode their own method (see _do_get/
++    _do_head above). Anything else - a typo, an attempt to smuggle a
++    different method in via the "action" field, an unrecognized shape -
++    falls straight into the else branch below and issues no request.
++    """
++    action_type = action.get("action") if isinstance(action, dict) else None
++    if action_type not in _ALLOWED_ACTIONS or action_type == "finish":
++        return (
++            f"Action '{action_type}' is not available in this loop - only get, head, "
++            f"and compare issue requests (finish ends the loop). No request was sent."
++        )
++    if action_type == "get":
++        return await _do_get(action.get("url", ""), endpoints_seen)
++    if action_type == "head":
++        return await _do_head(action.get("url", ""), endpoints_seen)
++    return await _do_compare(action.get("url_a", ""), action.get("url_b", ""), endpoints_seen)
++
++
++def _render_history_block(history: list[dict]) -> str:
++    if not history:
++        return "(nothing yet - this is the first action)"
++    lines = []
++    for i, entry in enumerate(history, start=1):
++        action_desc = json.dumps(entry["action"])[:200]
++        result = (entry["result"] or "")[:_HISTORY_RESULT_CHARS]
++        lines.append(f"Step {i}: action={action_desc}\n  result: {result}")
++    return "\n".join(lines)
++
++
++async def _force_conclude(client: genai.Client, hypothesis: str, target_name: str,
++                           target_type: str, history: list[dict]) -> tuple[str | None, float | None]:
++    prompt = _FORCE_CONCLUDE_PROMPT.format(
++        max_steps=_MAX_STEPS, target_name=target_name, target_type=target_type,
++        hypothesis=hypothesis[:2000], history_block=_render_history_block(history),
++    )
++    try:
++        response, _ = await generate_with_rotation(client, prompt, preferred_model=_MODEL)
++        parsed = _parse_json_response(response.text or "")
++        return parsed.get("conclusion"), parsed.get("confidence")
++    except Exception as exc:
++        logger.info("agent_loop: forced-conclude call failed: %s", exc)
++        return None, None
++
++
++def _render_summary(conclusion: str | None, confidence, steps_taken: int, history: list[dict]) -> str:
++    conf_str = f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "unknown"
++    steps_desc = "; ".join(
++        f"step {i}: {entry['action'].get('action') if isinstance(entry['action'], dict) else '?'}"
++        for i, entry in enumerate(history, start=1)
++    ) or "(no steps taken)"
++    return (
++        f"[agentic investigation: {steps_taken} step(s) taken, concluding confidence={conf_str}]\n"
++        f"{conclusion or '(automated summarization did not produce a conclusion - review the raw steps manually)'}\n"
++        f"Steps: {steps_desc}"
++    )
++
++
++async def investigate(hypothesis: str, target_name: str, target_type: str | None,
++                       surface_context: str) -> dict:
++    """
++    Runs the bounded multi-step loop for one hypothesis. Returns:
++      {"summary": str,              - evidence-appendix text, same role the old
++                                       single-GET verification note played
++       "steps_taken": int,
++       "endpoints_touched": list[dict]}  - {url, source, is_live, status_code} per
++                                            probe, for the caller to upsert into
++                                            attack_surface_endpoints
++
++    Never raises - any failure (model error, malformed JSON, etc.) ends
++    the loop early with whatever was learned so far rather than losing
++    the whole investigation.
++    """
++    client = _get_client()
++    history: list[dict] = []
++    endpoints_seen: list[dict] = []
++    conclusion: str | None = None
++    confidence = None
++    steps_taken = 0
++
++    for step_num in range(1, _MAX_STEPS + 1):
++        steps_taken = step_num
++        prompt = _AGENT_STEP_PROMPT.format(
++            max_steps=_MAX_STEPS, step_num=step_num, target_name=target_name,
++            target_type=target_type or "website", surface_context=surface_context,
++            hypothesis=hypothesis[:2000], history_block=_render_history_block(history),
++        )
++        try:
++            response, _ = await generate_with_rotation(client, prompt, preferred_model=_MODEL)
++            action = _parse_json_response(response.text or "")
++        except Exception as exc:
++            logger.info("agent_loop: step %s reasoning failed, ending investigation: %s", step_num, exc)
++            break
++
++        if isinstance(action, dict) and action.get("action") == "finish":
++            conclusion = action.get("conclusion")
++            confidence = action.get("confidence")
++            history.append({"action": action, "result": "(investigation concluded)"})
++            break
++
++        result = await _execute_tool_call(action if isinstance(action, dict) else {}, endpoints_seen)
++        history.append({"action": action if isinstance(action, dict) else {"action": "invalid"}, "result": result})
++
++    if conclusion is None:
++        conclusion, confidence = await _force_conclude(client, hypothesis, target_name, target_type or "website", history)
++
++    return {
++        "summary": _render_summary(conclusion, confidence, steps_taken, history),
++        "steps_taken": steps_taken,
++        "endpoints_touched": endpoints_seen,
++    }
+diff --git a/backend/app/logic_hunter.py b/backend/app/logic_hunter.py
+index 0f59950..c3e2b24 100644
+--- a/backend/app/logic_hunter.py
++++ b/backend/app/logic_hunter.py
+@@ -23,22 +23,37 @@ model on everything but triage.py's escalation and this both spend the
+ strong model only where warranted.
+ 
+ IMPORTANT: this phase produces HYPOTHESES, not confirmed findings. An
+-LLM reasoning over recon data can be wrong, and unlike detective.py's
+-checks (which confirm behavior against a live response before ever
+-returning a finding), logic_hunter never sends a single request itself.
+-Every finding it saves is prefixed "[ai-hypothesis: needs manual
+-verification]" in the evidence, and triage.py sees that same framing -
+-it should never be reported to a bounty program off this phase's output
+-alone without a human actually testing the hypothesis first.
++LLM reasoning over recon data can be wrong. Every finding it saves is
++prefixed "[ai-hypothesis: needs manual verification]" in the evidence,
++and triage.py sees that same framing - it should never be reported to a
++bounty program off this phase's output alone without a human actually
++testing the hypothesis first.
++
++Investigation step: after a hypothesis is produced, agent_loop.py runs a
++bounded, read-only, anonymous multi-step investigation against it (up to
++6 GET/HEAD/compare probes - see agent_loop.py for the full safety model)
++and appends what it found to the evidence. This replaces the old
++single-shot "can this be confirmed with exactly one unauthenticated GET"
++check, which only ever fired for the narrow slice of hypotheses shaped
++like "is this URL reachable with no auth" - most hypotheses (IDOR, most
++business-logic claims) instantly failed that bar and stayed pure,
++unverified hypothesis. The agentic loop can chase a hypothesis across
++several requests instead, so more hypotheses come out of this phase with
++at least partial, real signal attached rather than "needs manual
++verification" alone. It still can't do anything that genuinely requires
++authentication or a second session - that stays item #3 in the build
++order (authenticated/multi-account testing) - and the loop says so
++explicitly in its conclusion when that's the blocker, rather than
++pretending an anonymous probe settled something it couldn't.
+ """
+ 
+ import json
+ import logging
+ import os
+ 
+-import httpx
+ from google import genai
+ 
++from . import agent_loop
+ from .gemini_rotation import generate_with_rotation
+ 
+ logger = logging.getLogger("swas.logic_hunter")
+@@ -81,101 +96,6 @@ human should prioritize this over other manual testing" - most real hypotheses l
+ """
+ 
+ 
+-_VERIFICATION_TIMEOUT = 10.0
+-
+-# Deliberately the cheap model, same tier as gate.py - this is a narrow
+-# extraction task (does the hypothesis contain ONE safely-testable claim),
+-# not open-ended reasoning, so it doesn't need gemini-2.5-pro.
+-_VERIFICATION_MODEL = "gemini-2.5-flash-lite"
+-
+-_VERIFICATION_PROMPT = """A security researcher's hypothesis about a target is below. Your \
+-ONLY job is to decide whether this specific hypothesis can be partially confirmed or refuted \
+-with a SINGLE, unauthenticated, read-only HTTP GET request - nothing else counts as testable.
+-
+-Hypothesis: {hypothesis}
+-
+-Mark testable=false for ANYTHING that requires: comparing two different user sessions/accounts, \
+-sending a POST/PUT/DELETE/PATCH, needing a valid auth token you don't already have, or any \
+-multi-step sequence. Most hypotheses (especially IDOR and most business-logic claims) genuinely \
+-require a second authenticated session to confirm and are NOT testable this way - it is correct \
+-and expected for testable to be false most of the time.
+-
+-Only mark testable=true for narrow cases like: "this admin/internal endpoint is reachable with \
+-no authentication at all" (a plain GET to that exact URL returning 200 instead of 401/403/404 \
+-would confirm it), where the full concrete URL is already stated or directly derivable from the \
+-hypothesis text.
+-
+-Respond with ONLY a JSON object, no other text, no markdown fences:
+-{{"testable": false}}
+-or
+-{{"testable": true, "url": "https://full/concrete/url", "expected_signal": "one short phrase describing what a CONFIRMING response looks like, e.g. 'HTTP 200 with a JSON body' or 'HTTP 200 instead of 401/403'"}}
+-"""
+-
+-
+-def _parse_verification_extraction(text: str) -> dict:
+-    text = text.strip()
+-    if text.startswith("```"):
+-        text = text.strip("`")
+-        if text.startswith("json"):
+-            text = text[4:].strip()
+-    return json.loads(text)
+-
+-
+-async def _attempt_single_request_verification(hypothesis: str) -> str | None:
+-    """
+-    Returns a short evidence-appendix string describing the verification
+-    outcome, or None if the hypothesis wasn't safely testable this way
+-    (the overwhelmingly common case - most hypotheses need a second
+-    session and stay pure hypothesis, which is correct and expected).
+-
+-    Safety: regardless of what the model returns, this only ever issues
+-    a single GET. No method, header, or body the model suggests can turn
+-    this into a state-changing request - that's enforced in code, not
+-    just by the prompt.
+-    """
+-    client = _get_client()
+-    try:
+-        response, _ = await generate_with_rotation(
+-            client, _VERIFICATION_PROMPT.format(hypothesis=hypothesis[:2000]),
+-            preferred_model=_VERIFICATION_MODEL,
+-        )
+-        extraction = _parse_verification_extraction(response.text or "")
+-    except Exception as exc:
+-        logger.info("logic_hunter: verification extraction failed, leaving as pure hypothesis: %s", exc)
+-        return None
+-
+-    if not extraction.get("testable") or not extraction.get("url"):
+-        return None
+-
+-    url = extraction["url"]
+-    expected_signal = (extraction.get("expected_signal") or "")[:200]
+-
+-    try:
+-        async with httpx.AsyncClient(timeout=_VERIFICATION_TIMEOUT, verify=False, follow_redirects=True) as http_client:
+-            resp = await http_client.get(url)  # GET only - hardcoded, never derived from model output
+-    except httpx.HTTPError as exc:
+-        logger.info("logic_hunter: verification GET failed for %s: %s", url, exc)
+-        return f"[auto-verification attempted, request failed: {exc}] no signal either way."
+-
+-    if resp.status_code in (401, 403, 404):
+-        return (
+-            f"[auto-verification: GET {url} returned {resp.status_code} - the claimed "
+-            f"unauthenticated access does NOT appear to hold; this hypothesis looks weaker "
+-            f"than it first read, but confirm manually before dismissing]"
+-        )
+-    if resp.status_code == 200 and len(resp.text) > 50:
+-        return (
+-            f"[auto-verification: GET {url} returned 200 with a {len(resp.text)}-byte body "
+-            f"with no auth sent - consistent with the hypothesis (expected signal: "
+-            f"{expected_signal!r}). Still needs a human to confirm the response body actually "
+-            f"contains what's claimed before this is report-ready.]"
+-        )
+-    return (
+-        f"[auto-verification: GET {url} returned {resp.status_code} - inconclusive, "
+-        f"doesn't clearly confirm or refute the hypothesis]"
+-    )
+-
+-
+ def _get_client() -> genai.Client:
+     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+ 
+@@ -227,14 +147,75 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
+         response, model_used = await generate_with_rotation(client, prompt, preferred_model=_MODEL)
+         result = _parse_hunter_response(response.text or "")
+         result["model_used"] = model_used
++        result["surface_context"] = surface_context
+         return result
+     except Exception as exc:
+         logger.warning("logic_hunter reasoning failed for %s: %s", target_name, exc)
+         return {"has_hypothesis": False, "hypothesis": None, "vuln_type": None,
+-                "confidence": 0.0, "model_used": "none"}
++                "confidence": 0.0, "model_used": "none", "surface_context": surface_context}
++
++
++def _infer_requires_auth(status_code: int | None) -> bool | None:
++    """
++    Same heuristic as pipeline._infer_requires_auth - duplicated rather
++    than imported for the same reason as everything else in this file:
++    pipeline.py imports logic_hunter, so the reverse import would be
++    circular.
++    """
++    if status_code in (401, 403):
++        return True
++    if status_code == 200:
++        return False
++    return None
+ 
+ 
+-async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: int, result: dict) -> int | None:
++async def _upsert_surface_endpoints(conn, target_id: int, endpoints: list[dict]) -> None:
++    """
++    conn-scoped counterpart to pipeline._save_surface_endpoints_pooled
++    (which takes a pool, since recon/probe interleave many outbound
++    calls with writes). logic_hunter already holds a single connection
++    for the whole phase - see _phase_logic_hunter in pipeline.py - so
++    this just uses it directly rather than acquiring its own. Same
++    merge-not-overwrite semantics: tech_stack/sources unioned, times_seen
++    incremented, requires_auth only set if not already confidently known.
++    """
++    if not endpoints:
++        return
++    for ep in endpoints:
++        status_code = ep.get("status_code")
++        inferred_auth = _infer_requires_auth(status_code)
++        auth_evidence = f"inferred from status_code={status_code}" if inferred_auth is not None else None
++        await conn.execute(
++            """
++            INSERT INTO attack_surface_endpoints
++                (target_id, url, is_live, last_status_code, sources, requires_auth, auth_evidence)
++            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
++            ON CONFLICT (target_id, url) DO UPDATE SET
++                times_seen = attack_surface_endpoints.times_seen + 1,
++                last_seen_at = now(),
++                last_status_code = EXCLUDED.last_status_code,
++                is_live = COALESCE(EXCLUDED.is_live, attack_surface_endpoints.is_live),
++                sources = (
++                    SELECT jsonb_agg(DISTINCT s)
++                    FROM jsonb_array_elements_text(
++                        attack_surface_endpoints.sources || EXCLUDED.sources
++                    ) AS s
++                ),
++                requires_auth = COALESCE(attack_surface_endpoints.requires_auth, EXCLUDED.requires_auth),
++                auth_evidence = COALESCE(attack_surface_endpoints.auth_evidence, EXCLUDED.auth_evidence)
++            """,
++            target_id,
++            ep["url"],
++            ep.get("is_live"),
++            status_code,
++            json.dumps([ep["source"]] if ep.get("source") else []),
++            inferred_auth,
++            auth_evidence,
++        )
++
++
++async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: str,
++                            target_type: str | None, cluster_id: int, result: dict) -> int | None:
+     """
+     Saves a logic_hunter hypothesis the same way pipeline._save_finding
+     saves everything else (severity='unknown', goes through triage
+@@ -243,12 +224,26 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: in
+     gate_status is set straight to 'passed' since this already came out
+     the far side of an LLM reasoning pass; it doesn't need the cheap
+     noise-filter gate that raw scanner/tool output does.
++
++    Investigation: runs the bounded agentic loop (agent_loop.investigate)
++    against the hypothesis - up to a few anonymous, read-only probes,
++    not just the old single "is this one URL reachable" check - and
++    appends its conclusion to the evidence. Every endpoint the loop
++    touched also gets written back into the attack-surface model, so
++    this investigation's own probing accumulates the same way recon's
++    does, per the "write back, not just read" requirement from the
++    build-order notes.
+     """
+     confidence = result.get("confidence") or 0.0
+-    verification_note = await _attempt_single_request_verification(result["hypothesis"] or "")
++    investigation = await agent_loop.investigate(
++        hypothesis=result["hypothesis"] or "",
++        target_name=target_name,
++        target_type=target_type,
++        surface_context=result.get("surface_context") or "No attack-surface context available.",
++    )
+     evidence = f"[ai-hypothesis: needs manual verification, confidence={confidence:.2f}]\n{result['hypothesis']}"
+-    if verification_note:
+-        evidence += f"\n{verification_note}"
++    evidence += f"\n{investigation['summary']}"
++
+     finding_id = await conn.fetchval(
+         """
+         INSERT INTO findings (project_id, target_id, tool_name, vuln_type, severity, evidence, gate_status)
+@@ -265,6 +260,7 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, cluster_id: in
+         """,
+         cluster_id, finding_id,
+     )
++    await _upsert_surface_endpoints(conn, target_id, investigation["endpoints_touched"])
+     return finding_id
+ 
+ 
+@@ -310,7 +306,10 @@ async def hunt_project(conn, project_id: int) -> int:
+                 dict(surface_summary) if surface_summary else None,
+             )
+             if result.get("has_hypothesis") and result.get("hypothesis"):
+-                finding_id = await _save_hypothesis(conn, project_id, row["target_id"], row["cluster_id"], result)
++                finding_id = await _save_hypothesis(
++                    conn, project_id, row["target_id"], row["target_name"], row["target_type"],
++                    row["cluster_id"], result,
++                )
+                 hunted += 1
+                 logger.info(
+                     "logic_hunter: hypothesis saved for target_id=%s cluster_id=%s (finding_id=%s)",
+diff --git a/backend/app/test_agent_loop_manual.py b/backend/app/test_agent_loop_manual.py
+new file mode 100644
+index 0000000..b4e38cd
+--- /dev/null
++++ b/backend/app/test_agent_loop_manual.py
+@@ -0,0 +1,185 @@
++"""
++Manual verification harness for agent_loop.py.
++
++Not wired into a pytest suite (repo has none yet) - run directly from
++the `backend/` directory:
++    cd backend && python3 -m app.test_agent_loop_manual
++
++No real GEMINI_API_KEY needed: generate_with_rotation is monkeypatched
++with a scripted fake model so this test is deterministic and free. What
++it actually proves, against real local HTTP servers (not mocked
++responses) and the real agent_loop code path:
++
++  1. SAFETY: a scripted "model" that tries to sneak in a disallowed
++     action (here, "action": "post" - not in _ALLOWED_ACTIONS) never
++     causes a real HTTP request. Proven by pointing it at a local server
++     that would record any request it received; the server log stays
++     empty for that step.
++  2. STEP BUDGET: a scripted model that always asks for another 'get'
++     and never calls 'finish' still stops at exactly _MAX_STEPS steps,
++     and a forced-conclude call happens afterward - proven by counting
++     actual server hits.
++  3. WRITEBACK: URLs the loop actually GETs show up in
++     endpoints_touched with the right status codes, ready for the
++     caller (_save_hypothesis) to upsert into attack_surface_endpoints.
++"""
++import asyncio
++import urllib.parse
++
++from . import agent_loop
++
++
++class _FakeResponse:
++    def __init__(self, text: str):
++        self.text = text
++
++
++async def _serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, hit_log: list):
++    data = await reader.read(4096)
++    request_line = data.split(b"\r\n", 1)[0].decode(errors="ignore")
++    method, path, _ = request_line.split(" ", 2)
++    hit_log.append((method, path))
++    body = b'{"ok": true}'
++    resp = (
++        f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nContent-Type: application/json\r\n\r\n"
++    ).encode() + body
++    writer.write(resp)
++    await writer.drain()
++    writer.close()
++
++
++async def _run_server(port: int, hit_log: list):
++    server = await asyncio.start_server(lambda r, w: _serve(r, w, hit_log), "127.0.0.1", port)
++    async with server:
++        asyncio.ensure_future(server.serve_forever())
++        await asyncio.sleep(0.15)
++        yield
++
++
++async def test_disallowed_action_never_hits_network():
++    hit_log: list = []
++    server = await asyncio.start_server(lambda r, w: _serve(r, w, hit_log), "127.0.0.1", 8911)
++
++    call_count = {"n": 0}
++
++    async def fake_generate(client, prompt, preferred_model=None):
++        call_count["n"] += 1
++        # Step 1: try a disallowed method dressed up as an "action".
++        if call_count["n"] == 1:
++            return _FakeResponse(
++                '{"action": "post", "url": "http://127.0.0.1:8911/admin", "why": "try to write"}'
++            ), "fake-model"
++        # Step 2: give up and finish.
++        return _FakeResponse(
++            '{"action": "finish", "conclusion": "post is not available, nothing more to check", "confidence": 0.2}'
++        ), "fake-model"
++
++    orig = agent_loop.generate_with_rotation
++    agent_loop.generate_with_rotation = fake_generate
++    agent_loop._get_client = lambda: object()
++    try:
++        async with server:
++            asyncio.ensure_future(server.serve_forever())
++            await asyncio.sleep(0.15)
++            result = await agent_loop.investigate(
++                hypothesis="attacker can write to /admin without auth",
++                target_name="test-target", target_type="website",
++                surface_context="no surface data",
++            )
++    finally:
++        agent_loop.generate_with_rotation = orig
++
++    assert hit_log == [], f"REGRESSION: a disallowed action reached the network! hit_log={hit_log}"
++    assert result["steps_taken"] == 2
++    print("PASS (1/3): disallowed 'post' action never issued a real request.", "hit_log:", hit_log)
++
++
++async def test_step_budget_hard_enforced():
++    hit_log: list = []
++    server = await asyncio.start_server(lambda r, w: _serve(r, w, hit_log), "127.0.0.1", 8912)
++
++    call_count = {"n": 0}
++
++    async def fake_generate(client, prompt, preferred_model=None):
++        call_count["n"] += 1
++        # Never finishes on its own - always asks for one more GET.
++        return _FakeResponse(
++            f'{{"action": "get", "url": "http://127.0.0.1:8912/probe{call_count["n"]}", "why": "keep going"}}'
++        ), "fake-model"
++
++    orig = agent_loop.generate_with_rotation
++    agent_loop.generate_with_rotation = fake_generate
++    agent_loop._get_client = lambda: object()
++    try:
++        async with server:
++            asyncio.ensure_future(server.serve_forever())
++            await asyncio.sleep(0.15)
++            result = await agent_loop.investigate(
++                hypothesis="endless hypothesis that never gets confirmed",
++                target_name="test-target", target_type="website",
++                surface_context="no surface data",
++            )
++    finally:
++        agent_loop.generate_with_rotation = orig
++
++    assert result["steps_taken"] == agent_loop._MAX_STEPS, (
++        f"REGRESSION: step budget not enforced, got {result['steps_taken']} vs cap {agent_loop._MAX_STEPS}"
++    )
++    assert len(hit_log) == agent_loop._MAX_STEPS, (
++        f"REGRESSION: expected exactly {agent_loop._MAX_STEPS} real requests, got {len(hit_log)}: {hit_log}"
++    )
++    # +1 because the model never called finish, so a forced-conclude call happens after the loop.
++    assert call_count["n"] == agent_loop._MAX_STEPS + 1
++    print(f"PASS (2/3): step budget hard-capped at {agent_loop._MAX_STEPS} real requests "
++          f"(model never called finish), forced-conclude ran once after.")
++
++
++async def test_endpoint_writeback():
++    hit_log: list = []
++    server = await asyncio.start_server(lambda r, w: _serve(r, w, hit_log), "127.0.0.1", 8913)
++
++    call_count = {"n": 0}
++
++    async def fake_generate(client, prompt, preferred_model=None):
++        call_count["n"] += 1
++        if call_count["n"] == 1:
++            return _FakeResponse(
++                '{"action": "get", "url": "http://127.0.0.1:8913/api/user/1", "why": "check response shape"}'
++            ), "fake-model"
++        return _FakeResponse(
++            '{"action": "finish", "conclusion": "endpoint returned 200 with a JSON body, consistent with the hypothesis", "confidence": 0.6}'
++        ), "fake-model"
++
++    orig = agent_loop.generate_with_rotation
++    agent_loop.generate_with_rotation = fake_generate
++    agent_loop._get_client = lambda: object()
++    try:
++        async with server:
++            asyncio.ensure_future(server.serve_forever())
++            await asyncio.sleep(0.15)
++            result = await agent_loop.investigate(
++                hypothesis="unauth GET to /api/user/1 leaks another user's data",
++                target_name="test-target", target_type="website",
++                surface_context="no surface data",
++            )
++    finally:
++        agent_loop.generate_with_rotation = orig
++
++    assert len(result["endpoints_touched"]) == 1
++    ep = result["endpoints_touched"][0]
++    assert ep["url"] == "http://127.0.0.1:8913/api/user/1"
++    assert ep["status_code"] == 200
++    assert ep["is_live"] is True
++    assert ep["source"] == "logic_hunter_agent"
++    print("PASS (3/3): endpoint touched during investigation captured correctly for surface writeback:", ep)
++
++
++async def main():
++    await test_disallowed_action_never_hits_network()
++    await test_step_budget_hard_enforced()
++    await test_endpoint_writeback()
++    print("\nALL PASS")
++
++
++if __name__ == "__main__":
++    asyncio.run(main())

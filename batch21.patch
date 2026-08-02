@@ -1,0 +1,466 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index eb7a27b..b625341 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -1502,7 +1502,8 @@ async def triage_one_finding(finding_id: int):
+             SET severity = $1,
+                 likely_program_outcome = $2,
+                 triage_reasoning = $3,
+-                triage_confidence = $4
++                triage_confidence = $4,
++                impact_evidence = $6
+             WHERE id = $5
+             """,
+             result["severity"] if result["severity"] in
+@@ -1511,6 +1512,7 @@ async def triage_one_finding(finding_id: int):
+             result.get("reasoning"),
+             result.get("confidence"),
+             finding_id,
++            (result.get("impact_evidence") or "").strip() or None,
+         )
+ 
+     return {"finding_id": finding_id, "signature": signature, **result}
+@@ -1530,7 +1532,7 @@ async def draft_finding_report(finding_id: int):
+     async with pool.acquire() as conn:
+         finding = await conn.fetchrow(
+             """
+-            SELECT f.id, f.tool_name, f.vuln_type, f.severity, f.evidence,
++            SELECT f.id, f.tool_name, f.vuln_type, f.severity, f.evidence, f.impact_evidence,
+                    f.triage_reasoning, st.target, p.id AS project_id, p.name AS project_name, p.platform
+             FROM findings f
+             JOIN scope_targets st ON st.id = f.target_id
+@@ -1551,6 +1553,7 @@ async def draft_finding_report(finding_id: int):
+             platform=finding["platform"], target=finding["target"], vuln_type=finding["vuln_type"],
+             severity=finding["severity"], evidence=finding["evidence"] or "",
+             triage_reasoning=finding["triage_reasoning"],
++            impact_evidence=finding["impact_evidence"],
+         )
+         if "error" in result:
+             raise HTTPException(status_code=502, detail=f"Report drafting failed: {result['error']}")
+diff --git a/backend/app/report_writer.py b/backend/app/report_writer.py
+index eeff0a8..fc7c92f 100644
+--- a/backend/app/report_writer.py
++++ b/backend/app/report_writer.py
+@@ -44,6 +44,7 @@ Vulnerability type: {vuln_type}
+ Severity (already decided, do not second-guess): {severity}
+ VRT category: {vrt_category}
+ Triage reasoning (already decided, do not second-guess): {triage_reasoning}
++Impact evidence on file (already decided, do not second-guess): {impact_evidence_context}
+ 
+ Raw evidence:
+ ---
+@@ -51,7 +52,7 @@ Raw evidence:
+ ---
+ 
+ Respond with ONLY a JSON object, no other text, no markdown fences:
+-{{"title": "concise, specific report title", "summary": "one paragraph describing the vulnerability", "steps_to_reproduce": ["step 1", "step 2", "..."], "impact": "one paragraph on real-world impact, grounded in the evidence - do not invent impact beyond what the evidence supports", "remediation": "one or two sentences, generic remediation guidance for this vuln class"}}
++{{"title": "concise, specific report title", "summary": "one paragraph describing the vulnerability", "steps_to_reproduce": ["step 1", "step 2", "..."], "impact": "one paragraph on real-world impact, grounded ONLY in the impact evidence on file and the raw evidence above - if impact evidence on file says impact is unproven, say plainly that impact beyond the vulnerability mechanism itself has not yet been demonstrated, rather than writing confident impact language anyway", "remediation": "one or two sentences, generic remediation guidance for this vuln class"}}
+ 
+ Platform tone guidance: {platform_guidance}
+ 
+@@ -64,6 +65,15 @@ behavior" is honest; inventing a specific curl command with made-up parameter va
+ that aren't in the evidence is not). This report will be submitted to a real program - \
+ a fabricated technical detail that doesn't hold up under review costs credibility on the \
+ whole account, not just this one report.
++
++CRITICAL, impact section specifically: if "Impact evidence on file" above says impact is \
++unproven, the "impact" field must say so plainly - e.g. "This confirms the vulnerability \
++mechanism fires, but no concrete evidence of data exposure or a privileged action has been \
++demonstrated yet; further testing would be needed to establish real-world impact." Writing \
++confident impact language (data breach framing, specific harm scenarios) when the actual \
++evidence doesn't support it is exactly the kind of report language that gets a submission \
++closed as Informative once a triager checks the evidence themselves - an honest "impact not \
++yet proven" framing is more credible, not less, than an oversold one that doesn't hold up.
+ """
+ 
+ _PLATFORM_GUIDANCE = {
+@@ -94,6 +104,7 @@ def _parse_report_response(text: str) -> dict:
+ async def draft_report(
+     platform: str, target: str, vuln_type: str, severity: str,
+     evidence: str, vrt_category: str | None = None, triage_reasoning: str | None = None,
++    impact_evidence: str | None = None,
+ ) -> dict:
+     """
+     Returns {"title", "summary", "steps_to_reproduce", "impact",
+@@ -102,15 +113,28 @@ async def draft_report(
+     to something that looks like a real draft, since this is
+     user-facing content meant to be copy-pasted toward a real
+     submission.
++
++    impact_evidence (optional): triage's own concrete evidence of real
++    impact (see triage.py's impact_evidence field), or None/empty if
++    triage never demonstrated impact beyond the vulnerability mechanism
++    itself. Fed into the prompt so the draft's "impact" section reflects
++    that honestly instead of writing confident impact language a real
++    triager's own evidence review would contradict.
+     """
+     client = _get_client()
+     platform_guidance = _PLATFORM_GUIDANCE.get(
+         platform.lower(), "No platform-specific guidance available - use a clear, generic structure."
+     )
++    impact_evidence_context = (
++        impact_evidence.strip() if impact_evidence and impact_evidence.strip()
++        else "unproven - only the vulnerability mechanism itself was confirmed, no concrete "
++             "evidence of data exposure or a privileged action was demonstrated"
++    )
+     prompt = _REPORT_PROMPT.format(
+         platform=platform, target=target, vuln_type=vuln_type, severity=severity,
+         vrt_category=vrt_category or "none assigned",
+         triage_reasoning=triage_reasoning or "none recorded",
++        impact_evidence_context=impact_evidence_context,
+         evidence=(evidence or "")[:3000],
+         platform_guidance=platform_guidance,
+     )
+diff --git a/backend/app/test_impact_evidence_manual.py b/backend/app/test_impact_evidence_manual.py
+new file mode 100644
+index 0000000..120afc5
+--- /dev/null
++++ b/backend/app/test_impact_evidence_manual.py
+@@ -0,0 +1,190 @@
++"""
++Manual verification for the impact_evidence severity cap (triage.py) -
++against a REAL local Postgres, real asyncpg, per project testing
++standard. The only thing swapped out is the outbound Gemini call
++(triage.generate_with_rotation), same pattern as
++test_retry_queue_manual.py.
++
++Setup:
++    export PGPASSWORD=testpass GEMINI_API_KEY=test-key-not-used
++    psql -h localhost -U swas_test -d swas_test_db -f backend/db/migrations/012_impact_evidence.sql
++    (+ full schema replay - see test_error_taxonomy_manual.py's docstring)
++
++Run:
++    cd backend && python3 -m app.test_impact_evidence_manual
++"""
++import asyncio
++import os
++import sys
++
++import asyncpg
++
++os.environ.setdefault("GEMINI_API_KEY", "test-key-not-used")
++
++from . import triage  # noqa: E402
++
++DB_DSN = os.environ.get(
++    "TEST_DB_DSN", "postgresql://swas_test:testpass@localhost/swas_test_db"
++)
++
++
++def test_weak_impact_evidence_detection():
++    cases = [
++        (None, True),
++        ("", True),
++        ("   ", True),
++        ("none", True),
++        ("N/A", True),
++        ("Not demonstrated.", True),
++        ("short", True),  # under _MIN_IMPACT_EVIDENCE_LENGTH
++        ("Extracted row: user_id=4821, email=admin@target.com, role=superadmin", False),
++        ("Response body contained victim's session cookie value after XSS payload fired", False),
++    ]
++    for value, expected_weak in cases:
++        actual = triage._impact_evidence_is_weak(value)
++        assert actual == expected_weak, f"{value!r} -> got weak={actual}, expected {expected_weak}"
++        print(f"PASS: impact_evidence={value!r} -> weak={actual}")
++
++
++def test_cap_applies_only_to_critical_high_with_weak_evidence():
++    # critical + weak -> capped to medium, reasoning prefixed
++    result = {"severity": "critical", "impact_evidence": "", "reasoning": "SQLi confirmed via error-based technique"}
++    capped = triage._apply_impact_evidence_cap(dict(result))
++    assert capped["severity"] == "medium", capped
++    assert "capped from critical to medium" in capped["reasoning"], capped
++    print("PASS: critical + weak impact_evidence -> capped to medium")
++
++    # high + strong evidence -> NOT capped
++    result2 = {
++        "severity": "high",
++        "impact_evidence": "Read /etc/passwd contents showing root and 3 other system user entries",
++        "reasoning": "LFI confirmed",
++    }
++    capped2 = triage._apply_impact_evidence_cap(dict(result2))
++    assert capped2["severity"] == "high", capped2
++    assert capped2["reasoning"] == "LFI confirmed", capped2
++    print("PASS: high + strong impact_evidence -> NOT capped, reasoning untouched")
++
++    # medium + weak evidence -> NOT capped (medium doesn't depend on impact_evidence)
++    result3 = {"severity": "medium", "impact_evidence": "", "reasoning": "Confirmed CVE version match"}
++    capped3 = triage._apply_impact_evidence_cap(dict(result3))
++    assert capped3["severity"] == "medium", capped3
++    print("PASS: medium + weak impact_evidence -> left alone (medium doesn't require impact_evidence)")
++
++    # info + weak evidence -> NOT capped
++    result4 = {"severity": "info", "impact_evidence": None, "reasoning": "Missing security header"}
++    capped4 = triage._apply_impact_evidence_cap(dict(result4))
++    assert capped4["severity"] == "info", capped4
++    print("PASS: info + weak impact_evidence -> left alone")
++
++
++async def _fake_generate_weak_critical(client, prompt, preferred_model=None):
++    class _R:
++        text = (
++            '{"severity": "critical", "confidence": 0.95, "reasoning": "SQLi confirmed", '
++            '"likely_program_outcome": "accepted", "impact_evidence": ""}'
++        )
++    return _R(), "gemini-2.5-flash"
++
++
++async def _fake_generate_strong_high(client, prompt, preferred_model=None):
++    class _R:
++        text = (
++            '{"severity": "high", "confidence": 0.9, "reasoning": "IDOR confirmed", '
++            '"likely_program_outcome": "accepted", '
++            '"impact_evidence": "Response for user_id=1002 (not the authenticated user) showed '
++            'their full name, email, and phone number"}'
++        )
++    return _R(), "gemini-2.5-flash"
++
++
++async def _e2e():
++    pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=3)
++    original = triage.generate_with_rotation
++    try:
++        async with pool.acquire() as conn:
++            project_id = await conn.fetchval(
++                "INSERT INTO projects (name, platform) VALUES ($1, $2) RETURNING id",
++                "impact-evidence-test-project", "hackerone",
++            )
++            target_id = await conn.fetchval(
++                "INSERT INTO scope_targets (project_id, target) VALUES ($1, $2) RETURNING id",
++                project_id, "impact-test.example.com",
++            )
++
++        try:
++            # Round 1: only the weak-evidence finding exists yet, so
++            # triage_project_findings (which sweeps ALL unknown findings
++            # in the project) can't accidentally also triage round 2's
++            # finding with round 1's fake response.
++            async with pool.acquire() as conn:
++                weak_finding_id = await conn.fetchval(
++                    """
++                    INSERT INTO findings (project_id, target_id, tool_name, vuln_type, evidence)
++                    VALUES ($1, $2, 'sqlmap', 'sqli-error-based', 'boolean differential observed') RETURNING id
++                    """,
++                    project_id, target_id,
++                )
++            triage.generate_with_rotation = _fake_generate_weak_critical
++            async with pool.acquire() as conn:
++                await triage.triage_project_findings(conn, project_id)
++            async with pool.acquire() as conn:
++                row = await conn.fetchrow(
++                    "SELECT severity, impact_evidence, triage_reasoning FROM findings WHERE id = $1", weak_finding_id
++                )
++            assert row["severity"] == "medium", row  # capped down from critical
++            assert row["impact_evidence"] is None, row  # empty string stored as NULL
++            assert "capped from critical to medium" in row["triage_reasoning"], row
++            print(f"PASS: weak-impact critical finding stored as severity={row['severity']!r}, capping noted in reasoning")
++
++            # Round 2: weak_finding is no longer 'unknown' (just resolved
++            # above), so this sweep only picks up the new finding.
++            async with pool.acquire() as conn:
++                strong_finding_id = await conn.fetchval(
++                    """
++                    INSERT INTO findings (project_id, target_id, tool_name, vuln_type, evidence)
++                    VALUES ($1, $2, 'custom-idor-check', 'idor', 'sequential id enumeration test') RETURNING id
++                    """,
++                    project_id, target_id,
++                )
++            triage.generate_with_rotation = _fake_generate_strong_high
++            async with pool.acquire() as conn:
++                await triage.triage_project_findings(conn, project_id)
++            async with pool.acquire() as conn:
++                row2 = await conn.fetchrow(
++                    "SELECT severity, impact_evidence FROM findings WHERE id = $1", strong_finding_id
++                )
++            assert row2["severity"] == "high", row2  # NOT capped
++            assert row2["impact_evidence"] and "phone number" in row2["impact_evidence"], row2
++            print(f"PASS: strong-impact high finding stays severity={row2['severity']!r}, impact_evidence persisted")
++
++        finally:
++            async with pool.acquire() as conn:
++                await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
++
++    finally:
++        triage.generate_with_rotation = original
++        await pool.close()
++
++
++def test_e2e_real_db():
++    asyncio.run(_e2e())
++
++
++if __name__ == "__main__":
++    tests = [
++        test_weak_impact_evidence_detection,
++        test_cap_applies_only_to_critical_high_with_weak_evidence,
++        test_e2e_real_db,
++    ]
++    failed = 0
++    for t in tests:
++        try:
++            t()
++        except AssertionError as e:
++            failed += 1
++            print(f"FAIL: {t.__name__} - {e}")
++    if failed:
++        print(f"\n{failed}/{len(tests)} test(s) FAILED")
++        sys.exit(1)
++    print(f"\nAll {len(tests)} test(s) passed")
+diff --git a/backend/app/triage.py b/backend/app/triage.py
+index ace4d63..6d80396 100644
+--- a/backend/app/triage.py
++++ b/backend/app/triage.py
+@@ -36,7 +36,7 @@ Tool: {tool_name}
+ ---
+ {outcome_context}{vrt_context}
+ Respond with ONLY a JSON object, no other text, no markdown fences:
+-{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null"}}
++{{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null", "impact_evidence": "concrete proof of REAL impact found IN THE EVIDENCE ABOVE - an actual sensitive value shown (email/token/row/credential), an actual privileged action performed, an actual different user's data accessed - or an empty string if the evidence only shows the vulnerability mechanism firing (a 200 response, a reflected payload, a matched signature) without anything concrete beyond that"}}
+ 
+ Guidance: missing security headers, generic fingerprinting (server/version
+ detection), and DNS records are almost always "info". Known CVEs with
+@@ -47,6 +47,17 @@ classification (the evidence is ambiguous, contradictory, or you're
+ guessing), set confidence below 0.6 - this is expected and fine, it
+ routes the finding to a closer look rather than forcing a bad guess.
+ 
++impact_evidence is separate from confidence and separate from whether
++the technique works - it specifically answers "did the evidence show
++something a program would consider actual harm, not just a working
++mechanism?" A SQLi finding where the evidence shows one real extracted
++row IS impact_evidence; a SQLi finding where the evidence only shows a
++boolean-blind true/false differential is NOT, even if you're highly
++confident the injection itself is real. Do not pad this field with
++restated technical detail to make it look substantive - if the evidence
++genuinely doesn't show concrete impact, leave it as an empty string
++rather than describing the mechanism again in different words.
++
+ SSL/TLS/certificate findings (weak ciphers, self-signed or expired
+ certs, missing HSTS/CSP, protocol version warnings, and similar scanner
+ output) are ALWAYS "info", high confidence (0.9+), and should NOT be
+@@ -177,6 +188,65 @@ def _format_self_declared_context(self_declared_severity: str | None) -> str:
+     )
+ 
+ 
++_MIN_IMPACT_EVIDENCE_LENGTH = 15
++_WEAK_IMPACT_EVIDENCE_MARKERS = {
++    "none", "n/a", "na", "not applicable", "not demonstrated", "not shown",
++    "no impact evidence", "no impact", "not proven", "unproven", "no concrete impact",
++}
++
++
++def _impact_evidence_is_weak(impact_evidence: str | None) -> bool:
++    """
++    True if impact_evidence doesn't actually establish real-world harm -
++    missing, empty, or just a short hedge/filler phrase rather than a
++    concrete detail. Deliberately simple (length + a fixed filler-phrase
++    set) rather than a second AI call to grade the first AI call's
++    answer - that would just move the "can I trust this judgment"
++    problem one level up instead of resolving it.
++    """
++    if not impact_evidence:
++        return True
++    cleaned = impact_evidence.strip()
++    if len(cleaned) < _MIN_IMPACT_EVIDENCE_LENGTH:
++        return True
++    if cleaned.rstrip(".!").lower() in _WEAK_IMPACT_EVIDENCE_MARKERS:
++        return True
++    return False
++
++
++def _apply_impact_evidence_cap(result: dict) -> dict:
++    """
++    "Real bug, unproven impact" shouldn't inherit high severity by
++    default just because the underlying technique is real - this is the
++    direct fix for the recurring "no real impact to sensitive data"
++    platform rejection. Only caps critical/high (the tiers where a
++    weak-impact rejection actually costs a payout); medium/low/info are
++    left alone since those severities don't depend on impact_evidence to
++    begin with (e.g. a confirmed CVE version match is legitimately
++    "medium" on technical grounds alone, not on demonstrated impact).
++
++    Caps to "medium", not lower - this is still a real, confirmed
++    finding, just not yet proven to matter at the critical/high tier.
++    Mutates and returns the same dict so callers can just chain this
++    onto the parsed response.
++    """
++    severity = result.get("severity")
++    if severity not in ("critical", "high"):
++        return result
++
++    if not _impact_evidence_is_weak(result.get("impact_evidence")):
++        return result
++
++    original_severity = severity
++    result["severity"] = "medium"
++    result["reasoning"] = (
++        f"[Severity capped from {original_severity} to medium: no concrete real-world impact "
++        f"evidence was provided, only that the vulnerability mechanism fires - see impact_evidence] "
++        f"{result.get('reasoning', '')}"
++    )
++    return result
++
++
+ async def triage_finding(
+     tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None,
+     self_declared_severity: str | None = None,
+@@ -255,15 +325,15 @@ async def triage_finding(
+             )
+             escalated = _parse_triage_response(response.text or "")
+             escalated["model_used"] = escalation_model_used
+-            return escalated
++            return _apply_impact_evidence_cap(escalated)
+         except Exception as exc:
+             logger.warning("Escalation failed on every model, keeping first-pass result: %s", exc)
+             # Fall back to the first-pass result rather than losing the
+             # finding entirely - a low-confidence guess is still more
+             # useful than nothing, and it's clearly labeled as such.
+-            return result
++            return _apply_impact_evidence_cap(result)
+ 
+-    return result
++    return _apply_impact_evidence_cap(result)
+ 
+ 
+ # ---------------------------------------------------------------------
+@@ -406,7 +476,8 @@ async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: lis
+         SET severity = $1,
+             likely_program_outcome = $2,
+             triage_reasoning = $3,
+-            triage_confidence = $4
++            triage_confidence = $4,
++            impact_evidence = $6
+         WHERE id = $5
+         """,
+         result["severity"] if result["severity"] in
+@@ -415,6 +486,7 @@ async def _triage_and_store_finding(conn, project_id: int, row, vrt_entries: lis
+         result.get("reasoning"),
+         result.get("confidence"),
+         row["id"],
++        (result.get("impact_evidence") or "").strip() or None,
+     )
+ 
+     # Close the loop: what triage decided about this signature on
+diff --git a/backend/db/migrations/012_impact_evidence.sql b/backend/db/migrations/012_impact_evidence.sql
+new file mode 100644
+index 0000000..ba4ecc9
+--- /dev/null
++++ b/backend/db/migrations/012_impact_evidence.sql
+@@ -0,0 +1,17 @@
++-- 012_impact_evidence.sql
++-- Adds impact_evidence to findings: the model's own concrete evidence
++-- of REAL-WORLD impact (actual sensitive data shown, an actual
++-- privileged action performed) as distinct from "the vulnerability
++-- mechanism fires". This is the direct fix for the recurring "no real
++-- impact to sensitive data" platform rejection - triage.py now caps
++-- critical/high severity down to medium whenever this field is
++-- missing/weak, rather than letting a confirmed-but-unproven bug
++-- inherit high severity by default (see triage._apply_impact_evidence_cap).
++--
++-- Nullable: pre-existing findings (and cluster-triage, which doesn't
++-- go through this field yet) simply have no impact_evidence rather
++-- than a fabricated one.
++--
++-- Idempotent, same pattern as prior migrations.
++
++ALTER TABLE findings ADD COLUMN IF NOT EXISTS impact_evidence TEXT;

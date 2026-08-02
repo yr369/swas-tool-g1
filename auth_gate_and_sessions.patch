@@ -1,0 +1,449 @@
+diff --git a/backend/app/auth_policy.py b/backend/app/auth_policy.py
+new file mode 100644
+index 0000000..5a4bcb2
+--- /dev/null
++++ b/backend/app/auth_policy.py
+@@ -0,0 +1,98 @@
++"""
++auth_policy.py - the default-deny gate for authenticated/multi-account testing.
++
++Plain-language: this file's ONLY job is to answer one question - "is
++authenticated testing explicitly approved for this specific project
++right now" - and to make it structurally hard for any other code path
++to skip asking it. Every function anywhere in this codebase that is
++about to attach a real credential/session to an outbound request MUST
++call `require_approved(...)` first and let it raise if the answer isn't
++a plain 'approved'. There is no code path that attaches credentials
++without going through this gate - credential storage/retrieval, once
++built on top of this, is required to call it before ever handing back a
++usable session.
++
++Default posture is DENY, not "assume yes until told otherwise": a
++project with no policy row at all, or an explicit 'unset' row, is
++blocked - exactly the same as an explicit 'denied' row. Only a row whose
++status is literally 'approved' passes. This mirrors the same scope-check
++discipline already applied everywhere else in this codebase (verify what
++a program's policy actually allows before testing something, never
++assume) - applied specifically to multi-account automation, which
++several bounty programs restrict or require pre-approval for even when
++the underlying vuln classes themselves are in scope.
++
++Moving a project to 'approved' is a manual, deliberate action (see
++`set_policy` below), meant to be invoked once by a human operator after
++actually reading the relevant program's policy on automated/multi-account
++testing - not something any pipeline phase ever sets on its own.
++"""
++
++import logging
++
++logger = logging.getLogger("swas.auth_policy")
++
++_VALID_STATUSES = ("unset", "approved", "denied")
++
++
++class AuthPolicyError(Exception):
++    """
++    Raised by require_approved() when a project isn't explicitly
++    approved for authenticated testing. Deliberately an exception, not
++    a bool return value - a caller can't accidentally `if not
++    require_approved(...): pass` their way past the gate; they have to
++    either handle it or let it propagate and stop the operation.
++    """
++
++
++async def get_policy(conn, project_id: int) -> dict:
++    row = await conn.fetchrow(
++        "SELECT status, policy_note, set_by, set_at FROM project_auth_policy WHERE project_id = $1",
++        project_id,
++    )
++    if not row:
++        return {"status": "unset", "policy_note": None, "set_by": None, "set_at": None}
++    return dict(row)
++
++
++async def require_approved(conn, project_id: int) -> None:
++    """
++    The gate. Call this before anything that would attach a stored
++    credential/session to an outbound request against this project's
++    targets. Raises AuthPolicyError for anything other than an explicit
++    'approved' status - including 'unset' (the default for every new
++    project) and 'denied'.
++    """
++    policy = await get_policy(conn, project_id)
++    if policy["status"] != "approved":
++        raise AuthPolicyError(
++            f"authenticated/multi-account testing is not approved for project_id={project_id} "
++            f"(status={policy['status']!r}). Call auth_policy.set_policy(...) after confirming "
++            f"the program's actual policy on automated multi-account testing before retrying."
++        )
++
++
++async def set_policy(conn, project_id: int, status: str, policy_note: str, set_by: str) -> None:
++    """
++    The only way a project moves out of the default-deny state. This is
++    a data-layer primitive meant to be called from a deliberate operator
++    action (a CLI command or admin endpoint - not built here) - never
++    automatically by a pipeline phase, and never with a placeholder
++    policy_note; the point is a real accountability trail for a real
++    decision, not a rubber stamp.
++    """
++    if status not in _VALID_STATUSES:
++        raise ValueError(f"invalid policy status: {status!r}, must be one of {_VALID_STATUSES}")
++    await conn.execute(
++        """
++        INSERT INTO project_auth_policy (project_id, status, policy_note, set_by, set_at)
++        VALUES ($1, $2, $3, $4, now())
++        ON CONFLICT (project_id) DO UPDATE SET
++            status = EXCLUDED.status,
++            policy_note = EXCLUDED.policy_note,
++            set_by = EXCLUDED.set_by,
++            set_at = now()
++        """,
++        project_id, status, policy_note, set_by,
++    )
++    logger.info("auth_policy: project_id=%s set to status=%s by %s", project_id, status, set_by)
+diff --git a/backend/app/auth_policy_migration.sql b/backend/app/auth_policy_migration.sql
+new file mode 100644
+index 0000000..c094cef
+--- /dev/null
++++ b/backend/app/auth_policy_migration.sql
+@@ -0,0 +1,20 @@
++-- auth_policy_migration.sql
++-- Default-deny gate for authenticated/multi-account testing (build-order item #3).
++--
++-- One row per project. No row, or status='unset', means BLOCKED - identical
++-- to an explicit 'denied' row. Only status='approved' lets auth_policy.py's
++-- require_approved() pass. A project only reaches 'approved' via a deliberate
++-- manual call to auth_policy.set_policy(...) after a human has actually read
++-- that program's policy on automated/multi-account testing - never set by a
++-- pipeline phase on its own.
++
++CREATE TABLE IF NOT EXISTS project_auth_policy (
++    id              SERIAL PRIMARY KEY,
++    project_id      INTEGER NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
++    status          TEXT NOT NULL DEFAULT 'unset'
++                    CHECK (status IN ('unset', 'approved', 'denied')),
++    policy_note     TEXT,       -- e.g. "program's VDP section 4.2 permits automated multi-account
++                                 -- testing; confirmed via program's own scope page 2026-08-01"
++    set_by          TEXT,       -- accountability trail - who made this call
++    set_at          TIMESTAMPTZ NOT NULL DEFAULT now()
++);
+diff --git a/backend/app/auth_sessions.py b/backend/app/auth_sessions.py
+new file mode 100644
+index 0000000..93c239f
+--- /dev/null
++++ b/backend/app/auth_sessions.py
+@@ -0,0 +1,151 @@
++"""
++auth_sessions.py - encrypted-at-rest storage for per-account session
++credentials (cookies/bearer tokens) used by authenticated/multi-account
++testing (build-order item #3).
++
++Plain-language: this is the ONLY place in the codebase allowed to
++handle a real bug-bounty account's cookie or token. Two things are
++enforced here IN CODE, not just described in a comment:
++
++  1. auth_policy.require_approved() is called before store OR retrieve.
++     A project that hasn't been explicitly approved for authenticated
++     testing can't have a session stored for it, let alone read one
++     back. This is checked on the WRITE path too, not just reads -
++     there's no reason to let credentials accumulate in the database
++     for a program nobody's confirmed allows this kind of testing yet.
++
++  2. Encryption at rest via Postgres's pgcrypto (pgp_sym_encrypt /
++     pgp_sym_decrypt), keyed by a passphrase that lives ONLY in the
++     SWAS_SESSION_KEY environment variable - never in this codebase,
++     never in the database itself. Losing that env var means every
++     stored session becomes permanently unreadable. That's by design:
++     there is no key-recovery path in this scheme, the same tradeoff as
++     any symmetric-key-at-rest approach without a separate escrow
++     system, which this project doesn't have.
++
++What this file deliberately does NOT do:
++  - Never logs a decrypted value, not even at debug level.
++    get_session()'s return value is meant to be used immediately by the
++    caller (attached to exactly one outbound request) and not stored
++    anywhere else - not in a variable that outlives the request, not in
++    a findings.evidence string. If a probe using a session needs to
++    describe what it saw, it describes the RESPONSE, never the
++    credential that produced it.
++  - list_sessions() only ever returns session_name/session_type/
++    header_name/notes/timestamps - never encrypted_value, and nothing
++    in this file returns more than one decrypted secret at a time.
++"""
++
++import logging
++import os
++
++from . import auth_policy
++
++logger = logging.getLogger("swas.auth_sessions")
++
++_VALID_SESSION_TYPES = ("cookie", "bearer_token", "header")
++
++
++def _get_passphrase() -> str:
++    passphrase = os.environ.get("SWAS_SESSION_KEY")
++    if not passphrase:
++        raise RuntimeError(
++            "SWAS_SESSION_KEY is not set - authenticated-session storage/retrieval is unavailable "
++            "until it is. There is no fallback/default key; that would defeat the point of "
++            "encrypting these at rest."
++        )
++    return passphrase
++
++
++async def store_session(conn, project_id: int, session_name: str, credential_value: str,
++                         session_type: str = "cookie", header_name: str | None = None,
++                         notes: str | None = None) -> None:
++    """
++    Encrypts and stores (or overwrites) one named session for a
++    project. Requires the project to already be 'approved' in
++    auth_policy - raises AuthPolicyError otherwise.
++    """
++    await auth_policy.require_approved(conn, project_id)
++    if session_type not in _VALID_SESSION_TYPES:
++        raise ValueError(f"invalid session_type: {session_type!r}, must be one of {_VALID_SESSION_TYPES}")
++    if session_type == "header" and not header_name:
++        raise ValueError("header_name is required when session_type='header'")
++
++    passphrase = _get_passphrase()
++    await conn.execute(
++        """
++        INSERT INTO project_auth_sessions
++            (project_id, session_name, encrypted_value, session_type, header_name, notes)
++        VALUES ($1, $2, pgp_sym_encrypt($3, $4), $5, $6, $7)
++        ON CONFLICT (project_id, session_name) DO UPDATE SET
++            encrypted_value = pgp_sym_encrypt($3, $4),
++            session_type = EXCLUDED.session_type,
++            header_name = EXCLUDED.header_name,
++            notes = EXCLUDED.notes
++        """,
++        project_id, session_name, credential_value, passphrase, session_type, header_name, notes,
++    )
++    logger.info(
++        "auth_sessions: stored session_name=%s (type=%s) for project_id=%s - value never logged",
++        session_name, session_type, project_id,
++    )
++
++
++async def get_session(conn, project_id: int, session_name: str) -> dict | None:
++    """
++    Decrypts and returns ONE session for immediate use by a caller
++    about to issue exactly one authenticated request. Requires the
++    project to be 'approved'. Returns None if no session with that name
++    exists for this project - a missing session is not an error,
++    callers should treat it the same as "nothing to attach, proceed
++    anonymously" rather than failing.
++
++    Returned dict: {session_type, header_name, credential_value}. The
++    caller must use credential_value immediately and not persist it
++    anywhere else.
++    """
++    await auth_policy.require_approved(conn, project_id)
++    passphrase = _get_passphrase()
++    row = await conn.fetchrow(
++        """
++        SELECT session_type, header_name, pgp_sym_decrypt(encrypted_value, $3) AS credential_value
++        FROM project_auth_sessions
++        WHERE project_id = $1 AND session_name = $2
++        """,
++        project_id, session_name, passphrase,
++    )
++    if not row:
++        return None
++    await conn.execute(
++        "UPDATE project_auth_sessions SET last_used_at = now() WHERE project_id = $1 AND session_name = $2",
++        project_id, session_name,
++    )
++    return dict(row)
++
++
++async def list_sessions(conn, project_id: int) -> list[dict]:
++    """
++    Metadata only - never encrypted_value, never a decrypted
++    credential. Deliberately does NOT require approval to list what
++    session names exist (useful for an operator checking what's
++    configured before deciding whether to approve) - store_session and
++    get_session both still gate on approval independently regardless.
++    """
++    rows = await conn.fetch(
++        """
++        SELECT session_name, session_type, header_name, notes, created_at, last_used_at
++        FROM project_auth_sessions
++        WHERE project_id = $1
++        ORDER BY session_name
++        """,
++        project_id,
++    )
++    return [dict(r) for r in rows]
++
++
++async def delete_session(conn, project_id: int, session_name: str) -> None:
++    await conn.execute(
++        "DELETE FROM project_auth_sessions WHERE project_id = $1 AND session_name = $2",
++        project_id, session_name,
++    )
++    logger.info("auth_sessions: deleted session_name=%s for project_id=%s", session_name, project_id)
+diff --git a/backend/app/auth_sessions_migration.sql b/backend/app/auth_sessions_migration.sql
+new file mode 100644
+index 0000000..6e086b7
+--- /dev/null
++++ b/backend/app/auth_sessions_migration.sql
+@@ -0,0 +1,27 @@
++-- auth_sessions_migration.sql
++-- Encrypted-at-rest storage for per-account session credentials (cookies/
++-- bearer tokens), gated by project_auth_policy (see auth_policy_migration.sql
++-- and auth_policy.py - every read/write here goes through that gate in code,
++-- not just by convention).
++--
++-- Encryption is pgcrypto's pgp_sym_encrypt/pgp_sym_decrypt, keyed by a
++-- passphrase that lives ONLY in the SWAS_SESSION_KEY environment variable -
++-- never in this schema, never in a column, never in application code. There
++-- is deliberately no key-recovery path: losing that env var makes every row
++-- here permanently undecryptable.
++
++CREATE EXTENSION IF NOT EXISTS pgcrypto;
++
++CREATE TABLE IF NOT EXISTS project_auth_sessions (
++    id              SERIAL PRIMARY KEY,
++    project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
++    session_name    TEXT NOT NULL,   -- operator-chosen label, e.g. 'user_a' - never the credential itself
++    encrypted_value BYTEA NOT NULL,  -- pgp_sym_encrypt(cookie_or_token, passphrase)
++    session_type    TEXT NOT NULL DEFAULT 'cookie'
++                    CHECK (session_type IN ('cookie', 'bearer_token', 'header')),
++    header_name     TEXT,            -- only meaningful when session_type='header', e.g. 'Authorization'
++    notes           TEXT,            -- operator note (e.g. "free-tier account") - never the secret
++    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
++    last_used_at    TIMESTAMPTZ,
++    UNIQUE (project_id, session_name)
++);
+diff --git a/backend/app/test_auth_policy_and_sessions_manual.py b/backend/app/test_auth_policy_and_sessions_manual.py
+new file mode 100644
+index 0000000..7a0be30
+--- /dev/null
++++ b/backend/app/test_auth_policy_and_sessions_manual.py
+@@ -0,0 +1,123 @@
++"""
++Manual verification harness for auth_policy.py + auth_sessions.py.
++
++Unlike test_crlf_check_manual.py and test_agent_loop_manual.py, this one
++genuinely needs a real Postgres with pgcrypto - the thing being tested is
++server-side encryption, which cannot be meaningfully mocked. Point it at
++a real (ideally scratch/local) database via the same DATABASE_URL the app
++itself uses, plus a throwaway SWAS_SESSION_KEY:
++
++    export DATABASE_URL="postgresql://postgres:testpass@localhost/swas_test"
++    export SWAS_SESSION_KEY="some-throwaway-passphrase"
++    cd backend && python3 -m app.test_auth_policy_and_sessions_manual
++
++Requires auth_policy_migration.sql and auth_sessions_migration.sql to
++already be applied to that database (same as any other migration - see
++the "Verification method" note in the project handoff doc for how to
++replay the full schema history locally).
++
++This creates its own throwaway `projects` rows and cleans them up at the
++end regardless of pass/fail, so it's safe to run against a persistent
++dev database, not just a scratch one - though a scratch database is
++still recommended since it does exercise real INSERT/DELETE.
++
++What this proves, all against real asyncpg + real pgcrypto:
++  1. store_session refuses to run with no SWAS_SESSION_KEY set.
++  2. store_session is blocked on a project that isn't explicitly
++     'approved' in auth_policy - and confirms zero rows persist.
++  3. store -> get on an approved project roundtrips the exact original
++     credential value.
++  4. The raw stored bytes do not contain the plaintext credential.
++  5. Decrypting with the wrong passphrase raises rather than returning
++     garbage silently.
++  6. list_sessions returns metadata only (no secret material) and does
++     not require approval to call.
++"""
++import asyncio
++import os
++
++import asyncpg
++
++from . import auth_policy, auth_sessions
++
++
++async def main():
++    database_url = os.environ["DATABASE_URL"]
++    if not os.environ.get("SWAS_SESSION_KEY"):
++        raise SystemExit("Set SWAS_SESSION_KEY (any throwaway value) before running this harness.")
++
++    conn = await asyncpg.connect(database_url)
++    project_ids = []
++    try:
++        project_id = await conn.fetchval(
++            "INSERT INTO projects (name, platform) VALUES ('harness-test-program', 'hackerone') RETURNING id"
++        )
++        project_ids.append(project_id)
++
++        real_key = os.environ.pop("SWAS_SESSION_KEY")
++        try:
++            await auth_policy.set_policy(conn, project_id, "approved", "harness test", "harness")
++            try:
++                await auth_sessions.store_session(conn, project_id, "user_a", "session_cookie=abc123secret")
++                raise AssertionError("store_session proceeded with no SWAS_SESSION_KEY set!")
++            except RuntimeError:
++                print("PASS (1/6): store_session refuses to run with no encryption key set")
++        finally:
++            os.environ["SWAS_SESSION_KEY"] = real_key
++
++        project_id_2 = await conn.fetchval(
++            "INSERT INTO projects (name, platform) VALUES ('harness-unapproved-program', 'bugcrowd') RETURNING id"
++        )
++        project_ids.append(project_id_2)
++        try:
++            await auth_sessions.store_session(conn, project_id_2, "user_a", "should-not-persist")
++            raise AssertionError("store_session proceeded on an unapproved project!")
++        except auth_policy.AuthPolicyError:
++            print("PASS (2/6): store_session blocked on unapproved project")
++        count = await conn.fetchval(
++            "SELECT count(*) FROM project_auth_sessions WHERE project_id = $1", project_id_2
++        )
++        assert count == 0
++        print("PASS (2b/6): zero rows persisted for the blocked project")
++
++        await auth_sessions.store_session(
++            conn, project_id, "user_a", "session_cookie=abc123secret",
++            session_type="cookie", notes="free-tier account",
++        )
++        result = await auth_sessions.get_session(conn, project_id, "user_a")
++        assert result["credential_value"] == "session_cookie=abc123secret"
++        print("PASS (3/6): store -> get roundtrip returns the exact original credential")
++
++        raw = await conn.fetchval(
++            "SELECT encrypted_value FROM project_auth_sessions WHERE project_id = $1 AND session_name = 'user_a'",
++            project_id,
++        )
++        assert b"abc123secret" not in raw
++        print(f"PASS (4/6): raw stored bytes do not contain the plaintext credential (len={len(raw)} bytes)")
++
++        try:
++            await conn.fetchrow(
++                "SELECT pgp_sym_decrypt(encrypted_value, 'totally-wrong-key') FROM project_auth_sessions "
++                "WHERE project_id = $1 AND session_name = 'user_a'",
++                project_id,
++            )
++            raise AssertionError("decrypting with the wrong passphrase did not raise!")
++        except AssertionError:
++            raise
++        except Exception:
++            print("PASS (5/6): decrypting with the wrong passphrase correctly raises")
++
++        listing = await auth_sessions.list_sessions(conn, project_id)
++        assert "encrypted_value" not in listing[0] and "credential_value" not in listing[0]
++        assert listing[0]["session_name"] == "user_a"
++        print("PASS (6/6): list_sessions returns metadata only, no secret material")
++
++        print("\nALL PASS")
++    finally:
++        for pid in project_ids:
++            await conn.execute("DELETE FROM projects WHERE id = $1", pid)  # cascades to sessions/policy rows
++        await conn.close()
++
++
++if __name__ == "__main__":
++    asyncio.run(main())

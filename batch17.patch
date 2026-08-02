@@ -1,0 +1,324 @@
+diff --git a/backend/app/config.py b/backend/app/config.py
+new file mode 100644
+index 0000000..1a3855d
+--- /dev/null
++++ b/backend/app/config.py
+@@ -0,0 +1,120 @@
++"""
++config.py - startup config sanity checks.
++
++Why this exists: without it, a missing GEMINI_API_KEY or a nuclei binary
++that never got installed in the image doesn't surface until a scan is
++already 3 phases in and something throws `KeyError: 'GEMINI_API_KEY'` or
++`FileNotFoundError: nuclei` deep in a subprocess call - by then it's
++buried in scan logs, not obvious, and the container has looked "healthy"
++the whole time.
++
++This makes the container refuse to start with the SAME failure it would
++have hit later anyway - just immediate, named, and in one place, instead
++of surfacing piecemeal the first time each broken thing is actually used.
++"""
++
++import logging
++import os
++import shutil
++
++logger = logging.getLogger("swas.config")
++
++# env var -> why a scan breaks without it. Missing/blank/placeholder ->
++# hard fail, since every one of these WILL cause a real failure the
++# first time it's touched, not a degraded-but-working mode.
++_REQUIRED_ENV = {
++    "GEMINI_API_KEY": "every AI call (triage, scope parsing, logic_hunter, "
++                       "agent_loop, report drafting) needs this - without "
++                       "it every scan fails at the first AI step",
++    "POSTGRES_USER": "asyncpg's connection string is built from this",
++    "POSTGRES_PASSWORD": "asyncpg's connection string is built from this",
++    "POSTGRES_DB": "asyncpg's connection string is built from this",
++}
++
++# Values copied straight out of .env.example without being changed -
++# these LOOK set (non-empty) but are guaranteed wrong.
++_PLACEHOLDER_VALUES = {
++    "your_gemini_api_key_here",
++    "changeme_use_a_real_password",
++}
++
++# Recommended, not required - missing these degrades behavior (CORS
++# blocked, no notifications) rather than breaking scans outright, so
++# these only warn.
++_RECOMMENDED_ENV = {
++    "ALLOWED_ORIGINS": "frontend requests will be CORS-blocked without this",
++}
++
++# binary -> which pipeline phase breaks without it. Checked with
++# shutil.which so this catches "image build skipped installing a tool"
++# before the pipeline does, instead of a scan silently producing zero
++# findings from that phase forever.
++_REQUIRED_BINARIES = {
++    "subfinder": "recon phase (subdomain enumeration)",
++    "httpx-pd": "probe phase (live host detection)",
++    "nuclei": "scan phase (template-based vuln scanning)",
++    "arjun": "fuzz phase (parameter discovery)",
++    "ffuf": "fuzz phase (content/dir fuzzing)",
++    "dalfox": "verify phase (XSS confirmation)",
++    "sqlmap": "verify phase (SQLi confirmation)",
++}
++
++
++class ConfigError(RuntimeError):
++    """
++    Raised when a REQUIRED config item is missing/invalid. main.py's
++    lifespan lets this propagate out of startup, which means the
++    container never reaches "started" and its health check never
++    passes - orchestration (docker compose, k8s) surfaces this
++    immediately as a crash-looping container instead of one that looks
++    "up" but is quietly broken.
++    """
++
++
++def check_startup_config() -> list[str]:
++    """
++    Runs once at app startup (see main.py's lifespan). Returns a list of
++    warning strings for RECOMMENDED-but-missing items - caller logs
++    these but startup proceeds. Raises ConfigError immediately if
++    anything REQUIRED is missing, blank, or left at its .env.example
++    placeholder value; the exception message lists every problem found
++    in one pass rather than failing on the first one, so a fresh
++    install doesn't have to restart-fix-restart-fix through each error
++    one at a time.
++    """
++    errors: list[str] = []
++    warnings: list[str] = []
++
++    for var, why in _REQUIRED_ENV.items():
++        value = os.environ.get(var, "").strip()
++        if not value:
++            errors.append(f"{var} is not set - {why}")
++        elif value in _PLACEHOLDER_VALUES:
++            errors.append(f"{var} is still set to its .env.example placeholder value - {why}")
++
++    for binary, phase in _REQUIRED_BINARIES.items():
++        if shutil.which(binary) is None:
++            errors.append(f"binary '{binary}' not found on PATH - {phase} will fail every time it runs")
++
++    for var, why in _RECOMMENDED_ENV.items():
++        if not os.environ.get(var, "").strip():
++            warnings.append(f"{var} is not set - {why}")
++
++    webhook = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
++    if webhook and not (webhook.startswith("http://") or webhook.startswith("https://")):
++        warnings.append(
++            f"NOTIFY_WEBHOOK_URL is set but doesn't look like a URL "
++            f"('{webhook[:40]}...') - notifications will fail"
++        )
++
++    if errors:
++        for e in errors:
++            logger.error("STARTUP CONFIG ERROR: %s", e)
++        bullet_list = "\n  - ".join(errors)
++        raise ConfigError(
++            f"{len(errors)} required config item(s) missing/invalid - refusing to start:\n"
++            f"  - {bullet_list}\n"
++            f"Fix .env (or the image, for missing binaries) and restart."
++        )
++
++    return warnings
+diff --git a/backend/app/main.py b/backend/app/main.py
+index c540c03..1748834 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import FileResponse, StreamingResponse
+ import os
+ 
+-from . import auth_policy, auth_sessions, checkpoint, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
++from . import auth_policy, auth_sessions, checkpoint, config, database, gate, logic_hunter, pipeline, readiness, report_writer, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+ from .models import (
+     Project,
+     ProjectCreate,
+@@ -520,7 +520,15 @@ async def _queue_worker_loop() -> None:
+ 
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+-    # Runs once when the app starts up
++    # Runs once when the app starts up. Config sanity check comes FIRST,
++    # before even the DB connection - a missing GEMINI_API_KEY or a
++    # nuclei binary that never made it into the image should surface as
++    # one clear crash-on-boot, not a cryptic KeyError/FileNotFoundError
++    # three phases into someone's first real scan.
++    config_warnings = config.check_startup_config()
++    for w in config_warnings:
++        logger.warning("STARTUP CONFIG WARNING: %s", w)
++
+     await database.connect_db()
+ 
+     # Crash-safety check: if the app was restarted while scans were mid-
+diff --git a/backend/app/test_config_manual.py b/backend/app/test_config_manual.py
+new file mode 100644
+index 0000000..428af5d
+--- /dev/null
++++ b/backend/app/test_config_manual.py
+@@ -0,0 +1,162 @@
++"""
++Manual verification harness for config.check_startup_config().
++
++Not wired into a pytest suite (repo has none yet) - run directly from
++the `backend/` directory:
++    cd backend && python3 -m app.test_config_manual
++
++No DB/network needed - this only touches os.environ and PATH, both of
++which are fully controllable/restorable in-process, so a real
++subprocess env is exercised without needing mocks.
++"""
++import os
++import shutil
++import sys
++import tempfile
++
++from . import config
++
++_REQUIRED = {
++    "GEMINI_API_KEY": "real_key_value",
++    "POSTGRES_USER": "swas_user",
++    "POSTGRES_PASSWORD": "real_password",
++    "POSTGRES_DB": "swas_db",
++}
++
++
++def _clean_env():
++    for var in list(_REQUIRED) + ["ALLOWED_ORIGINS", "NOTIFY_WEBHOOK_URL"]:
++        os.environ.pop(var, None)
++
++
++def _make_fake_binaries(tmpdir: str, names: list[str]) -> str:
++    """Creates empty, executable stub files for each name in tmpdir and
++    returns tmpdir so it can be prepended to PATH."""
++    for name in names:
++        p = os.path.join(tmpdir, name)
++        with open(p, "w") as f:
++            f.write("#!/bin/sh\nexit 0\n")
++        os.chmod(p, 0o755)
++    return tmpdir
++
++
++def test_fails_when_gemini_key_missing():
++    _clean_env()
++    with tempfile.TemporaryDirectory() as tmp:
++        _make_fake_binaries(tmp, list(config._REQUIRED_BINARIES))
++        old_path = os.environ.get("PATH", "")
++        os.environ["PATH"] = f"{tmp}:{old_path}"
++        try:
++            for var, val in _REQUIRED.items():
++                if var != "GEMINI_API_KEY":
++                    os.environ[var] = val
++            try:
++                config.check_startup_config()
++                assert False, "expected ConfigError when GEMINI_API_KEY is unset"
++            except config.ConfigError as e:
++                assert "GEMINI_API_KEY" in str(e)
++                print("PASS: missing GEMINI_API_KEY raises ConfigError -", e)
++        finally:
++            os.environ["PATH"] = old_path
++    _clean_env()
++
++
++def test_fails_on_placeholder_value():
++    _clean_env()
++    with tempfile.TemporaryDirectory() as tmp:
++        _make_fake_binaries(tmp, list(config._REQUIRED_BINARIES))
++        old_path = os.environ.get("PATH", "")
++        os.environ["PATH"] = f"{tmp}:{old_path}"
++        try:
++            for var, val in _REQUIRED.items():
++                os.environ[var] = val
++            os.environ["GEMINI_API_KEY"] = "your_gemini_api_key_here"
++            try:
++                config.check_startup_config()
++                assert False, "expected ConfigError for placeholder value"
++            except config.ConfigError as e:
++                assert "placeholder" in str(e)
++                print("PASS: placeholder GEMINI_API_KEY raises ConfigError -", e)
++        finally:
++            os.environ["PATH"] = old_path
++    _clean_env()
++
++
++def test_fails_when_binary_missing():
++    _clean_env()
++    with tempfile.TemporaryDirectory() as tmp:
++        # deliberately skip nuclei
++        binaries = [b for b in config._REQUIRED_BINARIES if b != "nuclei"]
++        _make_fake_binaries(tmp, binaries)
++        old_path = os.environ.get("PATH", "")
++        os.environ["PATH"] = tmp  # exclusive PATH so real system nuclei (if any) can't hide the gap
++        try:
++            for var, val in _REQUIRED.items():
++                os.environ[var] = val
++            try:
++                config.check_startup_config()
++                assert False, "expected ConfigError when nuclei binary missing"
++            except config.ConfigError as e:
++                assert "nuclei" in str(e)
++                print("PASS: missing nuclei binary raises ConfigError -", e)
++        finally:
++            os.environ["PATH"] = old_path
++    _clean_env()
++
++
++def test_passes_and_warns_when_all_required_present():
++    _clean_env()
++    with tempfile.TemporaryDirectory() as tmp:
++        _make_fake_binaries(tmp, list(config._REQUIRED_BINARIES))
++        old_path = os.environ.get("PATH", "")
++        os.environ["PATH"] = f"{tmp}:{old_path}"
++        try:
++            for var, val in _REQUIRED.items():
++                os.environ[var] = val
++            # deliberately leave ALLOWED_ORIGINS unset -> should warn, not raise
++            warnings = config.check_startup_config()
++            assert any("ALLOWED_ORIGINS" in w for w in warnings)
++            print("PASS: all required present -> no raise, warns about ALLOWED_ORIGINS:", warnings)
++        finally:
++            os.environ["PATH"] = old_path
++    _clean_env()
++
++
++def test_warns_on_malformed_webhook_url():
++    _clean_env()
++    with tempfile.TemporaryDirectory() as tmp:
++        _make_fake_binaries(tmp, list(config._REQUIRED_BINARIES))
++        old_path = os.environ.get("PATH", "")
++        os.environ["PATH"] = f"{tmp}:{old_path}"
++        try:
++            for var, val in _REQUIRED.items():
++                os.environ[var] = val
++            os.environ["ALLOWED_ORIGINS"] = "http://localhost"
++            os.environ["NOTIFY_WEBHOOK_URL"] = "not-a-url"
++            warnings = config.check_startup_config()
++            assert any("NOTIFY_WEBHOOK_URL" in w for w in warnings)
++            print("PASS: malformed NOTIFY_WEBHOOK_URL warns:", warnings)
++        finally:
++            os.environ["PATH"] = old_path
++    _clean_env()
++
++
++if __name__ == "__main__":
++    tests = [
++        test_fails_when_gemini_key_missing,
++        test_fails_on_placeholder_value,
++        test_fails_when_binary_missing,
++        test_passes_and_warns_when_all_required_present,
++        test_warns_on_malformed_webhook_url,
++    ]
++    failed = 0
++    for t in tests:
++        try:
++            t()
++        except AssertionError as e:
++            failed += 1
++            print(f"FAIL: {t.__name__} - {e}")
++    if failed:
++        print(f"\n{failed}/{len(tests)} test(s) FAILED")
++        sys.exit(1)
++    print(f"\nAll {len(tests)} test(s) passed")

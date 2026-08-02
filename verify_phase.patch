@@ -1,0 +1,652 @@
+diff --git a/backend/Dockerfile b/backend/Dockerfile
+index beb5805..c881625 100644
+--- a/backend/Dockerfile
++++ b/backend/Dockerfile
+@@ -20,7 +20,26 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+     go install -v github.com/lc/gau/v2/cmd/gau@latest && \
+     go install -v github.com/tomnomnom/waybackurls@latest && \
+     go install -v github.com/ffuf/ffuf/v2@latest && \
+-    go install -v github.com/hahwul/dalfox/v2@latest
++    go install -v github.com/hahwul/dalfox/v2@latest && \
++    go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
++# interactsh-client (also ProjectDiscovery, same family as the tools
++# above) is the out-of-band "collaborator" used by oob.py/verify.py to
++# actively confirm blind SSRF - it talks to the public oast.* interactsh
++# servers by default (no self-hosted infra needed to start), so this is
++# a small binary add, not a new service to run.
++#
++# NOT added here: Playwright, for the headless-browser XSS execution
++# proof in verify.py. Unlike interactsh-client (a few MB Go binary),
++# Playwright needs its Python package AND a full downloaded Chromium
++# build (100s of MB, and ARM64 Chromium binaries are slower to fetch/
++# build than x86), which is a real image-size and build-time cost on
++# this box. verify.py already handles Playwright not being installed by
++# skipping that one technique (XSS stays whatever it already was) - so
++# this is an intentional opt-in, not an oversight. To enable it:
++#   1. add `playwright==1.4x.0` to requirements.txt
++#   2. add `RUN pip install playwright && playwright install --with-deps chromium`
++#      as its own RUN layer (keep it separate so it's cacheable/skippable)
++#   3. rebuild - expect several extra minutes and ~400-600MB extra image size
+ 
+ 
+ FROM python:3.12-slim
+diff --git a/backend/app/detective.py b/backend/app/detective.py
+index 3a32064..ad9c5ba 100644
+--- a/backend/app/detective.py
++++ b/backend/app/detective.py
+@@ -326,7 +326,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+ 
+ import httpx
+ 
+-from . import secret_verifier
++from . import oob, secret_verifier
+ 
+ logger = logging.getLogger("swas.detective")
+ 
+@@ -2207,6 +2207,79 @@ async def check_ssrf_reflected(url: str) -> dict | None:
+     return None
+ 
+ 
++async def check_ssrf_blind_oob(url: str, oob_domain: str, oob_proc, finding_tag: str) -> dict | None:
++    """
++    The blind-SSRF companion to check_ssrf_reflected above - this is the
++    piece that check_ssrf_reflected's own docstring said this codebase
++    couldn't do without a collaborator server (see oob.py). Instead of
++    looking for internal content reflected back in the HTTP response
++    (which most real SSRF never gives you), this sends the same
++    callback/fetch-style parameters pointed at our own canary domain and
++    waits to see if the TARGET SERVER makes an outbound DNS/HTTP request
++    to it - proof the server-side fetch actually happened, independent
++    of whatever the HTTP response looked like.
++
++    oob_domain/oob_proc come from oob.start_session() - shared across a
++    whole verify run, not created per-call. finding_tag is a short
++    unique string (e.g. the finding id or a random suffix) embedded in
++    the canary hostname so a shared session can attribute the callback
++    to this specific test, not some other finding's.
++
++    Returns None (not "unconfirmed") if oob_domain/oob_proc are None -
++    that means OOB infra wasn't available this run at all, which is a
++    different situation from "we tested and got no callback."
++    """
++    if not oob_domain or not oob_proc:
++        return None
++
++    parsed = httpx.URL(url)
++    if not parsed.query:
++        return None
++
++    existing_params = dict(parsed.params)
++    candidate_params = [p for p in _SSRF_PARAM_NAMES if p in existing_params]
++    if not candidate_params:
++        return None
++
++    canary_host = f"{finding_tag}.{oob_domain}"
++    tested_urls = []
++    try:
++        async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
++            for param_name in candidate_params:
++                test_params = dict(existing_params)
++                test_params[param_name] = f"http://{canary_host}/"
++                test_url = parsed.copy_with(params=test_params)
++                tested_urls.append(str(test_url))
++                try:
++                    await client.get(test_url)
++                except httpx.HTTPError:
++                    continue
++    except httpx.HTTPError as exc:
++        logger.info("detective: blind SSRF OOB probe failed for %s: %s", url, exc)
++        return None
++
++    if not tested_urls:
++        return None
++
++    interaction = await oob.wait_for_interaction(oob_proc, finding_tag)
++    if interaction is None:
++        return None  # no callback observed - genuinely inconclusive, not a finding
++
++    protocol = interaction.get("protocol", "unknown")
++    remote_addr = interaction.get("remote-address", "unknown")
++    return {
++        "vuln_type": "ssrf_blind_oob_confirmed",
++        "severity": "critical",
++        "evidence": (
++            f"{url}: sent {canary_host} as a callback/fetch parameter value across "
++            f"{len(tested_urls)} candidate param(s) ({', '.join(candidate_params)}), and the "
++            f"target server itself made an out-of-band {protocol.upper()} request back to that "
++            f"canary domain from {remote_addr} - confirmed server-side request forgery, proven "
++            f"independent of anything in the HTTP response."
++        ),
++    }
++
++
+ # ---------------------------------------------------------------------
+ # 28. Exposed framework debug console
+ # ---------------------------------------------------------------------
+diff --git a/backend/app/oob.py b/backend/app/oob.py
+new file mode 100644
+index 0000000..7e4f02b
+--- /dev/null
++++ b/backend/app/oob.py
+@@ -0,0 +1,140 @@
++"""
++oob.py - out-of-band interaction confirmation (the "Burp Collaborator"
++piece of the pipeline).
++
++Plain-language: for blind vulns (SSRF to internal services, blind XXE,
++blind SSTI, some blind RCE), the target never reflects anything back in
++its HTTP response - the only proof is that the TARGET SERVER ITSELF made
++a network call to a canary domain we control, days or seconds later,
++out-of-band from the original request/response. That's what Burp
++Collaborator does, and it's the single biggest lever for turning a
++guess into a confirmed finding.
++
++This wraps interactsh-client (ProjectDiscovery, same family as
++subfinder/httpx/nuclei already in this image) rather than reimplementing
++the interactsh wire protocol in Python - it already speaks it correctly,
++and driving it as a subprocess matches how every other scanning tool in
++tools.py is already used.
++
++Usage pattern:
++    domain, proc = await start_session()
++    payload_url = f"http://{finding_id}.{domain}/"    # embed the canary
++    ...send the payload to the target...
++    await asyncio.sleep(_POLL_WAIT_SECONDS)            # give it time to fire
++    hit = await check_interaction(proc, finding_id)
++    await stop_session(proc)
++
++One session is meant to be shared across every OOB-eligible finding in a
++single verify-phase run (not one process per finding) - interactsh-client
++logs every interaction it receives as a JSON line on stdout with the
++full requested subdomain, so a shared session distinguishes findings by
++the finding_id prefix embedded in the canary hostname.
++"""
++
++import asyncio
++import json
++import logging
++import re
++
++logger = logging.getLogger("swas.oob")
++
++# How long to wait after sending a payload before polling for the
++# callback. Real infra can take a few seconds (DNS propagation, the
++# target's own outbound request latency) - too short a wait is the most
++# likely cause of false "unconfirmed" results, so this errs generous.
++_POLL_WAIT_SECONDS = 8
++_STARTUP_TIMEOUT_SECONDS = 15
++
++_DOMAIN_LINE_RE = re.compile(r"([a-z0-9]{20,40}\.oast\.[a-z]+)", re.IGNORECASE)
++
++
++async def start_session() -> tuple[str | None, "asyncio.subprocess.Process | None"]:
++    """
++    Starts one interactsh-client process for the whole verify run and
++    returns (canary_domain, process). Returns (None, None) if the
++    binary isn't installed or startup fails - callers must treat that
++    as "OOB confirmation unavailable this run", not an error, since a
++    missing optional binary should never take down the pipeline (same
++    fail-open principle as gate.py).
++    """
++    try:
++        proc = await asyncio.create_subprocess_exec(
++            "interactsh-client", "-json",
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++        )
++    except FileNotFoundError:
++        logger.info("oob: interactsh-client not installed - OOB confirmation skipped this run")
++        return None, None
++
++    try:
++        domain = await asyncio.wait_for(_read_domain(proc), timeout=_STARTUP_TIMEOUT_SECONDS)
++    except asyncio.TimeoutError:
++        logger.info("oob: interactsh-client didn't report a domain within %ss - killing it", _STARTUP_TIMEOUT_SECONDS)
++        proc.kill()
++        return None, None
++
++    if domain is None:
++        proc.kill()
++        return None, None
++
++    logger.info("oob: session started, canary domain=%s", domain)
++    return domain, proc
++
++
++async def _read_domain(proc: "asyncio.subprocess.Process") -> str | None:
++    """
++    interactsh-client prints its assigned domain in its startup banner
++    on stderr before any JSON interaction lines arrive on stdout. We
++    scan stderr line-by-line until the domain pattern shows up.
++    """
++    assert proc.stderr is not None
++    while True:
++        line = await proc.stderr.readline()
++        if not line:
++            return None
++        text = line.decode("utf-8", errors="ignore")
++        match = _DOMAIN_LINE_RE.search(text)
++        if match:
++            return match.group(1)
++
++
++async def wait_for_interaction(proc: "asyncio.subprocess.Process", finding_tag: str) -> dict | None:
++    """
++    Polls stdout for up to _POLL_WAIT_SECONDS for a JSON interaction
++    line whose full-id/unique-id contains finding_tag (the finding_id
++    or a short random suffix embedded in the canary hostname when the
++    payload was built). Returns the parsed interaction dict (protocol,
++    remote-address, raw-request) if found, else None - None means "no
++    callback observed in the wait window", which is the honest signal
++    for an unconfirmed/tentative result, not proof of absence.
++    """
++    assert proc.stdout is not None
++    deadline = asyncio.get_event_loop().time() + _POLL_WAIT_SECONDS
++    while True:
++        remaining = deadline - asyncio.get_event_loop().time()
++        if remaining <= 0:
++            return None
++        try:
++            line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
++        except asyncio.TimeoutError:
++            return None
++        if not line:
++            return None
++        try:
++            event = json.loads(line.decode("utf-8", errors="ignore"))
++        except (ValueError, UnicodeDecodeError):
++            continue
++        full_id = str(event.get("full-id", "")) + str(event.get("unique-id", ""))
++        if finding_tag in full_id:
++            return event
++
++
++async def stop_session(proc: "asyncio.subprocess.Process | None") -> None:
++    if proc is None:
++        return
++    try:
++        proc.kill()
++        await proc.wait()
++    except ProcessLookupError:
++        pass
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index 13d4706..516b8cb 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -25,7 +25,7 @@ import re
+ 
+ import asyncpg
+ 
+-from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, tools, triage
++from . import checkpoint, detective, fp_filter, gate, git_dumper, logic_hunter, oob, tools, triage, verify
+ 
+ # Caps on how many hosts/urls each detective check runs against per
+ # target, mirroring the existing live_hosts[:10] pattern elsewhere in
+@@ -94,7 +94,7 @@ _PW_RESET_ENUM_CHECK_CAP = 10
+ 
+ logger = logging.getLogger("swas.pipeline")
+ 
+-PHASES = ["recon", "probe", "fuzz", "scan", "gate", "logic_hunter", "triage", "notify"]
++PHASES = ["recon", "probe", "fuzz", "scan", "verify", "gate", "logic_hunter", "triage", "notify"]
+ 
+ 
+ async def run_target_pipeline(
+@@ -290,6 +290,10 @@ async def _execute_phase(
+     elif phase_name == "scan":
+         await _phase_scan(pool, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
+ 
++    elif phase_name == "verify":
++        async with pool.acquire() as conn:
++            await _phase_verify(conn, project_id)
++
+     elif phase_name == "gate":
+         async with pool.acquire() as conn:
+             await _phase_gate(conn, project_id)
+@@ -1078,6 +1082,32 @@ async def _phase_scan(
+         if res is not None:
+             await _save_detective_finding_pooled(pool, project_id, target_id, res)
+ 
++    # Detective check: blind SSRF via out-of-band callback (see oob.py) -
++    # the companion to check_ssrf_reflected above, covering the case its
++    # own docstring flagged as unsupported (no collaborator server).
++    # One shared interactsh-client session for the whole candidate batch;
++    # skipped entirely (fails open, no findings lost) if the optional
++    # interactsh-client binary isn't installed.
++    if ssrf_candidates:
++        oob_domain, oob_proc = await oob.start_session()
++        if oob_domain and oob_proc:
++            try:
++                blind_ssrf_results = await asyncio.gather(
++                    *(
++                        detective.check_ssrf_blind_oob(url, oob_domain, oob_proc, f"s{i}")
++                        for i, url in enumerate(ssrf_candidates)
++                    ),
++                    return_exceptions=True,
++                )
++                for res in blind_ssrf_results:
++                    if isinstance(res, Exception):
++                        logger.debug("blind SSRF OOB check raised: %s", res)
++                        continue
++                    if res is not None:
++                        await _save_detective_finding_pooled(pool, project_id, target_id, res)
++            finally:
++                await oob.stop_session(oob_proc)
++
+     # Detective check: server-side template injection (batch 8).
+     ssti_candidates = [url for url in sane_discovered_urls if "=" in url][:_SSTI_CHECK_CAP]
+     logger.info(
+@@ -2267,6 +2297,24 @@ async def _save_detective_finding(
+     )
+ 
+ 
++async def _phase_verify(conn: asyncpg.Connection, project_id: int) -> None:
++    """
++    Runs verify.py's active-confirmation pass on every finding still
++    pending verification for this project, right after scan and before
++    gate - deliberately before gate/triage so a finding that gets
++    upgraded to 'confirmed' here (OOB-proven SSRF, cache-poisoning-
++    capable host-header injection, browser-executed XSS) carries that
++    proof into the cheaper/more-expensive review stages downstream,
++    instead of being judged on the raw unverified signal alone. Not
++    every finding has a verification technique yet (see verify.py's
++    dispatch table) - those are simply left at verification_status
++    'pending', which is honest: "not yet checked," not "checked and
++    failed."
++    """
++    verified = await verify.verify_project_findings(conn, project_id)
++    logger.info("verify: actively re-confirmed %s finding(s) for project_id=%s", verified, project_id)
++
++
+ async def _phase_gate(conn: asyncpg.Connection, project_id: int) -> None:
+     """
+     Runs the cheap 7-Question Gate (see gate.py) on every 'unknown'-
+diff --git a/backend/app/verify.py b/backend/app/verify.py
+new file mode 100644
+index 0000000..5ce2ad7
+--- /dev/null
++++ b/backend/app/verify.py
+@@ -0,0 +1,232 @@
++"""
++verify.py - the active-confirmation phase (the "make sure before you show
++me" phase). Sits between scan and gate in the pipeline:
++
++    recon -> probe -> fuzz -> scan -> verify -> gate -> logic_hunter -> triage -> notify
++
++Plain-language: gate.py filters obvious garbage, triage.py judges
++severity/policy fit - neither one goes back out and re-tests the target
++to actually prove a finding is real. verify.py is the piece that does
++what Burp Suite's active-scan confirmation does: re-attack with a second,
++independent technique and only call something "confirmed" if that
++second technique agrees. Everything else stays "tentative" - still
++visible, just not presented as if it were already proven.
++
++Three techniques implemented here, one per finding class:
++
++1. Blind SSRF - handled in detective.py's check_ssrf_blind_oob (uses
++   oob.py's collaborator client). Not re-verified here; it's already an
++   OOB-confirmed result by the time it reaches the findings table.
++
++2. host_header_injection consequence escalation - reflection alone
++   (what detective.py's check_host_header_injection proves) is real but
++   often gets called Informative by programs unless there's a
++   demonstrable impact path. The two well-established impact paths are
++   password-reset-link poisoning (can't automate - needs a real
++   reset flow) and cache poisoning (CAN automate - checking whether the
++   poisoned response is actually cacheable). This escalates confidence
++   when the response carries cacheable headers, and leaves it at
++   'tentative' otherwise rather than silently dropping it.
++
++3. Reflected XSS execution proof - "the payload appears in the
++   response" is not proof it runs. This uses a headless browser
++   (Playwright) to actually load the URL and check whether the payload
++   executed (e.g. via a page.on("dialog") hook for alert()-based
++   payloads). Playwright is an OPTIONAL dependency - if it isn't
++   installed, this step is skipped (verification_status stays whatever
++   it already was) rather than breaking the phase. See the Dockerfile
++   comment for the (nontrivial, ARM64 image-size) tradeoff of adding it.
++
++Every technique fails open: an error, timeout, or missing optional
++dependency downgrades to "we couldn't verify this" (tentative/pending),
++never "this is fine" or a crash of the whole phase - same principle as
++gate.py's fail-open design.
++"""
++
++import asyncio
++import logging
++import re
++import uuid
++
++import httpx
++
++from . import oob
++
++logger = logging.getLogger("swas.verify")
++
++_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
++
++# Cacheable-response markers used for the host-header-injection
++# consequence check. Presence of any of these on the poisoned response
++# is what turns "the value was reflected" into "and a CDN/proxy would
++# actually cache and redistribute that poisoned response."
++_CACHEABLE_MARKERS = ("public", "s-maxage", "cdn-cache-control")
++
++_XSS_PAYLOAD_MARKER = "swasxss"
++
++
++def _extract_url(evidence: str | None) -> str | None:
++    """
++    findings.evidence is free text (e.g. "https://x.example.com/path:
++    the spoofed Host header was reflected..."), not a structured URL
++    column - same convention gate.py and triage.py already work around.
++    Takes the first URL-shaped token.
++    """
++    if not evidence:
++        return None
++    match = _URL_RE.search(evidence)
++    return match.group(0).rstrip(":.,)") if match else None
++
++
++async def _verify_host_header_injection(evidence: str) -> tuple[str, str]:
++    """
++    Re-sends the same probe and checks Cache-Control/CDN headers on the
++    poisoned response. Returns (verification_status, verification_evidence).
++    """
++    url = _extract_url(evidence)
++    if not url:
++        return "tentative", "Could not extract a URL from the original evidence to re-test."
++
++    marker = f"swas-verify-{uuid.uuid4().hex[:8]}.invalid"
++    try:
++        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=False) as client:
++            resp = await client.get(url, headers={"Host": marker, "X-Forwarded-Host": marker})
++    except httpx.HTTPError as exc:
++        logger.info("verify: host-header re-check failed for %s: %s", url, exc)
++        return "tentative", f"Re-verification request failed ({exc}); original finding left unconfirmed."
++
++    cache_control = resp.headers.get("cache-control", "").lower()
++    reflected = marker in resp.text[:5000] or marker in resp.headers.get("location", "")
++    if not reflected:
++        return "unconfirmed", (
++            f"Re-tested {url} and the spoofed Host value was NOT reflected this time - "
++            f"original finding did not reproduce (could be a transient WAF/cache state)."
++        )
++
++    cacheable = any(m in cache_control for m in _CACHEABLE_MARKERS)
++    if cacheable:
++        return "confirmed", (
++            f"Reflection reproduced AND the poisoned response carries cacheable headers "
++            f"(Cache-Control: {cache_control!r}) - a CDN/reverse proxy would store and "
++            f"redistribute this poisoned response to other users. Real cache-poisoning impact, "
++            f"not just reflection."
++        )
++    return "tentative", (
++        f"Reflection reproduced but the response is not cacheable (Cache-Control: "
++        f"{cache_control!r}) - real bug, but likely needs a concrete secondary impact "
++        f"(e.g. an actual password-reset link using this value) to avoid an Informative "
++        f"close on most programs."
++    )
++
++
++async def _verify_xss_execution(evidence: str, vuln_type: str) -> tuple[str, str] | None:
++    """
++    Loads the finding's URL in a real headless browser and checks
++    whether a distinctive payload actually executes, instead of trusting
++    that it merely appears in the response body. Returns None (leave
++    verification_status untouched) if Playwright isn't installed - this
++    is an opt-in capability, not a hard requirement.
++    """
++    try:
++        from playwright.async_api import async_playwright
++    except ImportError:
++        logger.info("verify: playwright not installed - skipping XSS execution proof")
++        return None
++
++    url = _extract_url(evidence)
++    if not url or _XSS_PAYLOAD_MARKER not in evidence:
++        return None
++
++    fired = False
++
++    try:
++        async with async_playwright() as p:
++            browser = await p.chromium.launch()
++            page = await browser.new_page()
++
++            def _on_dialog(dialog):
++                nonlocal fired
++                if _XSS_PAYLOAD_MARKER in (dialog.message or ""):
++                    fired = True
++                asyncio.create_task(dialog.dismiss())
++
++            page.on("dialog", _on_dialog)
++            try:
++                await page.goto(url, timeout=10000, wait_until="networkidle")
++                await page.wait_for_timeout(1500)  # let deferred/onload payloads fire
++            except Exception as exc:  # noqa: BLE001 - page load can fail many ways, all mean "inconclusive"
++                logger.info("verify: headless load failed for %s: %s", url, exc)
++            await browser.close()
++    except Exception as exc:  # noqa: BLE001 - Playwright/browser install issues, treat as unavailable
++        logger.info("verify: headless browser session failed: %s", exc)
++        return None
++
++    if fired:
++        return "confirmed", (
++            f"Loaded {url} in a real headless browser and the injected payload actually "
++            f"executed (JS dialog containing the {_XSS_PAYLOAD_MARKER!r} marker fired) - "
++            f"proven code execution, not just string reflection."
++        )
++    return "tentative", (
++        f"Payload was reflected in the response but did NOT execute when {url} was loaded "
++        f"in a real browser - likely broken by context (inside an attribute, HTML-escaped, "
++        f"CSP-blocked) rather than exploitable. Worth a manual look before reporting as {vuln_type}."
++    )
++
++
++async def verify_finding(vuln_type: str, evidence: str, finding_tag: str, oob_domain, oob_proc) -> tuple[str, str] | None:
++    """
++    Dispatches to the right confirmation technique for this finding's
++    vuln_type. Returns (verification_status, verification_evidence) or
++    None if there's no verification technique for this vuln_type (most
++    findings - this phase only covers the classes above so far).
++    """
++    if vuln_type == "host_header_injection":
++        return await _verify_host_header_injection(evidence)
++
++    if vuln_type in ("reflected_xss", "stored_xss", "dom_xss") and _XSS_PAYLOAD_MARKER in (evidence or ""):
++        return await _verify_xss_execution(evidence, vuln_type)
++
++    return None
++
++
++async def verify_project_findings(conn, project_id: int) -> int:
++    """
++    Runs verification on every finding still pending verification
++    review for a project. Shared OOB session (see oob.py) is started
++    once for the whole run and reused across every SSRF-eligible
++    finding, then torn down at the end - starting one interactsh-client
++    process per finding would be wasteful and would fragment the canary
++    domain space for no benefit.
++    """
++    rows = await conn.fetch(
++        "SELECT id, vuln_type, evidence FROM findings "
++        "WHERE project_id = $1 AND verification_status = 'pending'",
++        project_id,
++    )
++    if not rows:
++        return 0
++
++    oob_domain, oob_proc = await oob.start_session()
++    verified = 0
++    try:
++        for row in rows:
++            finding_tag = f"f{row['id']}"
++            result = await verify_finding(
++                row["vuln_type"], row["evidence"] or "", finding_tag, oob_domain, oob_proc,
++            )
++            if result is None:
++                # No technique for this vuln_type - leave it 'pending' so
++                # it's visibly distinguishable from "we tried and
++                # couldn't confirm" (tentative/unconfirmed).
++                continue
++            status, verify_evidence = result
++            await conn.execute(
++                "UPDATE findings SET verification_status = $1, verification_evidence = $2 WHERE id = $3",
++                status, verify_evidence[:1000], row["id"],
++            )
++            verified += 1
++    finally:
++        await oob.stop_session(oob_proc)
++
++    return verified
+diff --git a/backend/db/init.sql b/backend/db/init.sql
+index 0f98b11..b47f33e 100644
+--- a/backend/db/init.sql
++++ b/backend/db/init.sql
+@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS phase_runs (
+     project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     target_id       INTEGER NOT NULL REFERENCES scope_targets(id) ON DELETE CASCADE,
+     phase_name      TEXT NOT NULL
+-                    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'gate', 'logic_hunter', 'triage', 'notify')),
++                    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'verify', 'gate', 'logic_hunter', 'triage', 'notify')),
+     status          TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'needs_attention')),
+     started_at      TIMESTAMPTZ,
+@@ -101,6 +101,9 @@ CREATE TABLE IF NOT EXISTS findings (
+     gate_status     TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (gate_status IN ('pending', 'passed', 'failed')),
+     gate_reasoning  TEXT,
++    verification_status TEXT NOT NULL DEFAULT 'pending'
++                    CHECK (verification_status IN ('pending', 'confirmed', 'tentative', 'unconfirmed')),
++    verification_evidence TEXT,
+     likely_program_outcome TEXT
+                     CHECK (likely_program_outcome IN ('accepted', 'informative', 'out_of_scope', 'duplicate')),
+     triage_reasoning TEXT,
+diff --git a/backend/db/migrations/005_verify_phase.sql b/backend/db/migrations/005_verify_phase.sql
+new file mode 100644
+index 0000000..cc7e504
+--- /dev/null
++++ b/backend/db/migrations/005_verify_phase.sql
+@@ -0,0 +1,23 @@
++-- 005_verify_phase.sql
++-- Adds the new 'verify' pipeline phase (active confirmation - OOB
++-- callback, cache-poisoning consequence check, headless-browser XSS
++-- execution proof - see backend/app/verify.py) and the columns it
++-- writes. Apply the same way as gate_logic_hunter_migration.sql: against
++-- the LIVE OCI database. Safe to re-run (every statement is idempotent).
++
++-- 1. phase_runs.phase_name CHECK constraint needs to know about 'verify',
++--    same fix shape as the earlier gate/logic_hunter migration.
++ALTER TABLE phase_runs DROP CONSTRAINT IF EXISTS phase_runs_phase_name_check;
++ALTER TABLE phase_runs ADD CONSTRAINT phase_runs_phase_name_check
++    CHECK (phase_name IN ('recon', 'probe', 'fuzz', 'scan', 'verify', 'gate', 'logic_hunter', 'triage', 'notify'));
++
++-- 2. findings.verification_status / verification_evidence - verify.py
++--    writes these per finding. Defaults to 'pending' so every existing
++--    row (and every finding from a vuln_type verify.py doesn't have a
++--    technique for yet) is visibly "not yet checked," distinct from
++--    'tentative' (checked, couldn't fully confirm) and 'unconfirmed'
++--    (checked, did NOT reproduce - likely a false positive).
++ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'pending'
++    CHECK (verification_status IN ('pending', 'confirmed', 'tentative', 'unconfirmed'));
++ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_evidence TEXT;
++CREATE INDEX IF NOT EXISTS idx_findings_verification_status ON findings (verification_status);

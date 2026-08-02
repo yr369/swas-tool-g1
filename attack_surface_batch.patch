@@ -1,0 +1,377 @@
+diff --git a/backend/app/attack_surface_model.sql b/backend/app/attack_surface_model.sql
+new file mode 100644
+index 0000000..8d3e4c7
+--- /dev/null
++++ b/backend/app/attack_surface_model.sql
+@@ -0,0 +1,68 @@
++-- attack_surface_model.sql
++--
++-- Plain-language: every scan currently rediscovers a target's endpoints,
++-- tech stack, and parameters from scratch, holds them in plain Python
++-- lists for the duration of that one scan run, and throws all of it away
++-- the moment the scan finishes - only the subdomain list gets cached
++-- (scope_targets.recon_cache), and even that's a flat JSON blob with no
++-- structure. Findings get saved, but the underlying MAP of the target
++-- (what endpoints exist, what auth they need, what params they take,
++-- what tech runs where) never persists anywhere queryable.
++--
++-- This migration adds that missing layer: one row per distinct URL ever
++-- seen on a target, updated (not replaced) on every scan, so the surface
++-- model actually accumulates knowledge over time instead of starting
++-- from zero every run. This is the foundation the agentic investigation
++-- loop (next phase) will read from and write into.
++--
++-- Apply the same way as prior migrations:
++--   docker compose exec -T postgres bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < attack_surface_model.sql
++
++CREATE TABLE IF NOT EXISTS attack_surface_endpoints (
++    id                SERIAL PRIMARY KEY,
++    target_id         INTEGER NOT NULL REFERENCES scope_targets(id) ON DELETE CASCADE,
++    url               TEXT NOT NULL,
++    first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
++    last_seen_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
++    times_seen        INTEGER NOT NULL DEFAULT 1,
++    last_status_code  INTEGER,
++    -- NULL = never confirmed live (e.g. gau/wayback historical URL that
++    -- hasn't been probed), true/false = confirmed via httpx this scan
++    -- or a prior one.
++    is_live           BOOLEAN,
++    tech_stack        JSONB NOT NULL DEFAULT '[]'::jsonb,
++    params            JSONB NOT NULL DEFAULT '[]'::jsonb,
++    -- Which tools/phases have observed this URL - httpx, gau,
++    -- waybackurls, arjun, detective, etc. Union'd across scans.
++    sources           JSONB NOT NULL DEFAULT '[]'::jsonb,
++    -- NULL = unknown/not yet determined. This is a cheap heuristic from
++    -- status codes seen during probing (401/403 => likely true), not a
++    -- confirmed test - real confirmation is the authenticated-testing
++    -- phase's job.
++    requires_auth     BOOLEAN,
++    auth_evidence     TEXT,
++    notes             TEXT,
++    UNIQUE (target_id, url)
++);
++
++CREATE INDEX IF NOT EXISTS idx_surface_endpoints_target ON attack_surface_endpoints (target_id);
++CREATE INDEX IF NOT EXISTS idx_surface_endpoints_live ON attack_surface_endpoints (is_live);
++CREATE INDEX IF NOT EXISTS idx_surface_endpoints_auth ON attack_surface_endpoints (requires_auth);
++
++-- Per-target rollup so logic_hunter (and later phases) can pull one
++-- cheap summary row instead of scanning every endpoint row every time.
++CREATE OR REPLACE VIEW attack_surface_summary AS
++SELECT
++    target_id,
++    COUNT(*) AS total_endpoints,
++    COUNT(*) FILTER (WHERE is_live) AS live_endpoints,
++    COUNT(*) FILTER (WHERE requires_auth = true) AS auth_required_endpoints,
++    COUNT(*) FILTER (WHERE requires_auth = false) AS no_auth_endpoints,
++    (
++        SELECT jsonb_agg(DISTINCT tech)
++        FROM attack_surface_endpoints e2, jsonb_array_elements_text(e2.tech_stack) AS tech
++        WHERE e2.target_id = attack_surface_endpoints.target_id
++    ) AS tech_stack_union,
++    MAX(last_seen_at) AS last_scanned_at
++FROM attack_surface_endpoints
++GROUP BY target_id;
+diff --git a/backend/app/logic_hunter.py b/backend/app/logic_hunter.py
+index d7f6a70..0f59950 100644
+--- a/backend/app/logic_hunter.py
++++ b/backend/app/logic_hunter.py
+@@ -55,6 +55,11 @@ evidence combination suggests is worth a human manually testing.
+ 
+ Target: {target_name} ({target_type})
+ 
++What we know about this target's broader attack surface (from recon across all scans, \
++not just this cluster's findings) - use this for context like "most endpoints need auth \
++but this one doesn't", not as findings to repeat:
++{surface_context}
++
+ Findings already recorded on this target:
+ {findings_block}
+ 
+@@ -184,11 +189,17 @@ def _parse_hunter_response(text: str) -> dict:
+     return json.loads(text)
+ 
+ 
+-async def hunt_cluster(target_name: str, target_type: str | None, members: list[dict]) -> dict:
++async def hunt_cluster(target_name: str, target_type: str | None, members: list[dict], surface_summary: dict | None = None) -> dict:
+     """
+     members: rows with tool_name, vuln_type, severity, evidence, source
+     (severity may still be 'unknown' - logic_hunter runs before triage,
+     so it's reasoning over raw findings, not triaged ones).
++
++    surface_summary: one row from attack_surface_summary for this
++    target, or None if the surface model has no data yet (a brand new
++    target on its first scan, or scans predating this feature) - in
++    that case the prompt says so plainly rather than silently omitting
++    the section, so the model doesn't need to guess why it's missing.
+     """
+     client = _get_client()
+     findings_block = "\n".join(
+@@ -196,8 +207,20 @@ async def hunt_cluster(target_name: str, target_type: str | None, members: list[
+         f"{(m['evidence'] or '')[:1600]}"
+         for m in members
+     )
++    if surface_summary and surface_summary.get("total_endpoints"):
++        surface_context = (
++            f"{surface_summary['total_endpoints']} endpoints seen total, "
++            f"{surface_summary.get('live_endpoints') or 0} confirmed live. "
++            f"Of endpoints with a known auth requirement: "
++            f"{surface_summary.get('auth_required_endpoints') or 0} require auth, "
++            f"{surface_summary.get('no_auth_endpoints') or 0} don't. "
++            f"Tech stack seen across the target: {surface_summary.get('tech_stack_union') or 'unknown'}."
++        )
++    else:
++        surface_context = "No attack-surface data recorded yet for this target - reason from the findings below alone."
+     prompt = _LOGIC_HUNTER_PROMPT.format(
+-        target_name=target_name, target_type=target_type or "website", findings_block=findings_block,
++        target_name=target_name, target_type=target_type or "website",
++        surface_context=surface_context, findings_block=findings_block,
+     )
+ 
+     try:
+@@ -277,8 +300,15 @@ async def hunt_project(conn, project_id: int) -> int:
+             row["cluster_id"],
+         )
+ 
++        surface_summary = await conn.fetchrow(
++            "SELECT * FROM attack_surface_summary WHERE target_id = $1", row["target_id"],
++        )
++
+         if members:
+-            result = await hunt_cluster(row["target_name"], row["target_type"], [dict(m) for m in members])
++            result = await hunt_cluster(
++                row["target_name"], row["target_type"], [dict(m) for m in members],
++                dict(surface_summary) if surface_summary else None,
++            )
+             if result.get("has_hypothesis") and result.get("hypothesis"):
+                 finding_id = await _save_hypothesis(conn, project_id, row["target_id"], row["cluster_id"], result)
+                 hunted += 1
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index daeed6e..772c016 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -282,10 +282,10 @@ async def _execute_phase(
+         await _phase_recon(pool, project_id, target_id, target, discovered_subdomains)
+ 
+     elif phase_name == "probe":
+-        await _phase_probe(target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
++        await _phase_probe(pool, target_id, target, discovered_subdomains, live_hosts, discovered_urls, tech_stack)
+ 
+     elif phase_name == "fuzz":
+-        await _phase_fuzz(live_hosts, params_found)
++        await _phase_fuzz(pool, target_id, live_hosts, params_found)
+ 
+     elif phase_name == "scan":
+         await _phase_scan(pool, project_id, target_id, live_hosts, discovered_urls, params_found, tech_stack)
+@@ -368,6 +368,8 @@ async def _phase_recon(
+ 
+ 
+ async def _phase_probe(
++    pool: asyncpg.Pool,
++    target_id: int,
+     target: str,
+     discovered_subdomains: list[str],
+     live_hosts: list[str],
+@@ -381,8 +383,13 @@ async def _phase_probe(
+     of a plain hostname string. We parse that here once - this is the
+     "fingerprint once, reuse everywhere" behavior: every other tool
+     downstream gets tech_stack instead of re-detecting independently.
++
++    Also persists every observed URL into attack_surface_endpoints (see
++    attack_surface_model.sql) - this is the one place that data stops
++    being thrown away at the end of the scan run.
+     """
+     hosts_to_check = discovered_subdomains or [target]
++    surface_endpoints: list[dict] = []
+ 
+     httpx_result = await tools.run_httpx(hosts_to_check)
+     if httpx_result.success:
+@@ -396,21 +403,33 @@ async def _phase_probe(
+                 if url:
+                     live_hosts.append(url)
+                     tech_stack[url] = record.get("tech", [])
++                    surface_endpoints.append({
++                        "url": url,
++                        "source": "httpx",
++                        "is_live": True,
++                        "status_code": record.get("status_code"),
++                        "tech_stack": record.get("tech", []),
++                    })
+             except json.JSONDecodeError:
+                 # Fall back to treating the raw line as a plain host -
+                 # never silently drop a live host just because one line
+                 # wasn't valid JSON (e.g. a stray log line mixed into
+                 # stdout). No tech info for this one, that's fine.
+                 live_hosts.append(line)
++                surface_endpoints.append({"url": line, "source": "httpx", "is_live": True})
+     # A non-fatal httpx failure shouldn't kill the whole phase - URL
+     # discovery below can still proceed even without a live host list.
+     # We still raise if BOTH httpx and the URL tools fail (see below).
+ 
+     gau_result = await tools.run_gau(target)
+     if gau_result.success:
+-        discovered_urls.extend(
+-            line.strip() for line in gau_result.stdout.splitlines() if line.strip()
+-        )
++        gau_urls = [line.strip() for line in gau_result.stdout.splitlines() if line.strip()]
++        discovered_urls.extend(gau_urls)
++        # is_live intentionally omitted (stays NULL/unknown on first
++        # insert, or whatever a prior scan already determined on
++        # conflict) - gau returns historical archive URLs, not
++        # confirmed-live ones.
++        surface_endpoints.extend({"url": u, "source": "gau"} for u in gau_urls)
+ 
+     if not httpx_result.success and not gau_result.success:
+         raise RuntimeError(
+@@ -418,22 +437,32 @@ async def _phase_probe(
+             f"gau={gau_result.error}"
+         )
+ 
++    await _save_surface_endpoints_pooled(pool, target_id, surface_endpoints)
++
+     logger.info(
+         "probe: %d live hosts, %d historical URLs for %s",
+         len(live_hosts), len(discovered_urls), target,
+     )
+ 
+ 
+-async def _phase_fuzz(live_hosts: list[str], params_found: dict[str, bool]) -> None:
++async def _phase_fuzz(pool: asyncpg.Pool, target_id: int, live_hosts: list[str], params_found: dict[str, bool]) -> None:
+     """
+     Discover parameters on live hosts. This determines which hosts are
+     worth running sqlmap/dalfox against in the scan phase - we don't run
+     those expensive tools blindly against every host.
++
++    Also parses arjun's actual output (best-effort - see
++    _parse_arjun_params) and merges the real param names into the
++    matching attack_surface_endpoints row, instead of only recording the
++    yes/no "this host has some params" flag that params_found tracks.
+     """
+     for host in live_hosts[:10]:  # Phase 1: cap how many hosts get deep-probed
+         result = await tools.run_arjun(host)
+         if result.success and result.stdout.strip():
+             params_found[host] = True
++            param_names = _parse_arjun_params(result.stdout)
++            if param_names:
++                await _save_surface_params_pooled(pool, target_id, host, param_names)
+ 
+     logger.info("fuzz: %d hosts have discoverable parameters", len(params_found))
+     # Note: we deliberately don't raise here even if nothing was found -
+@@ -2153,6 +2182,117 @@ async def _save_recon_cache_pooled(pool: asyncpg.Pool, target_id: int, subdomain
+         )
+ 
+ 
++# 401/403 on an unauthenticated probe is a reasonable (not certain) signal
++# that an endpoint requires auth; 200 is a reasonable (not certain) signal
++# that it doesn't. Anything else (redirects, 5xx, etc.) is genuinely
++# ambiguous and left as NULL/unknown rather than guessed - this mirrors
++# the same "don't manufacture a signal you don't actually have" discipline
++# used in gate.py.
++def _infer_requires_auth(status_code: int | None) -> bool | None:
++    if status_code in (401, 403):
++        return True
++    if status_code == 200:
++        return False
++    return None
++
++
++async def _save_surface_endpoints_pooled(
++    pool: asyncpg.Pool,
++    target_id: int,
++    endpoints: list[dict],
++) -> None:
++    """
++    Upserts a batch of observed endpoints into the persistent attack
++    surface model. Each dict: {url, source, is_live, status_code,
++    tech_stack}. On conflict (same target_id+url seen in an earlier
++    scan), merges rather than overwrites: tech_stack and sources are
++    unioned, times_seen increments, requires_auth only gets set if we
++    don't already have a confident answer from a prior scan (so one
++    ambiguous probe doesn't erase a previously-confirmed 401).
++
++    Short-acquire pattern (acquire only for this one batch write, same
++    as _save_recon_cache_pooled/_save_detective_finding_pooled above) -
++    this is called after all the outbound HTTP probing for the phase is
++    already done, never interleaved with it.
++    """
++    if not endpoints:
++        return
++    async with pool.acquire() as conn:
++        for ep in endpoints:
++            status_code = ep.get("status_code")
++            inferred_auth = _infer_requires_auth(status_code)
++            auth_evidence = f"inferred from status_code={status_code}" if inferred_auth is not None else None
++            await conn.execute(
++                """
++                INSERT INTO attack_surface_endpoints
++                    (target_id, url, is_live, last_status_code, tech_stack, sources, requires_auth, auth_evidence)
++                VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
++                ON CONFLICT (target_id, url) DO UPDATE SET
++                    times_seen = attack_surface_endpoints.times_seen + 1,
++                    last_seen_at = now(),
++                    last_status_code = EXCLUDED.last_status_code,
++                    is_live = COALESCE(EXCLUDED.is_live, attack_surface_endpoints.is_live),
++                    tech_stack = (
++                        SELECT jsonb_agg(DISTINCT t)
++                        FROM jsonb_array_elements_text(
++                            attack_surface_endpoints.tech_stack || EXCLUDED.tech_stack
++                        ) AS t
++                    ),
++                    sources = (
++                        SELECT jsonb_agg(DISTINCT s)
++                        FROM jsonb_array_elements_text(
++                            attack_surface_endpoints.sources || EXCLUDED.sources
++                        ) AS s
++                    ),
++                    requires_auth = COALESCE(attack_surface_endpoints.requires_auth, EXCLUDED.requires_auth),
++                    auth_evidence = COALESCE(attack_surface_endpoints.auth_evidence, EXCLUDED.auth_evidence)
++                """,
++                target_id,
++                ep["url"],
++                ep.get("is_live"),
++                status_code,
++                json.dumps(ep.get("tech_stack") or []),
++                json.dumps([ep["source"]] if ep.get("source") else []),
++                inferred_auth,
++                auth_evidence,
++            )
++
++
++_ARJUN_PARAMS_RE = re.compile(r"parameters?\s+found:\s*(.+)", re.IGNORECASE)
++
++
++def _parse_arjun_params(stdout: str) -> list[str]:
++    """
++    Best-effort parse of arjun's human-readable stdout (it doesn't run
++    with a JSON output flag here). If the expected "parameters found:"
++    line isn't there - format changed, or arjun printed something else -
++    this just returns [] rather than raising; the caller still records
++    that arjun ran and found *something* via params_found[host]=True
++    regardless of whether we could parse the actual names out of it.
++    """
++    match = _ARJUN_PARAMS_RE.search(stdout)
++    if not match:
++        return []
++    return [p.strip() for p in match.group(1).split(",") if p.strip()]
++
++
++async def _save_surface_params_pooled(pool: asyncpg.Pool, target_id: int, url: str, params: list[str]) -> None:
++    if not params:
++        return
++    async with pool.acquire() as conn:
++        await conn.execute(
++            """
++            UPDATE attack_surface_endpoints
++            SET params = (
++                SELECT jsonb_agg(DISTINCT p)
++                FROM jsonb_array_elements_text(params || $2::jsonb) AS p
++            )
++            WHERE target_id = $1 AND url = $3
++            """,
++            target_id, json.dumps(params), url,
++        )
++
++
+ async def _save_detective_finding_pooled(
+     pool: asyncpg.Pool, project_id: int, target_id: int, result: dict
+ ) -> None:
