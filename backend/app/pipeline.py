@@ -1511,6 +1511,18 @@ async def _phase_scan(
             if res is not None:
                 await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
+        # Detective check: BFLA - low-privilege account reaching admin
+        # function content. Reuses the same "account_a"/"account_b"
+        # sessions and has_sessions gate as the IDOR check just above -
+        # see check_bfla_low_priv_admin_access's own docstring. Single
+        # host-level check (not per-URL), so this runs once here rather
+        # than fanning out across idor_candidates.
+        logger.info("detective: running BFLA low-priv admin access check against %s", host)
+        async with pool.acquire() as conn:
+            bfla_result = await detective.check_bfla_low_priv_admin_access(conn, project_id, host)
+        if bfla_result is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, bfla_result)
+
     # Detective check: reflected XSS (batch 9).
     xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]
     logger.info(

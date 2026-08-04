@@ -1356,6 +1356,69 @@ async def check_idor_multi_account(
     }
 
 
+async def check_bfla_low_priv_admin_access(
+    conn, project_id: int, host: str, low_priv_session: str = "account_a",
+) -> dict | None:
+    """
+    Broken Function-Level Authorization (OWASP API5) - distinct from
+    check_admin_panel_no_auth_functional_access above, which only
+    proves the panel is reachable with ZERO authentication. That's a
+    real bug, but plenty of apps correctly block anonymous access
+    while still failing to check ROLE once you're logged in as *any*
+    account. This is the much more common real-world failure: a
+    perfectly ordinary, non-admin user session (account_a - reuses the
+    same stored session as check_idor_multi_account, no separate setup
+    needed) reaching functional admin content it was never granted a
+    role for.
+
+    Same read-only discipline as every admin-panel check in this file:
+    GET only, no state-changing request ever attempted, and the same
+    login-form-indicator exclusion so a redirect back to a login page
+    doesn't get misread as a hit. Requires the "account_a" session to
+    be stored and the project auth_policy-approved (see
+    check_idor_multi_account's docstring for the same setup) - returns
+    None immediately and silently if it isn't, so this is always safe
+    to call unconditionally.
+    """
+    try:
+        session_creds = await auth_sessions.get_session(conn, project_id, low_priv_session)
+    except auth_sessions.auth_policy.AuthPolicyError:
+        return None
+    if not session_creds:
+        return None
+
+    base = host.rstrip("/")
+    headers = _session_to_headers(session_creds)
+    try:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        for path in _ADMIN_PANEL_PATHS:
+            try:
+                resp = await client.get(base + path, headers=headers)
+            except httpx.HTTPError:
+                continue
+            if resp.status_code != 200:
+                continue
+            body_lower = resp.text[:8000].lower()
+            if any(ind in body_lower for ind in _LOGIN_FORM_INDICATORS):
+                continue  # bounced back to a login gate - role check is working
+            hit_markers = [m for m in _ADMIN_FUNCTIONAL_MARKERS if m in body_lower]
+            if hit_markers:
+                return {
+                    "vuln_type": "bfla_low_priv_admin_access",
+                    "severity": "critical",
+                    "evidence": (
+                        f"{base + path}: authenticated as a standard, non-admin session "
+                        f"({low_priv_session!r}) and received admin-area content directly "
+                        f"(markers: {', '.join(hit_markers)}) - the endpoint checks for ANY "
+                        f"valid login, not the caller's actual role. Broken function-level "
+                        f"authorization, not just missing authentication."
+                    ),
+                }
+    except httpx.HTTPError as exc:
+        logger.info("detective: BFLA low-priv admin access check failed for %s: %s", host, exc)
+    return None
+
+
 _ADMIN_FUNCTIONAL_MARKERS = (
     "log out", "logout", "sign out", "dashboard", "welcome back",
     "manage users", "user management", "site settings", "admin panel",
