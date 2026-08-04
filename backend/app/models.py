@@ -93,6 +93,13 @@ class Project(BaseModel):
     preferred_ai_model: Optional[str] = None
     is_canary: bool = False
     canary_baseline_finding_count: Optional[int] = None
+    # Count of real findings (severity != 'info') - drives the grey/dim
+    # card treatment in ProjectList when a project has nothing worth
+    # opening it for. Deliberately excludes 'info' severity and the
+    # separate scan_notes table (neither counts as a "finding" for this
+    # purpose), so a project full of only informative noise still shows
+    # grey instead of looking like it has real signal.
+    open_findings_count: int = 0
 
 
 class ScheduleUpdateRequest(BaseModel):

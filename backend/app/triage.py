@@ -544,7 +544,7 @@ async def _triage_and_store_finding(
     return result
 
 
-async def triage_project_findings(conn, project_id: int) -> int:
+async def triage_project_findings(conn, project_id: int, include_gate_failed: bool = False) -> int:
     """
     Triages every 'unknown'-severity finding in a project, one at a
     time, looking up past outcome history and stripping/passing through
@@ -560,16 +560,26 @@ async def triage_project_findings(conn, project_id: int) -> int:
     instead of just sitting at severity='unknown' until the next full
     scan happens to re-triage it - see retry_pending_ai_failures, which
     a background loop in main.py runs every few minutes.
+
+    include_gate_failed: the automatic post-scan "triage" phase leaves
+    this False on purpose - gate_status='failed' findings are scanner
+    noise the cheap gate already screened out, and burning a full AI
+    triage call on every one of them on every scan would defeat the
+    point of having a gate. But that also means gate-failed findings
+    were stuck at severity='unknown' forever with no path off it - the
+    on-demand /triage-all endpoint passes True here since a manual click
+    is an explicit "yes, spend the calls, I want these resolved" signal.
     """
     from . import retry_queue, vrt as vrt_module
 
     project_row = await conn.fetchrow("SELECT preferred_ai_model FROM projects WHERE id = $1", project_id)
     preferred_model_override = project_row["preferred_ai_model"] if project_row else None
 
+    gate_clause = "" if include_gate_failed else "AND gate_status != 'failed'"
     rows = await conn.fetch(
-        """
+        f"""
         SELECT id, target_id, tool_name, vuln_type, evidence FROM findings
-        WHERE project_id = $1 AND severity = 'unknown' AND gate_status != 'failed'
+        WHERE project_id = $1 AND severity = 'unknown' {gate_clause}
         """,
         project_id,
     )

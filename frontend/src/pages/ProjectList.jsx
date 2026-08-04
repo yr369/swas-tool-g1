@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import { Donut } from "../components/charts/Donut";
 import { platformLabel } from "../constants";
@@ -18,8 +18,40 @@ export function ProjectList() {
   // (or to keep them out of the way while working) - default to hiding
   // them, with an explicit tab to go look, same as most task trackers
   // handle a "done"/"archived" bucket.
-  const [statusFilter, setStatusFilter] = useState("active");
-  const [platformFilter, setPlatformFilter] = useState("all");
+  //
+  // statusFilter/platformFilter live in the URL (not plain useState) so
+  // that navigating into a project and pressing back (or Alt+Left)
+  // lands you back on the SAME filtered view instead of a fresh,
+  // unfiltered ProjectList - a bare useState resets to its default on
+  // every remount, which is exactly what "goes back into the main
+  // page" was: the filter, not the route, was the thing getting lost.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const statusFilter = searchParams.get("status") || "active";
+  const platformFilter = searchParams.get("platform") || "all";
+
+  function setStatusFilter(next) {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === "active") p.delete("status");
+        else p.set("status", next);
+        return p;
+      },
+      { replace: true }
+    );
+  }
+
+  function setPlatformFilter(next) {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === "all") p.delete("platform");
+        else p.set("platform", next);
+        return p;
+      },
+      { replace: true }
+    );
+  }
 
   function load() {
     return api
@@ -267,12 +299,18 @@ function ProjectRow({ p, selected, onToggleSelected }) {
     }
   }
 
+  // No real findings (critical/high/medium/low/unknown - "info" and
+  // scan_notes don't count) means nothing worth opening this card for
+  // yet. Dim it grey so that's visible from the list without a click.
+  const hasNoFindings = (p.open_findings_count ?? 0) === 0;
+
   return (
     <div
       style={{
         background: "var(--bg-surface)",
-        border: "1px solid var(--border)",
+        border: `1px solid ${hasNoFindings ? "var(--text-muted)" : "var(--border)"}`,
         borderRadius: "var(--radius-lg)",
+        opacity: hasNoFindings ? 0.55 : 1,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px" }}>

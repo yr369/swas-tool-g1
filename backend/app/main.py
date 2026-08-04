@@ -867,7 +867,8 @@ async def list_projects():
                    p.next_scheduled_scan_at, p.created_at,
                    p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
-                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
+                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
+                   (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count
             FROM projects p
             ORDER BY p.created_at DESC
             """
@@ -1816,10 +1817,16 @@ async def triage_all_findings(project_id: int):
     tuning triage.py's prompt or after outcome history has changed.
     Both share the exact same logic via triage.triage_project_findings,
     so they can never drift out of sync.
+
+    include_gate_failed=True here (unlike the automatic scan-time
+    phase): a manual click is an explicit request to resolve every
+    'unknown', including the ones the cheap gate already screened out
+    as noise - those were previously silently skipped forever, which is
+    exactly the "some unknowns never get triaged" symptom.
     """
     pool = database.get_pool()
     async with pool.acquire() as conn:
-        triaged = await triage.triage_project_findings(conn, project_id)
+        triaged = await triage.triage_project_findings(conn, project_id, include_gate_failed=True)
 
     return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
 

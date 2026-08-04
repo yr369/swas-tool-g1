@@ -180,7 +180,12 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
     try {
       const result = await api.triageFinding(finding.id);
       setTriageResult(result);
-      onTriaged?.();
+      // Pass the finding id up so FindingsList can keep this row visible
+      // through the refresh even if the new severity (e.g. "info") would
+      // normally be filtered out of the default view - otherwise the row
+      // you're actively reading the reasoning for just vanishes out from
+      // under you the moment the list refetches.
+      onTriaged?.(finding.id);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -299,6 +304,11 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
                   <strong style={{ color: "var(--text-primary)" }}>VRT category:</strong> {triageResult.vrt_category}
                 </div>
               )}
+              {triageResult.severity === "info" && (
+                <div style={{ marginTop: 4, color: "var(--sev-medium)" }}>
+                  Triaged as Info - hidden from the default list after this refreshes. Toggle the Info chip above to see it again.
+                </div>
+              )}
             </div>
           ) : (
             finding.triage_reasoning && (
@@ -359,6 +369,19 @@ export function FindingsList({ findings, onTriaged, projectId }) {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkUpdating, setBulkUpdating] = useState(false);
   const [onlyAwaitingOutcome, setOnlyAwaitingOutcome] = useState(false);
+  // Findings just triaged via the individual "Run AI triage" button stay
+  // visible through the parent's refetch even if their new severity (most
+  // often "info") would normally be hidden by activeSeverities - without
+  // this, the row you're mid-read on disappears the instant the list
+  // refreshes. Cleared implicitly on unmount/remount of this component.
+  const [justTriaged, setJustTriaged] = useState(() => new Set());
+
+  function handleOneTriaged(findingId) {
+    if (findingId != null) {
+      setJustTriaged((prev) => new Set(prev).add(findingId));
+    }
+    onTriaged?.();
+  }
 
   const awaitingOutcomeCount = useMemo(
     () => findings.filter((f) => f.status === "submitted" && !f.has_logged_outcome).length,
@@ -419,7 +442,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
     const q = search.trim().toLowerCase();
     let list = findings.filter((f) => {
       const sev = f.severity in counts ? f.severity : "unknown";
-      if (!activeSeverities.has(sev)) return false;
+      if (!activeSeverities.has(sev) && !justTriaged.has(f.id)) return false;
       if (toolFilter !== "all" && f.tool_name !== toolFilter) return false;
       if (onlyAwaitingOutcome && !(f.status === "submitted" && !f.has_logged_outcome)) return false;
       if (q && !(f.evidence || "").toLowerCase().includes(q) && !(f.vuln_type || "").toLowerCase().includes(q)) {
@@ -440,7 +463,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
     });
 
     return list;
-  }, [findings, activeSeverities, toolFilter, search, sortBy, counts, onlyAwaitingOutcome]);
+  }, [findings, activeSeverities, toolFilter, search, sortBy, counts, onlyAwaitingOutcome, justTriaged]);
 
   if (findings.length === 0) {
     return (
@@ -576,7 +599,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
             <FindingRow
               key={finding.id}
               finding={finding}
-              onTriaged={onTriaged}
+              onTriaged={handleOneTriaged}
               selected={selected.has(finding.id)}
               onToggleSelect={toggleSelect}
             />

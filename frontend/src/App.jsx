@@ -22,10 +22,35 @@ function Shell() {
   const location = useLocation();
   const gPending = useRef(false);
   const gTimer = useRef(null);
+  const mainRef = useRef(null);
+  // Per-history-entry scroll positions for the <main> pane. React
+  // Router gives every navigation entry (including ones you land back
+  // on via Alt+Left / the browser back button) a stable, unique
+  // location.key - so remembering scrollTop per key and restoring it
+  // on the way back is what makes "scroll down a project list, open a
+  // project, hit back" land you where you left off instead of back at
+  // the top. The browser's own scroll restoration only ever sees the
+  // window, never this inner scrollable pane, so it can't do this on
+  // its own.
+  const scrollPositions = useRef(new Map());
   // The triage queue is a split-pane workspace, not a document - it
   // wants the full main area, not the ~960px reading-width column
   // every other page uses.
   const isFullBleed = location.pathname === "/triage" || location.pathname.startsWith("/report/");
+
+  useEffect(() => {
+    const mainEl = mainRef.current;
+    if (!mainEl) return;
+
+    function onScroll() {
+      scrollPositions.current.set(location.key, mainEl.scrollTop);
+    }
+
+    mainEl.addEventListener("scroll", onScroll, { passive: true });
+    mainEl.scrollTop = scrollPositions.current.get(location.key) || 0;
+
+    return () => mainEl.removeEventListener("scroll", onScroll);
+  }, [location.key]);
 
   useEffect(() => {
     function isTypingTarget(el) {
@@ -103,7 +128,7 @@ function Shell() {
           </div>
         </header>
 
-        <main style={{ flex: 1, minHeight: 0, overflowY: isFullBleed ? "hidden" : "auto", padding: "24px 24px" }}>
+        <main ref={mainRef} style={{ flex: 1, minHeight: 0, overflowY: isFullBleed ? "hidden" : "auto", padding: "24px 24px" }}>
           <div style={isFullBleed ? { height: "100%" } : { maxWidth: 960, margin: "0 auto" }}>
             <Routes>
               <Route path="/" element={<ProjectList />} />
