@@ -1,0 +1,293 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 9735b5b..c6b9888 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -867,7 +867,8 @@ async def list_projects():
+                    p.next_scheduled_scan_at, p.created_at,
+                    p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
+                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+-                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
++                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
++                   (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count
+             FROM projects p
+             ORDER BY p.created_at DESC
+             """
+@@ -1816,10 +1817,16 @@ async def triage_all_findings(project_id: int):
+     tuning triage.py's prompt or after outcome history has changed.
+     Both share the exact same logic via triage.triage_project_findings,
+     so they can never drift out of sync.
++
++    include_gate_failed=True here (unlike the automatic scan-time
++    phase): a manual click is an explicit request to resolve every
++    'unknown', including the ones the cheap gate already screened out
++    as noise - those were previously silently skipped forever, which is
++    exactly the "some unknowns never get triaged" symptom.
+     """
+     pool = database.get_pool()
+     async with pool.acquire() as conn:
+-        triaged = await triage.triage_project_findings(conn, project_id)
++        triaged = await triage.triage_project_findings(conn, project_id, include_gate_failed=True)
+ 
+     return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
+ 
+diff --git a/backend/app/models.py b/backend/app/models.py
+index b60455d..497015e 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -93,6 +93,13 @@ class Project(BaseModel):
+     preferred_ai_model: Optional[str] = None
+     is_canary: bool = False
+     canary_baseline_finding_count: Optional[int] = None
++    # Count of real findings (severity != 'info') - drives the grey/dim
++    # card treatment in ProjectList when a project has nothing worth
++    # opening it for. Deliberately excludes 'info' severity and the
++    # separate scan_notes table (neither counts as a "finding" for this
++    # purpose), so a project full of only informative noise still shows
++    # grey instead of looking like it has real signal.
++    open_findings_count: int = 0
+ 
+ 
+ class ScheduleUpdateRequest(BaseModel):
+diff --git a/backend/app/triage.py b/backend/app/triage.py
+index 7fe9cf8..a9db128 100644
+--- a/backend/app/triage.py
++++ b/backend/app/triage.py
+@@ -544,7 +544,7 @@ async def _triage_and_store_finding(
+     return result
+ 
+ 
+-async def triage_project_findings(conn, project_id: int) -> int:
++async def triage_project_findings(conn, project_id: int, include_gate_failed: bool = False) -> int:
+     """
+     Triages every 'unknown'-severity finding in a project, one at a
+     time, looking up past outcome history and stripping/passing through
+@@ -560,16 +560,26 @@ async def triage_project_findings(conn, project_id: int) -> int:
+     instead of just sitting at severity='unknown' until the next full
+     scan happens to re-triage it - see retry_pending_ai_failures, which
+     a background loop in main.py runs every few minutes.
++
++    include_gate_failed: the automatic post-scan "triage" phase leaves
++    this False on purpose - gate_status='failed' findings are scanner
++    noise the cheap gate already screened out, and burning a full AI
++    triage call on every one of them on every scan would defeat the
++    point of having a gate. But that also means gate-failed findings
++    were stuck at severity='unknown' forever with no path off it - the
++    on-demand /triage-all endpoint passes True here since a manual click
++    is an explicit "yes, spend the calls, I want these resolved" signal.
+     """
+     from . import retry_queue, vrt as vrt_module
+ 
+     project_row = await conn.fetchrow("SELECT preferred_ai_model FROM projects WHERE id = $1", project_id)
+     preferred_model_override = project_row["preferred_ai_model"] if project_row else None
+ 
++    gate_clause = "" if include_gate_failed else "AND gate_status != 'failed'"
+     rows = await conn.fetch(
+-        """
++        f"""
+         SELECT id, target_id, tool_name, vuln_type, evidence FROM findings
+-        WHERE project_id = $1 AND severity = 'unknown' AND gate_status != 'failed'
++        WHERE project_id = $1 AND severity = 'unknown' {gate_clause}
+         """,
+         project_id,
+     )
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 5d26988..8732085 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -22,11 +22,36 @@ function Shell() {
+   const location = useLocation();
+   const gPending = useRef(false);
+   const gTimer = useRef(null);
++  const mainRef = useRef(null);
++  // Per-history-entry scroll positions for the <main> pane. React
++  // Router gives every navigation entry (including ones you land back
++  // on via Alt+Left / the browser back button) a stable, unique
++  // location.key - so remembering scrollTop per key and restoring it
++  // on the way back is what makes "scroll down a project list, open a
++  // project, hit back" land you where you left off instead of back at
++  // the top. The browser's own scroll restoration only ever sees the
++  // window, never this inner scrollable pane, so it can't do this on
++  // its own.
++  const scrollPositions = useRef(new Map());
+   // The triage queue is a split-pane workspace, not a document - it
+   // wants the full main area, not the ~960px reading-width column
+   // every other page uses.
+   const isFullBleed = location.pathname === "/triage" || location.pathname.startsWith("/report/");
+ 
++  useEffect(() => {
++    const mainEl = mainRef.current;
++    if (!mainEl) return;
++
++    function onScroll() {
++      scrollPositions.current.set(location.key, mainEl.scrollTop);
++    }
++
++    mainEl.addEventListener("scroll", onScroll, { passive: true });
++    mainEl.scrollTop = scrollPositions.current.get(location.key) || 0;
++
++    return () => mainEl.removeEventListener("scroll", onScroll);
++  }, [location.key]);
++
+   useEffect(() => {
+     function isTypingTarget(el) {
+       return el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+@@ -103,7 +128,7 @@ function Shell() {
+           </div>
+         </header>
+ 
+-        <main style={{ flex: 1, minHeight: 0, overflowY: isFullBleed ? "hidden" : "auto", padding: "24px 24px" }}>
++        <main ref={mainRef} style={{ flex: 1, minHeight: 0, overflowY: isFullBleed ? "hidden" : "auto", padding: "24px 24px" }}>
+           <div style={isFullBleed ? { height: "100%" } : { maxWidth: 960, margin: "0 auto" }}>
+             <Routes>
+               <Route path="/" element={<ProjectList />} />
+diff --git a/frontend/src/components/FindingsList.jsx b/frontend/src/components/FindingsList.jsx
+index 6ec0cff..33c50b1 100644
+--- a/frontend/src/components/FindingsList.jsx
++++ b/frontend/src/components/FindingsList.jsx
+@@ -180,7 +180,12 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
+     try {
+       const result = await api.triageFinding(finding.id);
+       setTriageResult(result);
+-      onTriaged?.();
++      // Pass the finding id up so FindingsList can keep this row visible
++      // through the refresh even if the new severity (e.g. "info") would
++      // normally be filtered out of the default view - otherwise the row
++      // you're actively reading the reasoning for just vanishes out from
++      // under you the moment the list refetches.
++      onTriaged?.(finding.id);
+     } catch (err) {
+       setError(err.message);
+     } finally {
+@@ -299,6 +304,11 @@ function FindingRow({ finding, onTriaged, selected, onToggleSelect }) {
+                   <strong style={{ color: "var(--text-primary)" }}>VRT category:</strong> {triageResult.vrt_category}
+                 </div>
+               )}
++              {triageResult.severity === "info" && (
++                <div style={{ marginTop: 4, color: "var(--sev-medium)" }}>
++                  Triaged as Info - hidden from the default list after this refreshes. Toggle the Info chip above to see it again.
++                </div>
++              )}
+             </div>
+           ) : (
+             finding.triage_reasoning && (
+@@ -359,6 +369,19 @@ export function FindingsList({ findings, onTriaged, projectId }) {
+   const [selected, setSelected] = useState(() => new Set());
+   const [bulkUpdating, setBulkUpdating] = useState(false);
+   const [onlyAwaitingOutcome, setOnlyAwaitingOutcome] = useState(false);
++  // Findings just triaged via the individual "Run AI triage" button stay
++  // visible through the parent's refetch even if their new severity (most
++  // often "info") would normally be hidden by activeSeverities - without
++  // this, the row you're mid-read on disappears the instant the list
++  // refreshes. Cleared implicitly on unmount/remount of this component.
++  const [justTriaged, setJustTriaged] = useState(() => new Set());
++
++  function handleOneTriaged(findingId) {
++    if (findingId != null) {
++      setJustTriaged((prev) => new Set(prev).add(findingId));
++    }
++    onTriaged?.();
++  }
+ 
+   const awaitingOutcomeCount = useMemo(
+     () => findings.filter((f) => f.status === "submitted" && !f.has_logged_outcome).length,
+@@ -419,7 +442,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
+     const q = search.trim().toLowerCase();
+     let list = findings.filter((f) => {
+       const sev = f.severity in counts ? f.severity : "unknown";
+-      if (!activeSeverities.has(sev)) return false;
++      if (!activeSeverities.has(sev) && !justTriaged.has(f.id)) return false;
+       if (toolFilter !== "all" && f.tool_name !== toolFilter) return false;
+       if (onlyAwaitingOutcome && !(f.status === "submitted" && !f.has_logged_outcome)) return false;
+       if (q && !(f.evidence || "").toLowerCase().includes(q) && !(f.vuln_type || "").toLowerCase().includes(q)) {
+@@ -440,7 +463,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
+     });
+ 
+     return list;
+-  }, [findings, activeSeverities, toolFilter, search, sortBy, counts, onlyAwaitingOutcome]);
++  }, [findings, activeSeverities, toolFilter, search, sortBy, counts, onlyAwaitingOutcome, justTriaged]);
+ 
+   if (findings.length === 0) {
+     return (
+@@ -576,7 +599,7 @@ export function FindingsList({ findings, onTriaged, projectId }) {
+             <FindingRow
+               key={finding.id}
+               finding={finding}
+-              onTriaged={onTriaged}
++              onTriaged={handleOneTriaged}
+               selected={selected.has(finding.id)}
+               onToggleSelect={toggleSelect}
+             />
+diff --git a/frontend/src/pages/ProjectList.jsx b/frontend/src/pages/ProjectList.jsx
+index faa25c2..648281a 100644
+--- a/frontend/src/pages/ProjectList.jsx
++++ b/frontend/src/pages/ProjectList.jsx
+@@ -1,5 +1,5 @@
+ import { useEffect, useMemo, useState } from "react";
+-import { Link } from "react-router-dom";
++import { Link, useSearchParams } from "react-router-dom";
+ import { api } from "../api/client";
+ import { Donut } from "../components/charts/Donut";
+ import { platformLabel } from "../constants";
+@@ -18,8 +18,40 @@ export function ProjectList() {
+   // (or to keep them out of the way while working) - default to hiding
+   // them, with an explicit tab to go look, same as most task trackers
+   // handle a "done"/"archived" bucket.
+-  const [statusFilter, setStatusFilter] = useState("active");
+-  const [platformFilter, setPlatformFilter] = useState("all");
++  //
++  // statusFilter/platformFilter live in the URL (not plain useState) so
++  // that navigating into a project and pressing back (or Alt+Left)
++  // lands you back on the SAME filtered view instead of a fresh,
++  // unfiltered ProjectList - a bare useState resets to its default on
++  // every remount, which is exactly what "goes back into the main
++  // page" was: the filter, not the route, was the thing getting lost.
++  const [searchParams, setSearchParams] = useSearchParams();
++  const statusFilter = searchParams.get("status") || "active";
++  const platformFilter = searchParams.get("platform") || "all";
++
++  function setStatusFilter(next) {
++    setSearchParams(
++      (prev) => {
++        const p = new URLSearchParams(prev);
++        if (next === "active") p.delete("status");
++        else p.set("status", next);
++        return p;
++      },
++      { replace: true }
++    );
++  }
++
++  function setPlatformFilter(next) {
++    setSearchParams(
++      (prev) => {
++        const p = new URLSearchParams(prev);
++        if (next === "all") p.delete("platform");
++        else p.set("platform", next);
++        return p;
++      },
++      { replace: true }
++    );
++  }
+ 
+   function load() {
+     return api
+@@ -267,12 +299,18 @@ function ProjectRow({ p, selected, onToggleSelected }) {
+     }
+   }
+ 
++  // No real findings (critical/high/medium/low/unknown - "info" and
++  // scan_notes don't count) means nothing worth opening this card for
++  // yet. Dim it grey so that's visible from the list without a click.
++  const hasNoFindings = (p.open_findings_count ?? 0) === 0;
++
+   return (
+     <div
+       style={{
+         background: "var(--bg-surface)",
+-        border: "1px solid var(--border)",
++        border: `1px solid ${hasNoFindings ? "var(--text-muted)" : "var(--border)"}`,
+         borderRadius: "var(--radius-lg)",
++        opacity: hasNoFindings ? 0.55 : 1,
+       }}
+     >
+       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px" }}>
