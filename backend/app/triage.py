@@ -600,6 +600,33 @@ async def triage_project_findings(conn, project_id: int, include_gate_failed: bo
     return triaged
 
 
+async def triage_all_projects_findings(pool, include_gate_failed: bool = True) -> dict:
+    """
+    Sweeps every project with an 'unknown'-severity finding, for the
+    Home page's "Triage all untriaged findings" button - saves opening
+    each project one at a time to click its own triage-all button.
+    Reuses triage_project_findings per project (same connection, run
+    sequentially) rather than a hand-rolled cross-project query, so this
+    can never drift out of sync with the per-project button's behavior,
+    including the gate_status handling above.
+    """
+    async with pool.acquire() as conn:
+        project_ids = [
+            r["project_id"]
+            for r in await conn.fetch("SELECT DISTINCT project_id FROM findings WHERE severity = 'unknown'")
+        ]
+
+        per_project = {}
+        total = 0
+        for project_id in project_ids:
+            count = await triage_project_findings(conn, project_id, include_gate_failed=include_gate_failed)
+            if count:
+                per_project[project_id] = count
+            total += count
+
+    return {"total": total, "per_project": per_project}
+
+
 async def retry_pending_ai_failures(pool) -> int:
     """
     Called periodically by main.py's background loop. Pulls due

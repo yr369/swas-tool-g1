@@ -13,6 +13,8 @@ export function ProjectList() {
   const [selected, setSelected] = useState(() => new Set());
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkResult, setBulkResult] = useState(null);
+  const [triagingAll, setTriagingAll] = useState(false);
+  const [triageAllResult, setTriageAllResult] = useState(null);
   // Archived projects sit in the same table as everything else and
   // were getting mixed into one flat list with no way to see just them
   // (or to keep them out of the way while working) - default to hiding
@@ -128,6 +130,20 @@ export function ProjectList() {
     }
   }
 
+  async function handleTriageAllProjects() {
+    setTriagingAll(true);
+    setTriageAllResult(null);
+    try {
+      const result = await api.triageAllProjects();
+      setTriageAllResult(result.message);
+      await load();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setTriagingAll(false);
+    }
+  }
+
   if (error) {
     return <p style={{ color: "var(--status-fail)" }}>Couldn't load projects: {error}</p>;
   }
@@ -150,10 +166,18 @@ export function ProjectList() {
           <div className="eyebrow" style={{ marginBottom: 4 }}>Operator console</div>
           <h1 style={{ fontSize: 24, fontWeight: 500, margin: 0 }}>Projects</h1>
         </div>
-        <Link to="/new" style={newButtonStyle}>
-          + New project
-        </Link>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button onClick={handleTriageAllProjects} disabled={triagingAll} style={secondaryButtonStyle}>
+            {triagingAll ? "Triaging…" : "Triage all untriaged findings"}
+          </button>
+          <Link to="/new" style={newButtonStyle}>
+            + New project
+          </Link>
+        </div>
       </div>
+      {triageAllResult && (
+        <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "-16px 0 16px" }}>{triageAllResult}</p>
+      )}
 
       {projects.length === 0 ? (
         <div style={{ padding: "48px 16px", textAlign: "center", color: "var(--text-muted)" }}>
@@ -330,8 +354,12 @@ function ProjectRow({ p, selected, onToggleSelected }) {
           <div style={{ minWidth: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ fontWeight: 500 }}>{p.name}</span>
-              <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                #{p.id}
+              <span
+                className="mono"
+                style={{ fontSize: 11, color: "var(--text-muted)" }}
+                title="Current position among existing projects (recalculated on delete) | Lifetime creation number (never changes)"
+              >
+                #{p.current_number} | #{p.id}
               </span>
             </div>
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>

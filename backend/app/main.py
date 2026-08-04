@@ -780,6 +780,13 @@ async def health_dashboard():
             LIMIT 10
             """
         )
+        # Separate count query since the row fetch above caps at 10 for
+        # display - without this the panel's header count and the list
+        # underneath silently disagree the moment there are more than 10
+        # dead targets (header says "10", there could really be 40).
+        dead_targets_total = await conn.fetchval(
+            "SELECT count(*) FROM scope_targets WHERE dead_since IS NOT NULL"
+        )
 
     canaries = []
     for row in canary_rows:
@@ -835,6 +842,7 @@ async def health_dashboard():
             "rotted_7d": evidence_rot_row["rotted_7d"] if evidence_rot_row else 0,
             "reproducible_7d": evidence_rot_row["reproducible_7d"] if evidence_rot_row else 0,
             "dead_targets": dead_targets,
+            "dead_targets_total": dead_targets_total,
         },
     }
 
@@ -868,7 +876,8 @@ async def list_projects():
                    p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
-                   (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count
+                   (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
+                   (SELECT COUNT(*) FROM projects p2 WHERE p2.id <= p.id) AS current_number
             FROM projects p
             ORDER BY p.created_at DESC
             """
@@ -940,7 +949,9 @@ async def get_project(project_id: int):
                    p.next_scheduled_scan_at, p.created_at,
                    p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
-                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
+                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
+                   (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
+                   (SELECT COUNT(*) FROM projects p2 WHERE p2.id <= p.id) AS current_number
             FROM projects p WHERE p.id = $1
             """,
             project_id,
@@ -1006,7 +1017,9 @@ async def update_project(project_id: int, payload: ProjectUpdate):
                    p.next_scheduled_scan_at, p.created_at,
                    p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
-                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count
+                   (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
+                   (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
+                   (SELECT COUNT(*) FROM projects p2 WHERE p2.id <= p.id) AS current_number
             FROM projects p WHERE p.id = $1
             """,
             project_id,
@@ -1829,6 +1842,24 @@ async def triage_all_findings(project_id: int):
         triaged = await triage.triage_project_findings(conn, project_id, include_gate_failed=True)
 
     return {"message": f"Triaged {triaged} finding(s)", "count": triaged}
+
+
+@app.post("/api/findings/triage-all")
+async def triage_all_findings_everywhere():
+    """
+    Home page's "Triage all untriaged findings" button - sweeps every
+    project's 'unknown' findings in one click instead of opening each
+    project to hit its own triage-all button. Same include_gate_failed
+    reasoning as the per-project endpoint above: a manual click is an
+    explicit "resolve everything, spend the AI calls" signal.
+    """
+    pool = database.get_pool()
+    result = await triage.triage_all_projects_findings(pool, include_gate_failed=True)
+    project_count = len(result["per_project"])
+    return {
+        "message": f"Triaged {result['total']} finding(s) across {project_count} project(s)",
+        **result,
+    }
 
 
 @app.post("/api/projects/{project_id}/gate-all")

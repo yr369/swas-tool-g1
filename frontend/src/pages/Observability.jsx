@@ -13,6 +13,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api/client";
 
 const POLL_MS = 30_000;
@@ -59,6 +60,8 @@ export function Observability() {
   const totalRetryPending = data.retry_queue.reduce((sum, r) => sum + r.pending, 0);
   const missingBinaries = Object.entries(data.tools.binaries_present).filter(([, present]) => !present);
   const driftedCanaries = data.canary_targets.filter((c) => c.drifted);
+  const trippedModels =
+    data.ai.circuit_breaker && !data.ai.circuit_breaker.error ? Object.keys(data.ai.circuit_breaker).length : 0;
 
   return (
     <div>
@@ -79,7 +82,7 @@ export function Observability() {
           <StatusLine ok={data.database_ok} okText="Connected" badText="Unreachable" />
         </Panel>
 
-        <Panel label="AI ROTATION">
+        <Panel label="AI ROTATION" accent={trippedModels > 0 ? "var(--status-fail)" : undefined}>
           <CircuitBreaker status={data.ai.circuit_breaker} />
           {data.ai.usage_today && typeof data.ai.usage_today === "object" && !data.ai.usage_today.error && (
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 6 }} className="mono">
@@ -118,11 +121,18 @@ export function Observability() {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               {data.retry_queue.map((r) => (
-                <div key={r.kind} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                  <span className="mono">{r.kind}</span>
-                  <span style={{ color: r.pending > 0 ? "var(--sev-medium)" : "var(--text-muted)" }}>
-                    {r.pending} pending{r.failed_24h > 0 ? `, ${r.failed_24h} failed/24h` : ""}
-                  </span>
+                <div key={r.kind} style={{ display: "flex", flexDirection: "column", fontSize: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span className="mono">{r.kind}</span>
+                    <span style={{ color: r.pending > 0 ? "var(--sev-medium)" : "var(--text-muted)" }}>
+                      {r.pending} pending{r.failed_24h > 0 ? `, ${r.failed_24h} failed/24h` : ""}
+                    </span>
+                  </div>
+                  {r.oldest_pending_due_at && (
+                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                      next auto-retry {new Date(r.oldest_pending_due_at).toLocaleTimeString()}
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
@@ -165,7 +175,9 @@ export function Observability() {
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               {data.canary_targets.map((c) => (
                 <div key={c.project_id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                  <span>{c.project_name}</span>
+                  <Link to={`/projects/${c.project_id}`} style={{ color: "var(--text-primary)" }}>
+                    {c.project_name}
+                  </Link>
                   <span style={{ color: c.drifted ? "var(--status-fail)" : "var(--status-success)" }}>
                     {c.current_finding_count} / baseline {c.baseline_finding_count ?? "—"}
                   </span>
@@ -178,16 +190,27 @@ export function Observability() {
 
       {data.evidence.dead_targets.length > 0 && (
         <div style={{ marginTop: 16 }}>
-          <div className="ops-panel" data-label={`DEAD TARGETS · ${data.evidence.dead_targets.length}`} style={{ overflow: "hidden" }}>
+          <div
+            className="ops-panel"
+            data-label={
+              data.evidence.dead_targets_total > data.evidence.dead_targets.length
+                ? `DEAD TARGETS · ${data.evidence.dead_targets_total} (showing ${data.evidence.dead_targets.length})`
+                : `DEAD TARGETS · ${data.evidence.dead_targets_total}`
+            }
+            style={{ overflow: "hidden" }}
+          >
             {data.evidence.dead_targets.map((t, i) => (
-              <div
+              <Link
                 key={t.target_id}
+                to={`/projects/${t.project_id}`}
                 style={{
                   display: "flex",
                   justifyContent: "space-between",
                   padding: "10px 16px",
                   borderBottom: i < data.evidence.dead_targets.length - 1 ? "1px solid var(--border)" : "none",
                   fontSize: 12,
+                  textDecoration: "none",
+                  color: "inherit",
                 }}
               >
                 <div>
@@ -197,7 +220,7 @@ export function Observability() {
                 <span style={{ color: "var(--text-muted)" }}>
                   {t.dead_since ? `dark since ${new Date(t.dead_since).toLocaleDateString()}` : ""}
                 </span>
-              </div>
+              </Link>
             ))}
           </div>
         </div>
@@ -241,26 +264,26 @@ function CircuitBreaker({ status }) {
   if (!status || status.error) {
     return <StatusLine ok={false} badText={status?.error || "Unknown"} />;
   }
-  // gemini_rotation.get_circuit_breaker_status() returns a dict keyed by
-  // model name -> {state: CLOSED|OPEN|HALF_OPEN, ...}. Render per-model
-  // so one bad model doesn't hide behind an aggregate "OK".
+  // gemini_rotation.get_circuit_breaker_status() returns
+  // {model: secondsRemainingInCooldown} - a plain number, and ONLY for
+  // models that are CURRENTLY tripped (healthy models never appear in
+  // this dict at all). Every key present here is by definition tripped
+  // - there's no per-model "state" field to read, and an empty dict
+  // means every model is healthy, not "no data yet".
   const entries = Object.entries(status);
   if (entries.length === 0) {
-    return <span style={{ fontSize: 12, color: "var(--text-muted)" }}>No models tracked yet</span>;
+    return <StatusLine ok okText="All models healthy" />;
   }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      {entries.map(([model, info]) => {
-        const state = typeof info === "object" ? info.state : info;
-        const color =
-          state === "OPEN" ? "var(--status-fail)" : state === "HALF_OPEN" ? "var(--sev-medium)" : "var(--status-success)";
-        return (
-          <div key={model} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-            <span className="mono">{model}</span>
-            <span style={{ color }}>{state}</span>
-          </div>
-        );
-      })}
+      {entries.map(([model, secondsRemaining]) => (
+        <div key={model} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+          <span className="mono">{model}</span>
+          <span style={{ color: "var(--status-fail)" }}>
+            cooling down · {Math.ceil(secondsRemaining)}s left
+          </span>
+        </div>
+      ))}
     </div>
   );
 }

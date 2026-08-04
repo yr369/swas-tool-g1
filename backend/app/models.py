@@ -100,6 +100,13 @@ class Project(BaseModel):
     # purpose), so a project full of only informative noise still shows
     # grey instead of looking like it has real signal.
     open_findings_count: int = 0
+    # Rank among currently-existing projects (active + archived),
+    # ordered oldest-first - "#1" is the oldest project that still
+    # exists. Recomputed on every read (COUNT of projects with a
+    # lower/equal id), so it automatically shifts when older projects
+    # get deleted, unlike `id`, which is the project's permanent
+    # lifetime creation number and never changes or gets reused.
+    current_number: int = 0
 
 
 class ScheduleUpdateRequest(BaseModel):

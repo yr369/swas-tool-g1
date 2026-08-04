@@ -249,6 +249,8 @@ export function ProjectDetail() {
         queueBusy={queueBusy}
         onEnqueue={handleEnqueue}
         onRemoveFromQueue={handleRemoveFromQueue}
+        onArchive={handleArchive}
+        archiving={archiving}
       />
 
       <Section
@@ -444,7 +446,7 @@ export function ProjectDetail() {
   );
 }
 
-function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy, onEnqueue, onRemoveFromQueue }) {
+function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy, onEnqueue, onRemoveFromQueue, onArchive, archiving }) {
   const [editing, setEditing] = useState(false);
   const [nameValue, setNameValue] = useState(project.name);
   const [platformValue, setPlatformValue] = useState(project.platform);
@@ -519,61 +521,80 @@ function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy, 
       </div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
         <h1 style={{ fontSize: 22, fontWeight: 500, margin: "0 0 4px" }}>{project.name}</h1>
-        <span className="mono" style={{ fontSize: 12, color: "var(--text-muted)" }}>#{project.id}</span>
+        <span
+          className="mono"
+          style={{ fontSize: 12, color: "var(--text-muted)" }}
+          title="Current position among existing projects (recalculated on delete) | Lifetime creation number (never changes)"
+        >
+          #{project.current_number} | #{project.id}
+        </span>
         <button className="btn" onClick={startEditing} style={{ padding: "3px 9px", fontSize: 11 }}>
           Edit
         </button>
-        <div style={{ marginLeft: "auto" }}>
-          {!queueEntry && (
-            <button
-              className="btn"
-              onClick={onEnqueue}
-              disabled={queueBusy}
-              style={{ padding: "5px 11px", fontSize: 11 }}
-            >
-              {queueBusy ? "…" : "+ Add to Execution Queue"}
-            </button>
-          )}
-          {queueEntry && queueEntry.status === "running" && (
-            <span
-              className="mono"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                fontSize: 11,
-                color: "var(--signal)",
-                border: "1px solid var(--signal)",
-                borderRadius: 999,
-                padding: "4px 10px",
-              }}
-            >
-              <span
-                aria-hidden="true"
-                style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--signal)", animation: "signal-pulse 1.6s ease-out infinite" }}
-              />
-              Running (queue)
-            </span>
-          )}
-          {queueEntry && queueEntry.status === "queued" && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <Link
-                to="/queue"
-                className="mono"
-                style={{ fontSize: 11, color: "var(--text-secondary)" }}
-                title="View execution queue"
-              >
-                Queued #{queueEntry.position}
-              </Link>
+        <div style={{ marginLeft: "auto", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {!queueEntry && (
               <button
                 className="btn"
-                onClick={onRemoveFromQueue}
+                onClick={onEnqueue}
                 disabled={queueBusy}
-                style={{ padding: "3px 9px", fontSize: 11, color: "var(--status-fail)" }}
+                style={{ padding: "5px 11px", fontSize: 11 }}
               >
-                {queueBusy ? "…" : "Remove"}
+                {queueBusy ? "…" : "+ Add to Execution Queue"}
               </button>
-            </div>
+            )}
+            {queueEntry && queueEntry.status === "running" && (
+              <span
+                className="mono"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 11,
+                  color: "var(--signal)",
+                  border: "1px solid var(--signal)",
+                  borderRadius: 999,
+                  padding: "4px 10px",
+                }}
+              >
+                <span
+                  aria-hidden="true"
+                  style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--signal)", animation: "signal-pulse 1.6s ease-out infinite" }}
+                />
+                Running (queue)
+              </span>
+            )}
+            {queueEntry && queueEntry.status === "queued" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <Link
+                  to="/queue"
+                  className="mono"
+                  style={{ fontSize: 11, color: "var(--text-secondary)" }}
+                  title="View execution queue"
+                >
+                  Queued #{queueEntry.position}
+                </Link>
+                <button
+                  className="btn"
+                  onClick={onRemoveFromQueue}
+                  disabled={queueBusy}
+                  style={{ padding: "3px 9px", fontSize: 11, color: "var(--status-fail)" }}
+                >
+                  {queueBusy ? "…" : "Remove"}
+                </button>
+              </div>
+            )}
+          </div>
+          {project.status !== "archived" && (
+            <button
+              className="btn"
+              onClick={onArchive}
+              disabled={archiving}
+              style={{ padding: "5px 11px", fontSize: 11 }}
+              title="Move this project from Active to Archived - reversible any time from the Danger zone section"
+            >
+              {archiving ? "Archiving…" : "Move to Archive"}
+            </button>
           )}
         </div>
       </div>

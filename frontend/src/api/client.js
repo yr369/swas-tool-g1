@@ -159,6 +159,7 @@ export const api = {
   triageFinding: (findingId) => request(`/findings/${findingId}/triage`, { method: "POST" }),
   getReportDraft: (findingId) => request(`/findings/${findingId}/report-draft`),
   triageAll: (projectId) => request(`/projects/${projectId}/triage-all`, { method: "POST" }),
+  triageAllProjects: () => request(`/findings/triage-all`, { method: "POST" }),
 
   // Readiness
   getReadiness: (findingId) => request(`/findings/${findingId}/readiness`),
