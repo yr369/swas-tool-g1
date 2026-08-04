@@ -25,7 +25,7 @@ import re
 
 import asyncpg
 
-from . import checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from . import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
 # Caps on how many hosts/urls each detective check runs against per
 # target, mirroring the existing live_hosts[:10] pattern elsewhere in
@@ -1472,6 +1472,44 @@ async def _phase_scan(
             continue
         if res is not None:
             await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
+    # Detective check: authenticated two-account IDOR confirmation.
+    # This is the actual "authenticated/multi-account testing" roadmap
+    # item, scoped to IDOR - see check_idor_multi_account's own
+    # docstring. Reuses the same candidate list as the two checks
+    # above. Costs nothing when the project has no "account_a"/
+    # "account_b" sessions stored (the two get_session() lookups
+    # happen once here, not per-URL, and check_idor_multi_account
+    # itself fails open per-URL too) so this always runs rather than
+    # being gated behind a separate feature flag.
+    has_sessions = False
+    try:
+        async with pool.acquire() as conn:
+            has_sessions = (
+                await auth_sessions.get_session(conn, project_id, "account_a") is not None
+                and await auth_sessions.get_session(conn, project_id, "account_b") is not None
+            )
+    except auth_policy.AuthPolicyError:
+        # Project isn't approved for authenticated testing (the
+        # default for every project) - correctly means "don't run
+        # this," not an error worth breaking the scan phase over.
+        pass
+    if has_sessions:
+        logger.info(
+            "detective: running authenticated multi-account IDOR check against %d URL(s)",
+            len(idor_candidates),
+        )
+        async with pool.acquire() as conn:
+            idor_multi_account_results = await asyncio.gather(
+                *(detective.check_idor_multi_account(conn, project_id, url) for url in idor_candidates),
+                return_exceptions=True,
+            )
+        for res in idor_multi_account_results:
+            if isinstance(res, Exception):
+                logger.debug("multi-account IDOR check raised: %s", res)
+                continue
+            if res is not None:
+                await _save_detective_finding_pooled(pool, project_id, target_id, res)
 
     # Detective check: reflected XSS (batch 9).
     xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]

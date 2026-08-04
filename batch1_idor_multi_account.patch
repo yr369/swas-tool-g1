@@ -1,0 +1,174 @@
+diff --git a/backend/app/detective/auth_access.py b/backend/app/detective/auth_access.py
+index 8623de5..c602ba4 100644
+--- a/backend/app/detective/auth_access.py
++++ b/backend/app/detective/auth_access.py
+@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+ 
+ import httpx
+ 
+-from .. import oob, secret_verifier
++from .. import auth_sessions, oob, secret_verifier
+ from .shared import (
+     logger,
+     _TIMEOUT,
+@@ -1260,6 +1260,102 @@ async def check_idor_unauthenticated_object_access(url: str) -> dict | None:
+     }
+ 
+ 
++def _session_to_headers(session: dict) -> dict[str, str]:
++    """
++    Turns an auth_sessions.get_session() dict into request headers.
++    Cookie/bearer_token/header are the three session_type values
++    auth_sessions.py accepts - see its _VALID_SESSION_TYPES.
++    """
++    value = session["credential_value"]
++    session_type = session["session_type"]
++    if session_type == "cookie":
++        return {"Cookie": value}
++    if session_type == "bearer_token":
++        return {"Authorization": f"Bearer {value}"}
++    # session_type == "header" - header_name is required and validated
++    # at store_session() time, so it's always present here.
++    return {session["header_name"]: value}
++
++
++async def check_idor_multi_account(
++    conn, project_id: int, url: str,
++    session_a: str = "account_a", session_b: str = "account_b",
++) -> dict | None:
++    """
++    The real, classic two-account IDOR proof that check_idor_candidate
++    and check_idor_unauthenticated_object_access both explicitly defer
++    to "the authenticated/multi-account testing roadmap item" - this
++    IS that item, applied to IDOR specifically.
++
++    Requires two named sessions (default names "account_a"/"account_b",
++    override if you've stored them under different names) already
++    stored via auth_sessions.store_session() for this project, which in
++    turn requires the project to be auth_policy-approved. If either
++    session isn't configured, this returns None immediately and silently
++    - same fail-open convention as every other check here - so running
++    this against a project with no sessions configured costs nothing
++    beyond two get_session() lookups; it's not gated at the pipeline
++    level for that reason, it can just be run unconditionally.
++
++    Methodology: request the SAME url as account_a (the account the URL
++    was presumably discovered/browsed under) and then again as
++    account_b (an unrelated second account with no legitimate claim to
++    that resource). If account_b's request comes back 200 AND its body
++    contains the same identity-shaped field values that account_a's
++    response contains, account_b retrieved account_a's private data -
++    that's a direct, confirmed IDOR with no guessing about neighboring
++    IDs or unauthenticated edge cases. If account_b is correctly denied
++    (401/403/404) or gets back different data, access control is
++    working and this returns None - no negative/noise finding, matching
++    every other check in this file.
++    """
++    try:
++        session_a_creds = await auth_sessions.get_session(conn, project_id, session_a)
++        session_b_creds = await auth_sessions.get_session(conn, project_id, session_b)
++    except auth_sessions.auth_policy.AuthPolicyError:
++        return None  # approval revoked mid-run - fail closed on the credential, not the scan
++    if not session_a_creds or not session_b_creds:
++        return None
++
++    try:
++        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
++        try:
++            resp_a = await client.get(url, headers=_session_to_headers(session_a_creds))
++            resp_b = await client.get(url, headers=_session_to_headers(session_b_creds))
++        except httpx.HTTPError:
++            return None
++    except httpx.HTTPError as exc:
++        logger.info("detective: multi-account IDOR check failed for %s: %s", url, exc)
++        return None
++
++    if resp_a.status_code != 200:
++        return None  # account_a couldn't even fetch its own resource - not a usable baseline
++    if resp_b.status_code != 200:
++        return None  # account_b was denied - access control is working here
++
++    fields_a = _extract_identity_fields(resp_a.text)
++    fields_b = _extract_identity_fields(resp_b.text)
++    if not fields_a:
++        return None  # nothing identity-shaped to compare, can't prove cross-account leakage
++
++    shared = fields_a & fields_b
++    if not shared:
++        return None  # account_b got a 200 but different content - likely its own resource, not A's
++
++    sample = next(iter(shared))
++    return {
++        "vuln_type": "idor_confirmed_multi_account",
++        "severity": "critical",
++        "evidence": (
++            f"{url}: requested as two independent accounts ({session_a!r} and {session_b!r}). "
++            f"Both received HTTP 200, and account {session_b!r}'s response contained identity "
++            f"data belonging to account {session_a!r} (matched value {sample!r}) - confirmed "
++            f"broken object-level access control, proven with two real authenticated sessions, "
++            f"not inferred from a numeric-ID pattern."
++        ),
++    }
++
++
+ _ADMIN_FUNCTIONAL_MARKERS = (
+     "log out", "logout", "sign out", "dashboard", "welcome back",
+     "manage users", "user management", "site settings", "admin panel",
+diff --git a/backend/app/pipeline.py b/backend/app/pipeline.py
+index a03b377..f1935e2 100644
+--- a/backend/app/pipeline.py
++++ b/backend/app/pipeline.py
+@@ -25,7 +25,7 @@ import re
+ 
+ import asyncpg
+ 
+-from . import checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
++from . import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+ 
+ # Caps on how many hosts/urls each detective check runs against per
+ # target, mirroring the existing live_hosts[:10] pattern elsewhere in
+@@ -1473,6 +1473,44 @@ async def _phase_scan(
+         if res is not None:
+             await _save_detective_finding_pooled(pool, project_id, target_id, res)
+ 
++    # Detective check: authenticated two-account IDOR confirmation.
++    # This is the actual "authenticated/multi-account testing" roadmap
++    # item, scoped to IDOR - see check_idor_multi_account's own
++    # docstring. Reuses the same candidate list as the two checks
++    # above. Costs nothing when the project has no "account_a"/
++    # "account_b" sessions stored (the two get_session() lookups
++    # happen once here, not per-URL, and check_idor_multi_account
++    # itself fails open per-URL too) so this always runs rather than
++    # being gated behind a separate feature flag.
++    has_sessions = False
++    try:
++        async with pool.acquire() as conn:
++            has_sessions = (
++                await auth_sessions.get_session(conn, project_id, "account_a") is not None
++                and await auth_sessions.get_session(conn, project_id, "account_b") is not None
++            )
++    except auth_policy.AuthPolicyError:
++        # Project isn't approved for authenticated testing (the
++        # default for every project) - correctly means "don't run
++        # this," not an error worth breaking the scan phase over.
++        pass
++    if has_sessions:
++        logger.info(
++            "detective: running authenticated multi-account IDOR check against %d URL(s)",
++            len(idor_candidates),
++        )
++        async with pool.acquire() as conn:
++            idor_multi_account_results = await asyncio.gather(
++                *(detective.check_idor_multi_account(conn, project_id, url) for url in idor_candidates),
++                return_exceptions=True,
++            )
++        for res in idor_multi_account_results:
++            if isinstance(res, Exception):
++                logger.debug("multi-account IDOR check raised: %s", res)
++                continue
++            if res is not None:
++                await _save_detective_finding_pooled(pool, project_id, target_id, res)
++
+     # Detective check: reflected XSS (batch 9).
+     xss_candidates = [url for url in sane_discovered_urls if "=" in url][:_XSS_CHECK_CAP]
+     logger.info(

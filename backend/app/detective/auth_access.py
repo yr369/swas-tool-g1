@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
-from .. import oob, secret_verifier
+from .. import auth_sessions, oob, secret_verifier
 from .shared import (
     logger,
     _TIMEOUT,
@@ -1256,6 +1256,102 @@ async def check_idor_unauthenticated_object_access(url: str) -> dict | None:
             f"{neighbor_url} returned a DIFFERENT identity value ({sample!r}) not present in "
             f"the original response - confirmed unauthorized cross-object data access, not "
             f"just a numeric-ID pattern candidate."
+        ),
+    }
+
+
+def _session_to_headers(session: dict) -> dict[str, str]:
+    """
+    Turns an auth_sessions.get_session() dict into request headers.
+    Cookie/bearer_token/header are the three session_type values
+    auth_sessions.py accepts - see its _VALID_SESSION_TYPES.
+    """
+    value = session["credential_value"]
+    session_type = session["session_type"]
+    if session_type == "cookie":
+        return {"Cookie": value}
+    if session_type == "bearer_token":
+        return {"Authorization": f"Bearer {value}"}
+    # session_type == "header" - header_name is required and validated
+    # at store_session() time, so it's always present here.
+    return {session["header_name"]: value}
+
+
+async def check_idor_multi_account(
+    conn, project_id: int, url: str,
+    session_a: str = "account_a", session_b: str = "account_b",
+) -> dict | None:
+    """
+    The real, classic two-account IDOR proof that check_idor_candidate
+    and check_idor_unauthenticated_object_access both explicitly defer
+    to "the authenticated/multi-account testing roadmap item" - this
+    IS that item, applied to IDOR specifically.
+
+    Requires two named sessions (default names "account_a"/"account_b",
+    override if you've stored them under different names) already
+    stored via auth_sessions.store_session() for this project, which in
+    turn requires the project to be auth_policy-approved. If either
+    session isn't configured, this returns None immediately and silently
+    - same fail-open convention as every other check here - so running
+    this against a project with no sessions configured costs nothing
+    beyond two get_session() lookups; it's not gated at the pipeline
+    level for that reason, it can just be run unconditionally.
+
+    Methodology: request the SAME url as account_a (the account the URL
+    was presumably discovered/browsed under) and then again as
+    account_b (an unrelated second account with no legitimate claim to
+    that resource). If account_b's request comes back 200 AND its body
+    contains the same identity-shaped field values that account_a's
+    response contains, account_b retrieved account_a's private data -
+    that's a direct, confirmed IDOR with no guessing about neighboring
+    IDs or unauthenticated edge cases. If account_b is correctly denied
+    (401/403/404) or gets back different data, access control is
+    working and this returns None - no negative/noise finding, matching
+    every other check in this file.
+    """
+    try:
+        session_a_creds = await auth_sessions.get_session(conn, project_id, session_a)
+        session_b_creds = await auth_sessions.get_session(conn, project_id, session_b)
+    except auth_sessions.auth_policy.AuthPolicyError:
+        return None  # approval revoked mid-run - fail closed on the credential, not the scan
+    if not session_a_creds or not session_b_creds:
+        return None
+
+    try:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+        try:
+            resp_a = await client.get(url, headers=_session_to_headers(session_a_creds))
+            resp_b = await client.get(url, headers=_session_to_headers(session_b_creds))
+        except httpx.HTTPError:
+            return None
+    except httpx.HTTPError as exc:
+        logger.info("detective: multi-account IDOR check failed for %s: %s", url, exc)
+        return None
+
+    if resp_a.status_code != 200:
+        return None  # account_a couldn't even fetch its own resource - not a usable baseline
+    if resp_b.status_code != 200:
+        return None  # account_b was denied - access control is working here
+
+    fields_a = _extract_identity_fields(resp_a.text)
+    fields_b = _extract_identity_fields(resp_b.text)
+    if not fields_a:
+        return None  # nothing identity-shaped to compare, can't prove cross-account leakage
+
+    shared = fields_a & fields_b
+    if not shared:
+        return None  # account_b got a 200 but different content - likely its own resource, not A's
+
+    sample = next(iter(shared))
+    return {
+        "vuln_type": "idor_confirmed_multi_account",
+        "severity": "critical",
+        "evidence": (
+            f"{url}: requested as two independent accounts ({session_a!r} and {session_b!r}). "
+            f"Both received HTTP 200, and account {session_b!r}'s response contained identity "
+            f"data belonging to account {session_a!r} (matched value {sample!r}) - confirmed "
+            f"broken object-level access control, proven with two real authenticated sessions, "
+            f"not inferred from a numeric-ID pattern."
         ),
     }
 
