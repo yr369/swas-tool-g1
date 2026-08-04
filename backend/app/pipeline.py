@@ -2110,6 +2110,22 @@ async def _phase_scan(
         if res is not None:
             await _save_scan_note_pooled(pool, project_id, target_id, "excessive_data_exposure_api", res)
 
+    # Detective check: excessive data exposure, VALUE-confirmed (not
+    # just field-name matching). See check_excessive_data_exposure_
+    # confirmed's own docstring. Reuses the same candidate list -
+    # cheap to run against the same URLs since it's just re-parsing
+    # the same JSON response with stricter validation.
+    excessive_exposure_confirmed_results = await asyncio.gather(
+        *(detective.check_excessive_data_exposure_confirmed(url) for url in excessive_exposure_candidates),
+        return_exceptions=True,
+    )
+    for res in excessive_exposure_confirmed_results:
+        if isinstance(res, Exception):
+            logger.debug("excessive data exposure (confirmed) check raised: %s", res)
+            continue
+        if res is not None:
+            await _save_detective_finding_pooled(pool, project_id, target_id, res)
+
     # Detective check: API version downgrade bypass.
     api_version_candidates = sane_discovered_urls[:_API_VERSION_DOWNGRADE_CHECK_CAP]
     logger.info(

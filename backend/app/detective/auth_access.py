@@ -731,6 +731,121 @@ _API_VERSION_RE = re.compile(r"/v(\d+)/")
 _DOWNGRADE_VERSIONS = ["v1", "v0", "beta", "internal", "legacy"]
 
 
+_SENSITIVE_HASH_RE = re.compile(r"^\$2[aby]\$|^\$argon2|^[a-f0-9]{32,}$", re.IGNORECASE)
+_SENSITIVE_SSN_RE = re.compile(r"^\d{3}-?\d{2}-?\d{4}$")
+_SENSITIVE_CC_RE = re.compile(r"^\d{13,19}$")
+_SENSITIVE_PLACEHOLDER_VALUES = {"", "null", "none", "n/a", "na", "***", "****", "redacted", "0", "false"}
+
+
+def _luhn_valid(digits: str) -> bool:
+    total = 0
+    parity = len(digits) % 2
+    for i, ch in enumerate(digits):
+        d = int(ch)
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _sensitive_value_looks_real(key: str, value) -> bool:
+    """
+    Distinguishes an actual leaked secret/PII value from a
+    suggestively-named field that's null, redacted, or a schema
+    placeholder - the single most common reason check_excessive_data_
+    exposure_api's field-name-only candidates get closed Informative.
+    Each key gets a shape check appropriate to what it claims to be,
+    same "verify the real thing" principle as secret_verifier.py.
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    if text.lower() in _SENSITIVE_PLACEHOLDER_VALUES:
+        return False
+    key_l = key.lower()
+    if key_l in ("password", "password_hash", "passwordhash", "hashed_password"):
+        return bool(_SENSITIVE_HASH_RE.match(text)) or len(text) >= 20
+    if key_l in ("ssn", "social_security"):
+        return bool(_SENSITIVE_SSN_RE.match(text))
+    if key_l in ("credit_card", "creditcard"):
+        digits_only = re.sub(r"[\s-]", "", text)
+        return bool(_SENSITIVE_CC_RE.match(digits_only)) and _luhn_valid(digits_only)
+    if key_l == "cvv":
+        return text.isdigit() and 3 <= len(text) <= 4
+    if key_l in ("api_secret", "private_key"):
+        return len(text) >= 16
+    if key_l == "is_admin":
+        return text.lower() in ("true", "1")
+    if key_l == "internal_notes":
+        return len(text) >= 3
+    return False  # "salt" deliberately excluded - not independently sensitive
+
+
+def _find_sensitive_key_values(obj, depth: int = 0) -> list[tuple[str, object]]:
+    if depth > 4:
+        return []
+    found: list[tuple[str, object]] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key.lower() in _EXCESSIVE_EXPOSURE_FIELD_NAMES:
+                found.append((key, value))
+            found.extend(_find_sensitive_key_values(value, depth + 1))
+    elif isinstance(obj, list):
+        for item in obj[:5]:
+            found.extend(_find_sensitive_key_values(item, depth + 1))
+    return found
+
+
+async def check_excessive_data_exposure_confirmed(url: str) -> dict | None:
+    """
+    Upgrades check_excessive_data_exposure_api (field-NAME matching
+    only, deliberately never became a findings-table row because a
+    field named 'password_hash' holding null/'***'/a placeholder isn't
+    a real leak) to actual VALUE validation: only fires when a
+    sensitive-looking field holds a value that actually matches the
+    shape of the real thing - a bcrypt/argon2/hex hash for password
+    fields, an SSN-shaped string, a credit-card number that passes a
+    Luhn checksum, etc. This is exactly the "impact over technical
+    validity" gap - a present-but-empty field name is routinely closed
+    Informative, a genuine hash or a Luhn-valid card number is not.
+    """
+    try:
+        client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=True)
+        resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.info("detective: excessive data exposure (confirmed) check failed for %s: %s", url, exc)
+        return None
+
+    try:
+        response_json = resp.json()
+    except Exception:
+        return None
+
+    confirmed = [
+        (key, value) for key, value in _find_sensitive_key_values(response_json)
+        if _sensitive_value_looks_real(key, value)
+    ]
+    if not confirmed:
+        return None
+
+    key, value = confirmed[0]
+    text = str(value)
+    masked = text[:4] + "..." if len(text) > 8 else "***"
+    field_list = ", ".join(sorted({k for k, _ in confirmed}))
+    return {
+        "vuln_type": "excessive_data_exposure_confirmed",
+        "severity": "high",
+        "evidence": (
+            f"{url}: response field {key!r} holds a real-looking value ({masked}) matching "
+            f"the expected shape for that field, not a null/placeholder - {len(confirmed)} "
+            f"sensitive field(s) confirmed with real data ({field_list}). Actual data exposure, "
+            f"not just a suggestively-named schema field."
+        ),
+    }
+
+
 async def check_api_version_downgrade_bypass(url: str) -> dict | None:
     """
     If a URL's path contains a version segment (/v2/, /v3/, etc.), tries
