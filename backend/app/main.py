@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -32,6 +33,9 @@ from .models import (
     ProjectUpdate,
     AuthPolicy,
     AuthSessionMeta,
+    AuthPolicyUpdateRequest,
+    AuthSessionUpsertRequest,
+    AuthSessionTestResult,
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
@@ -1056,6 +1060,137 @@ async def list_auth_sessions(project_id: int):
     pool = database.get_pool()
     async with pool.acquire() as conn:
         return await auth_sessions.list_sessions(conn, project_id)
+
+
+# --- Write paths for auth policy / sessions (project-card UI) ---
+#
+# Originally this was deliberately CLI-only (see auth_cli.py's docstring):
+# the reasoning was that an HTTP endpoint managing live bug-bounty
+# credentials is new attack surface on a box with "no login layer in
+# front of the API". That premise no longer holds - docker/caddy/Caddyfile
+# gates the entire site (UI + /api/* + /ws/*) behind basic_auth, so this
+# endpoint sits behind exactly the same auth boundary as every other
+# project-management route already in this file. Given that, requiring
+# SSH+CLI just to swap a dead credential mid-hunt was pure friction with
+# no remaining security benefit, so the write path moved here instead.
+#
+# What's still enforced, unchanged from the CLI path:
+#   - auth_policy.require_approved() still gates every session write/read
+#     (via auth_sessions.store_session/get_session, called as-is).
+#   - Credential values still only ever pass through auth_sessions.py's
+#     pgcrypto encrypt/decrypt - this file never sees a value at rest, and
+#     never logs one.
+#   - A decrypted credential_value returned by test_auth_session's one
+#     GET request is discarded the moment that function returns - it's
+#     used to build headers for exactly one outbound call and nothing
+#     else references it.
+
+@app.put("/api/projects/{project_id}/auth-policy", response_model=AuthPolicy)
+async def update_auth_policy(project_id: int, payload: AuthPolicyUpdateRequest):
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        proj = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
+        if not proj:
+            raise HTTPException(status_code=404, detail="Project not found")
+        await auth_policy.set_policy(conn, project_id, payload.status, payload.policy_note, payload.set_by)
+        return await auth_policy.get_policy(conn, project_id)
+
+
+@app.post("/api/projects/{project_id}/auth-sessions", response_model=AuthSessionMeta)
+async def upsert_auth_session(project_id: int, payload: AuthSessionUpsertRequest):
+    """
+    Add a new session or overwrite an existing one by session_name - the
+    same upsert store_session() already did for the CLI path, which is
+    exactly what "swap a dead credential mid-hunt" needs: re-add with the
+    same session_name and the new value replaces the old one in place,
+    nothing else (finding references, agent_loop history) has to change
+    since they only ever hold the session NAME, never the value.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        proj = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
+        if not proj:
+            raise HTTPException(status_code=404, detail="Project not found")
+        try:
+            await auth_sessions.store_session(
+                conn,
+                project_id,
+                payload.session_name,
+                payload.credential_value,
+                session_type=payload.session_type,
+                header_name=payload.header_name,
+                notes=payload.notes,
+            )
+        except auth_policy.AuthPolicyError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        rows = await auth_sessions.list_sessions(conn, project_id)
+        match = next((r for r in rows if r["session_name"] == payload.session_name), None)
+        if match is None:
+            raise HTTPException(status_code=500, detail="session stored but not found on re-read")
+        return match
+
+
+@app.delete("/api/projects/{project_id}/auth-sessions/{session_name}")
+async def remove_auth_session(project_id: int, session_name: str):
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        await auth_sessions.delete_session(conn, project_id, session_name)
+    return {"deleted": session_name}
+
+
+@app.post("/api/projects/{project_id}/auth-sessions/{session_name}/test", response_model=AuthSessionTestResult)
+async def test_auth_session(project_id: int, session_name: str):
+    """
+    Fires exactly one authenticated GET at the project's first in-scope
+    target and reports pass/fail, so a stale/wrong credential is caught
+    here instead of burning one of agent_loop's limited steps on it.
+    Header-building logic intentionally duplicated (not imported) from
+    agent_loop._build_credential_headers - that function is a private
+    helper local to the agent loop's own request path, not a shared
+    utility, and this endpoint has no other reason to import agent_loop.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        try:
+            session = await auth_sessions.get_session(conn, project_id, session_name)
+        except auth_policy.AuthPolicyError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"no session named {session_name!r} for this project")
+        target_row = await conn.fetchrow(
+            "SELECT target FROM scope_targets WHERE project_id = $1 AND in_scope = true ORDER BY id LIMIT 1",
+            project_id,
+        )
+
+    if not target_row:
+        return AuthSessionTestResult(session_name=session_name, ok=False, detail="no in-scope target to test against")
+
+    url = target_row["target"]
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    session_type = session["session_type"]
+    value = session["credential_value"]
+    if session_type == "cookie":
+        headers = {"Cookie": value}
+    elif session_type == "bearer_token":
+        headers = {"Authorization": f"Bearer {value}"}
+    else:
+        headers = {session["header_name"]: value}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+        return AuthSessionTestResult(
+            session_name=session_name,
+            ok=resp.status_code < 400,
+            status_code=resp.status_code,
+            detail=f"{resp.status_code} {resp.reason_phrase}",
+        )
+    except Exception as exc:
+        return AuthSessionTestResult(session_name=session_name, ok=False, detail=str(exc))
 
 
 @app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)

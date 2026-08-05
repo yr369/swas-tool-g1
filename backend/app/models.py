@@ -80,6 +80,27 @@ class AuthSessionMeta(BaseModel):
     last_used_at: Optional[datetime] = None
 
 
+class AuthPolicyUpdateRequest(BaseModel):
+    status: Literal["unset", "approved", "denied"]
+    policy_note: str
+    set_by: str
+
+
+class AuthSessionUpsertRequest(BaseModel):
+    session_name: str
+    session_type: Literal["cookie", "bearer_token", "header"] = "cookie"
+    header_name: Optional[str] = None
+    notes: Optional[str] = None
+    credential_value: str
+
+
+class AuthSessionTestResult(BaseModel):
+    session_name: str
+    ok: bool
+    status_code: Optional[int] = None
+    detail: str
+
+
 class Project(BaseModel):
     id: int
     name: str

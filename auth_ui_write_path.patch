@@ -1,0 +1,503 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 6808f62..5758027 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
+ from datetime import datetime, timedelta, timezone
+ from typing import List, Optional
+ 
++import httpx
+ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import FileResponse, StreamingResponse
+@@ -32,6 +33,9 @@ from .models import (
+     ProjectUpdate,
+     AuthPolicy,
+     AuthSessionMeta,
++    AuthPolicyUpdateRequest,
++    AuthSessionUpsertRequest,
++    AuthSessionTestResult,
+     ProjectBulkActionRequest,
+     ProjectBulkActionResult,
+     ScheduleUpdateRequest,
+@@ -1058,6 +1062,137 @@ async def list_auth_sessions(project_id: int):
+         return await auth_sessions.list_sessions(conn, project_id)
+ 
+ 
++# --- Write paths for auth policy / sessions (project-card UI) ---
++#
++# Originally this was deliberately CLI-only (see auth_cli.py's docstring):
++# the reasoning was that an HTTP endpoint managing live bug-bounty
++# credentials is new attack surface on a box with "no login layer in
++# front of the API". That premise no longer holds - docker/caddy/Caddyfile
++# gates the entire site (UI + /api/* + /ws/*) behind basic_auth, so this
++# endpoint sits behind exactly the same auth boundary as every other
++# project-management route already in this file. Given that, requiring
++# SSH+CLI just to swap a dead credential mid-hunt was pure friction with
++# no remaining security benefit, so the write path moved here instead.
++#
++# What's still enforced, unchanged from the CLI path:
++#   - auth_policy.require_approved() still gates every session write/read
++#     (via auth_sessions.store_session/get_session, called as-is).
++#   - Credential values still only ever pass through auth_sessions.py's
++#     pgcrypto encrypt/decrypt - this file never sees a value at rest, and
++#     never logs one.
++#   - A decrypted credential_value returned by test_auth_session's one
++#     GET request is discarded the moment that function returns - it's
++#     used to build headers for exactly one outbound call and nothing
++#     else references it.
++
++@app.put("/api/projects/{project_id}/auth-policy", response_model=AuthPolicy)
++async def update_auth_policy(project_id: int, payload: AuthPolicyUpdateRequest):
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        proj = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
++        if not proj:
++            raise HTTPException(status_code=404, detail="Project not found")
++        await auth_policy.set_policy(conn, project_id, payload.status, payload.policy_note, payload.set_by)
++        return await auth_policy.get_policy(conn, project_id)
++
++
++@app.post("/api/projects/{project_id}/auth-sessions", response_model=AuthSessionMeta)
++async def upsert_auth_session(project_id: int, payload: AuthSessionUpsertRequest):
++    """
++    Add a new session or overwrite an existing one by session_name - the
++    same upsert store_session() already did for the CLI path, which is
++    exactly what "swap a dead credential mid-hunt" needs: re-add with the
++    same session_name and the new value replaces the old one in place,
++    nothing else (finding references, agent_loop history) has to change
++    since they only ever hold the session NAME, never the value.
++    """
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        proj = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
++        if not proj:
++            raise HTTPException(status_code=404, detail="Project not found")
++        try:
++            await auth_sessions.store_session(
++                conn,
++                project_id,
++                payload.session_name,
++                payload.credential_value,
++                session_type=payload.session_type,
++                header_name=payload.header_name,
++                notes=payload.notes,
++            )
++        except auth_policy.AuthPolicyError as exc:
++            raise HTTPException(status_code=403, detail=str(exc))
++        except ValueError as exc:
++            raise HTTPException(status_code=400, detail=str(exc))
++        rows = await auth_sessions.list_sessions(conn, project_id)
++        match = next((r for r in rows if r["session_name"] == payload.session_name), None)
++        if match is None:
++            raise HTTPException(status_code=500, detail="session stored but not found on re-read")
++        return match
++
++
++@app.delete("/api/projects/{project_id}/auth-sessions/{session_name}")
++async def remove_auth_session(project_id: int, session_name: str):
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        await auth_sessions.delete_session(conn, project_id, session_name)
++    return {"deleted": session_name}
++
++
++@app.post("/api/projects/{project_id}/auth-sessions/{session_name}/test", response_model=AuthSessionTestResult)
++async def test_auth_session(project_id: int, session_name: str):
++    """
++    Fires exactly one authenticated GET at the project's first in-scope
++    target and reports pass/fail, so a stale/wrong credential is caught
++    here instead of burning one of agent_loop's limited steps on it.
++    Header-building logic intentionally duplicated (not imported) from
++    agent_loop._build_credential_headers - that function is a private
++    helper local to the agent loop's own request path, not a shared
++    utility, and this endpoint has no other reason to import agent_loop.
++    """
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        try:
++            session = await auth_sessions.get_session(conn, project_id, session_name)
++        except auth_policy.AuthPolicyError as exc:
++            raise HTTPException(status_code=403, detail=str(exc))
++        if session is None:
++            raise HTTPException(status_code=404, detail=f"no session named {session_name!r} for this project")
++        target_row = await conn.fetchrow(
++            "SELECT target FROM scope_targets WHERE project_id = $1 AND in_scope = true ORDER BY id LIMIT 1",
++            project_id,
++        )
++
++    if not target_row:
++        return AuthSessionTestResult(session_name=session_name, ok=False, detail="no in-scope target to test against")
++
++    url = target_row["target"]
++    if not url.startswith(("http://", "https://")):
++        url = f"https://{url}"
++
++    session_type = session["session_type"]
++    value = session["credential_value"]
++    if session_type == "cookie":
++        headers = {"Cookie": value}
++    elif session_type == "bearer_token":
++        headers = {"Authorization": f"Bearer {value}"}
++    else:
++        headers = {session["header_name"]: value}
++
++    try:
++        async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True) as client:
++            resp = await client.get(url, headers=headers)
++        return AuthSessionTestResult(
++            session_name=session_name,
++            ok=resp.status_code < 400,
++            status_code=resp.status_code,
++            detail=f"{resp.status_code} {resp.reason_phrase}",
++        )
++    except Exception as exc:
++        return AuthSessionTestResult(session_name=session_name, ok=False, detail=str(exc))
++
++
+ @app.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
+ async def bulk_project_action(payload: ProjectBulkActionRequest):
+     """
+diff --git a/backend/app/models.py b/backend/app/models.py
+index d847931..d75d0a8 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -80,6 +80,27 @@ class AuthSessionMeta(BaseModel):
+     last_used_at: Optional[datetime] = None
+ 
+ 
++class AuthPolicyUpdateRequest(BaseModel):
++    status: Literal["unset", "approved", "denied"]
++    policy_note: str
++    set_by: str
++
++
++class AuthSessionUpsertRequest(BaseModel):
++    session_name: str
++    session_type: Literal["cookie", "bearer_token", "header"] = "cookie"
++    header_name: Optional[str] = None
++    notes: Optional[str] = None
++    credential_value: str
++
++
++class AuthSessionTestResult(BaseModel):
++    session_name: str
++    ok: bool
++    status_code: Optional[int] = None
++    detail: str
++
++
+ class Project(BaseModel):
+     id: int
+     name: str
+diff --git a/frontend/src/api/client.js b/frontend/src/api/client.js
+index b0edbf2..f8933e2 100644
+--- a/frontend/src/api/client.js
++++ b/frontend/src/api/client.js
+@@ -41,6 +41,14 @@ export const api = {
+   getProject: (id) => request(`/projects/${id}`),
+   getAuthPolicy: (id) => request(`/projects/${id}/auth-policy`),
+   listAuthSessions: (id) => request(`/projects/${id}/auth-sessions`),
++  updateAuthPolicy: (id, payload) =>
++    request(`/projects/${id}/auth-policy`, { method: "PUT", body: JSON.stringify(payload) }),
++  upsertAuthSession: (id, payload) =>
++    request(`/projects/${id}/auth-sessions`, { method: "POST", body: JSON.stringify(payload) }),
++  deleteAuthSession: (id, sessionName) =>
++    request(`/projects/${id}/auth-sessions/${encodeURIComponent(sessionName)}`, { method: "DELETE" }),
++  testAuthSession: (id, sessionName) =>
++    request(`/projects/${id}/auth-sessions/${encodeURIComponent(sessionName)}/test`, { method: "POST" }),
+   updateProject: (id, payload) => request(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
+   createProject: (name, platform) =>
+     request("/projects", { method: "POST", body: JSON.stringify({ name, platform }) }),
+diff --git a/frontend/src/pages/ProjectDetail.jsx b/frontend/src/pages/ProjectDetail.jsx
+index c6bebdc..dc03906 100644
+--- a/frontend/src/pages/ProjectDetail.jsx
++++ b/frontend/src/pages/ProjectDetail.jsx
+@@ -606,23 +606,102 @@ function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy,
+   );
+ }
+ 
++const AUTH_SESSION_TYPES = ["cookie", "bearer_token", "header"];
++
++function emptySessionForm() {
++  return { session_name: "", session_type: "cookie", header_name: "", notes: "", credential_value: "" };
++}
++
+ function AuthTestingSection({ projectId }) {
+   const [expanded, setExpanded] = useState(false);
+   const [policy, setPolicy] = useState(null);
+   const [sessions, setSessions] = useState(null);
+   const [err, setErr] = useState(null);
+ 
++  const [policyForm, setPolicyForm] = useState(null); // {status, policy_note, set_by}
++  const [policySaving, setPolicySaving] = useState(false);
++
++  const [sessionForm, setSessionForm] = useState(null); // non-null = add/edit form open
++  const [sessionSaving, setSessionSaving] = useState(false);
++  const [sessionErr, setSessionErr] = useState(null);
++
++  const [testResults, setTestResults] = useState({}); // session_name -> {ok, detail, testing}
++
++  async function load() {
++    try {
++      const [p, s] = await Promise.all([api.getAuthPolicy(projectId), api.listAuthSessions(projectId)]);
++      setPolicy(p);
++      setSessions(s);
++      setPolicyForm({ status: p.status, policy_note: p.policy_note || "", set_by: p.set_by || "" });
++    } catch (e) {
++      setErr(e.message);
++    }
++  }
++
+   async function toggle() {
+     const next = !expanded;
+     setExpanded(next);
+-    if (next && policy === null) {
+-      try {
+-        const [p, s] = await Promise.all([api.getAuthPolicy(projectId), api.listAuthSessions(projectId)]);
+-        setPolicy(p);
+-        setSessions(s);
+-      } catch (e) {
+-        setErr(e.message);
+-      }
++    if (next && policy === null) await load();
++  }
++
++  async function savePolicy() {
++    if (!policyForm.policy_note.trim() || !policyForm.set_by.trim()) {
++      setErr("policy note and your name are required - this is the accountability trail for the decision.");
++      return;
++    }
++    setPolicySaving(true);
++    setErr(null);
++    try {
++      const p = await api.updateAuthPolicy(projectId, policyForm);
++      setPolicy(p);
++    } catch (e) {
++      setErr(e.message);
++    } finally {
++      setPolicySaving(false);
++    }
++  }
++
++  async function saveSession() {
++    if (!sessionForm.session_name.trim() || !sessionForm.credential_value.trim()) {
++      setSessionErr("session name and credential value are both required.");
++      return;
++    }
++    if (sessionForm.session_type === "header" && !sessionForm.header_name.trim()) {
++      setSessionErr("header_name is required when session type is 'header'.");
++      return;
++    }
++    setSessionSaving(true);
++    setSessionErr(null);
++    try {
++      await api.upsertAuthSession(projectId, sessionForm);
++      setSessionForm(null);
++      const s = await api.listAuthSessions(projectId);
++      setSessions(s);
++    } catch (e) {
++      setSessionErr(e.message);
++    } finally {
++      setSessionSaving(false);
++    }
++  }
++
++  async function removeSession(name) {
++    if (!window.confirm(`Delete session "${name}"? This can't be undone.`)) return;
++    try {
++      await api.deleteAuthSession(projectId, name);
++      const s = await api.listAuthSessions(projectId);
++      setSessions(s);
++    } catch (e) {
++      setErr(e.message);
++    }
++  }
++
++  async function testSession(name) {
++    setTestResults((r) => ({ ...r, [name]: { testing: true } }));
++    try {
++      const result = await api.testAuthSession(projectId, name);
++      setTestResults((r) => ({ ...r, [name]: result }));
++    } catch (e) {
++      setTestResults((r) => ({ ...r, [name]: { ok: false, detail: e.message } }));
+     }
+   }
+ 
+@@ -637,9 +716,9 @@ function AuthTestingSection({ projectId }) {
+         <div style={{ marginTop: 14 }}>
+           {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
+           {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
+-          {policy && (
++          {policy && policyForm && (
+             <>
+-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
++              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                 <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: statusColor[policy.status] }}>
+                   {policy.status.toUpperCase()}
+                 </span>
+@@ -649,9 +728,34 @@ function AuthTestingSection({ projectId }) {
+                   </span>
+                 )}
+               </div>
+-              {policy.policy_note && (
+-                <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 12px" }}>{policy.policy_note}</p>
+-              )}
++
++              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16, maxWidth: 480 }}>
++                <select
++                  className="input"
++                  value={policyForm.status}
++                  onChange={(e) => setPolicyForm({ ...policyForm, status: e.target.value })}
++                >
++                  <option value="unset">unset (default deny)</option>
++                  <option value="approved">approved</option>
++                  <option value="denied">denied</option>
++                </select>
++                <textarea
++                  className="input"
++                  placeholder="Why - e.g. 'program's VDP section 4.2 permits automated multi-account testing'. Required, this is the accountability trail."
++                  value={policyForm.policy_note}
++                  onChange={(e) => setPolicyForm({ ...policyForm, policy_note: e.target.value })}
++                  rows={2}
++                />
++                <input
++                  className="input"
++                  placeholder="your name"
++                  value={policyForm.set_by}
++                  onChange={(e) => setPolicyForm({ ...policyForm, set_by: e.target.value })}
++                />
++                <button className="btn" onClick={savePolicy} disabled={policySaving} style={{ alignSelf: "flex-start" }}>
++                  {policySaving ? "Saving…" : "Save policy"}
++                </button>
++              </div>
+ 
+               <div className="eyebrow" style={{ marginBottom: 6 }}>
+                 Sessions ({sessions?.length ?? 0})
+@@ -660,23 +764,112 @@ function AuthTestingSection({ projectId }) {
+                 <p style={{ fontSize: 13, color: "var(--text-muted)" }}>None registered.</p>
+               )}
+               {sessions && sessions.length > 0 && (
+-                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+-                  {sessions.map((s) => (
+-                    <div key={s.session_name} style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+-                      <span className="mono">{s.session_name}</span> ({s.session_type})
+-                      {s.last_used_at && <> · last used {formatDate(s.last_used_at)}</>}
+-                      {s.notes && <> · {s.notes}</>}
+-                    </div>
+-                  ))}
++                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
++                  {sessions.map((s) => {
++                    const tr = testResults[s.session_name];
++                    return (
++                      <div
++                        key={s.session_name}
++                        style={{ fontSize: 12, color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
++                      >
++                        <span className="mono">{s.session_name}</span> ({s.session_type})
++                        {s.last_used_at && <span>· last used {formatDate(s.last_used_at)}</span>}
++                        {s.notes && <span>· {s.notes}</span>}
++                        <button className="btn" onClick={() => testSession(s.session_name)} disabled={tr?.testing}>
++                          {tr?.testing ? "Testing…" : "Test"}
++                        </button>
++                        {tr && !tr.testing && (
++                          <span style={{ color: tr.ok ? "var(--status-success)" : "var(--status-fail)" }}>{tr.detail}</span>
++                        )}
++                        <button
++                          className="btn"
++                          onClick={() =>
++                            setSessionForm({
++                              session_name: s.session_name,
++                              session_type: s.session_type,
++                              header_name: s.header_name || "",
++                              notes: s.notes || "",
++                              credential_value: "",
++                            })
++                          }
++                        >
++                          Change credential
++                        </button>
++                        <button className="btn" onClick={() => removeSession(s.session_name)}>
++                          Delete
++                        </button>
++                      </div>
++                    );
++                  })}
++                </div>
++              )}
++
++              {sessionForm === null && (
++                <button className="btn" onClick={() => setSessionForm(emptySessionForm())}>
++                  Add session
++                </button>
++              )}
++
++              {sessionForm !== null && (
++                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10, maxWidth: 480, border: "1px solid var(--border)", borderRadius: 6, padding: 12 }}>
++                  <div className="eyebrow">
++                    {sessions?.some((s) => s.session_name === sessionForm.session_name) ? "Change credential" : "Add session"}
++                  </div>
++                  {sessionErr && <p style={{ color: "var(--status-fail)", fontSize: 12, margin: 0 }}>{sessionErr}</p>}
++                  <input
++                    className="input"
++                    placeholder="session name (e.g. user_a)"
++                    value={sessionForm.session_name}
++                    onChange={(e) => setSessionForm({ ...sessionForm, session_name: e.target.value })}
++                  />
++                  <select
++                    className="input"
++                    value={sessionForm.session_type}
++                    onChange={(e) => setSessionForm({ ...sessionForm, session_type: e.target.value })}
++                  >
++                    {AUTH_SESSION_TYPES.map((t) => (
++                      <option key={t} value={t}>
++                        {t}
++                      </option>
++                    ))}
++                  </select>
++                  {sessionForm.session_type === "header" && (
++                    <input
++                      className="input"
++                      placeholder="header name (e.g. X-Api-Key)"
++                      value={sessionForm.header_name}
++                      onChange={(e) => setSessionForm({ ...sessionForm, header_name: e.target.value })}
++                    />
++                  )}
++                  <input
++                    className="input"
++                    type="password"
++                    placeholder="credential value (cookie / token / header value) - re-enter every time, never shown back"
++                    value={sessionForm.credential_value}
++                    onChange={(e) => setSessionForm({ ...sessionForm, credential_value: e.target.value })}
++                  />
++                  <input
++                    className="input"
++                    placeholder="notes (optional, e.g. 'free-tier account') - never the secret itself"
++                    value={sessionForm.notes}
++                    onChange={(e) => setSessionForm({ ...sessionForm, notes: e.target.value })}
++                  />
++                  <div style={{ display: "flex", gap: 8 }}>
++                    <button className="btn" onClick={saveSession} disabled={sessionSaving}>
++                      {sessionSaving ? "Saving…" : "Save"}
++                    </button>
++                    <button className="btn" onClick={() => { setSessionForm(null); setSessionErr(null); }}>
++                      Cancel
++                    </button>
++                  </div>
+                 </div>
+               )}
+ 
+-              <p style={{ fontSize: 12, color: "var(--text-muted)", borderTop: "1px solid var(--border)", paddingTop: 10, margin: 0 }}>
+-                Approval and session credentials are managed via <code className="mono">auth_cli.py</code> over SSH,
+-                not from here - deliberately, since this box has no login layer in front of the API and this is the
+-                one feature that handles real account credentials. Run{" "}
+-                <code className="mono">python3 -m app.auth_cli status --project-id {projectId}</code> or{" "}
+-                <code className="mono">approve</code>/<code className="mono">add-session</code> on the OCI box.
++              <p style={{ fontSize: 12, color: "var(--text-muted)", borderTop: "1px solid var(--border)", paddingTop: 10, marginTop: 14 }}>
++                Credential values are encrypted at rest (pgcrypto) and only ever decrypted for one outbound request at
++                a time - they're never shown back here after saving. Approving with no session registered is
++                pointless but not blocked; <code className="mono">agent_loop.py</code> just won't advertise
++                authenticated actions to the model until at least one exists.
+               </p>
+             </>
+           )}

@@ -606,23 +606,102 @@ function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy, 
   );
 }
 
+const AUTH_SESSION_TYPES = ["cookie", "bearer_token", "header"];
+
+function emptySessionForm() {
+  return { session_name: "", session_type: "cookie", header_name: "", notes: "", credential_value: "" };
+}
+
 function AuthTestingSection({ projectId }) {
   const [expanded, setExpanded] = useState(false);
   const [policy, setPolicy] = useState(null);
   const [sessions, setSessions] = useState(null);
   const [err, setErr] = useState(null);
 
+  const [policyForm, setPolicyForm] = useState(null); // {status, policy_note, set_by}
+  const [policySaving, setPolicySaving] = useState(false);
+
+  const [sessionForm, setSessionForm] = useState(null); // non-null = add/edit form open
+  const [sessionSaving, setSessionSaving] = useState(false);
+  const [sessionErr, setSessionErr] = useState(null);
+
+  const [testResults, setTestResults] = useState({}); // session_name -> {ok, detail, testing}
+
+  async function load() {
+    try {
+      const [p, s] = await Promise.all([api.getAuthPolicy(projectId), api.listAuthSessions(projectId)]);
+      setPolicy(p);
+      setSessions(s);
+      setPolicyForm({ status: p.status, policy_note: p.policy_note || "", set_by: p.set_by || "" });
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
   async function toggle() {
     const next = !expanded;
     setExpanded(next);
-    if (next && policy === null) {
-      try {
-        const [p, s] = await Promise.all([api.getAuthPolicy(projectId), api.listAuthSessions(projectId)]);
-        setPolicy(p);
-        setSessions(s);
-      } catch (e) {
-        setErr(e.message);
-      }
+    if (next && policy === null) await load();
+  }
+
+  async function savePolicy() {
+    if (!policyForm.policy_note.trim() || !policyForm.set_by.trim()) {
+      setErr("policy note and your name are required - this is the accountability trail for the decision.");
+      return;
+    }
+    setPolicySaving(true);
+    setErr(null);
+    try {
+      const p = await api.updateAuthPolicy(projectId, policyForm);
+      setPolicy(p);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setPolicySaving(false);
+    }
+  }
+
+  async function saveSession() {
+    if (!sessionForm.session_name.trim() || !sessionForm.credential_value.trim()) {
+      setSessionErr("session name and credential value are both required.");
+      return;
+    }
+    if (sessionForm.session_type === "header" && !sessionForm.header_name.trim()) {
+      setSessionErr("header_name is required when session type is 'header'.");
+      return;
+    }
+    setSessionSaving(true);
+    setSessionErr(null);
+    try {
+      await api.upsertAuthSession(projectId, sessionForm);
+      setSessionForm(null);
+      const s = await api.listAuthSessions(projectId);
+      setSessions(s);
+    } catch (e) {
+      setSessionErr(e.message);
+    } finally {
+      setSessionSaving(false);
+    }
+  }
+
+  async function removeSession(name) {
+    if (!window.confirm(`Delete session "${name}"? This can't be undone.`)) return;
+    try {
+      await api.deleteAuthSession(projectId, name);
+      const s = await api.listAuthSessions(projectId);
+      setSessions(s);
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function testSession(name) {
+    setTestResults((r) => ({ ...r, [name]: { testing: true } }));
+    try {
+      const result = await api.testAuthSession(projectId, name);
+      setTestResults((r) => ({ ...r, [name]: result }));
+    } catch (e) {
+      setTestResults((r) => ({ ...r, [name]: { ok: false, detail: e.message } }));
     }
   }
 
@@ -637,9 +716,9 @@ function AuthTestingSection({ projectId }) {
         <div style={{ marginTop: 14 }}>
           {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
           {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
-          {policy && (
+          {policy && policyForm && (
             <>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
                 <span className="mono" style={{ fontSize: 12, fontWeight: 600, color: statusColor[policy.status] }}>
                   {policy.status.toUpperCase()}
                 </span>
@@ -649,9 +728,34 @@ function AuthTestingSection({ projectId }) {
                   </span>
                 )}
               </div>
-              {policy.policy_note && (
-                <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 12px" }}>{policy.policy_note}</p>
-              )}
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16, maxWidth: 480 }}>
+                <select
+                  className="input"
+                  value={policyForm.status}
+                  onChange={(e) => setPolicyForm({ ...policyForm, status: e.target.value })}
+                >
+                  <option value="unset">unset (default deny)</option>
+                  <option value="approved">approved</option>
+                  <option value="denied">denied</option>
+                </select>
+                <textarea
+                  className="input"
+                  placeholder="Why - e.g. 'program's VDP section 4.2 permits automated multi-account testing'. Required, this is the accountability trail."
+                  value={policyForm.policy_note}
+                  onChange={(e) => setPolicyForm({ ...policyForm, policy_note: e.target.value })}
+                  rows={2}
+                />
+                <input
+                  className="input"
+                  placeholder="your name"
+                  value={policyForm.set_by}
+                  onChange={(e) => setPolicyForm({ ...policyForm, set_by: e.target.value })}
+                />
+                <button className="btn" onClick={savePolicy} disabled={policySaving} style={{ alignSelf: "flex-start" }}>
+                  {policySaving ? "Saving…" : "Save policy"}
+                </button>
+              </div>
 
               <div className="eyebrow" style={{ marginBottom: 6 }}>
                 Sessions ({sessions?.length ?? 0})
@@ -660,23 +764,112 @@ function AuthTestingSection({ projectId }) {
                 <p style={{ fontSize: 13, color: "var(--text-muted)" }}>None registered.</p>
               )}
               {sessions && sessions.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
-                  {sessions.map((s) => (
-                    <div key={s.session_name} style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-                      <span className="mono">{s.session_name}</span> ({s.session_type})
-                      {s.last_used_at && <> · last used {formatDate(s.last_used_at)}</>}
-                      {s.notes && <> · {s.notes}</>}
-                    </div>
-                  ))}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+                  {sessions.map((s) => {
+                    const tr = testResults[s.session_name];
+                    return (
+                      <div
+                        key={s.session_name}
+                        style={{ fontSize: 12, color: "var(--text-secondary)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+                      >
+                        <span className="mono">{s.session_name}</span> ({s.session_type})
+                        {s.last_used_at && <span>· last used {formatDate(s.last_used_at)}</span>}
+                        {s.notes && <span>· {s.notes}</span>}
+                        <button className="btn" onClick={() => testSession(s.session_name)} disabled={tr?.testing}>
+                          {tr?.testing ? "Testing…" : "Test"}
+                        </button>
+                        {tr && !tr.testing && (
+                          <span style={{ color: tr.ok ? "var(--status-success)" : "var(--status-fail)" }}>{tr.detail}</span>
+                        )}
+                        <button
+                          className="btn"
+                          onClick={() =>
+                            setSessionForm({
+                              session_name: s.session_name,
+                              session_type: s.session_type,
+                              header_name: s.header_name || "",
+                              notes: s.notes || "",
+                              credential_value: "",
+                            })
+                          }
+                        >
+                          Change credential
+                        </button>
+                        <button className="btn" onClick={() => removeSession(s.session_name)}>
+                          Delete
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
-              <p style={{ fontSize: 12, color: "var(--text-muted)", borderTop: "1px solid var(--border)", paddingTop: 10, margin: 0 }}>
-                Approval and session credentials are managed via <code className="mono">auth_cli.py</code> over SSH,
-                not from here - deliberately, since this box has no login layer in front of the API and this is the
-                one feature that handles real account credentials. Run{" "}
-                <code className="mono">python3 -m app.auth_cli status --project-id {projectId}</code> or{" "}
-                <code className="mono">approve</code>/<code className="mono">add-session</code> on the OCI box.
+              {sessionForm === null && (
+                <button className="btn" onClick={() => setSessionForm(emptySessionForm())}>
+                  Add session
+                </button>
+              )}
+
+              {sessionForm !== null && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10, maxWidth: 480, border: "1px solid var(--border)", borderRadius: 6, padding: 12 }}>
+                  <div className="eyebrow">
+                    {sessions?.some((s) => s.session_name === sessionForm.session_name) ? "Change credential" : "Add session"}
+                  </div>
+                  {sessionErr && <p style={{ color: "var(--status-fail)", fontSize: 12, margin: 0 }}>{sessionErr}</p>}
+                  <input
+                    className="input"
+                    placeholder="session name (e.g. user_a)"
+                    value={sessionForm.session_name}
+                    onChange={(e) => setSessionForm({ ...sessionForm, session_name: e.target.value })}
+                  />
+                  <select
+                    className="input"
+                    value={sessionForm.session_type}
+                    onChange={(e) => setSessionForm({ ...sessionForm, session_type: e.target.value })}
+                  >
+                    {AUTH_SESSION_TYPES.map((t) => (
+                      <option key={t} value={t}>
+                        {t}
+                      </option>
+                    ))}
+                  </select>
+                  {sessionForm.session_type === "header" && (
+                    <input
+                      className="input"
+                      placeholder="header name (e.g. X-Api-Key)"
+                      value={sessionForm.header_name}
+                      onChange={(e) => setSessionForm({ ...sessionForm, header_name: e.target.value })}
+                    />
+                  )}
+                  <input
+                    className="input"
+                    type="password"
+                    placeholder="credential value (cookie / token / header value) - re-enter every time, never shown back"
+                    value={sessionForm.credential_value}
+                    onChange={(e) => setSessionForm({ ...sessionForm, credential_value: e.target.value })}
+                  />
+                  <input
+                    className="input"
+                    placeholder="notes (optional, e.g. 'free-tier account') - never the secret itself"
+                    value={sessionForm.notes}
+                    onChange={(e) => setSessionForm({ ...sessionForm, notes: e.target.value })}
+                  />
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn" onClick={saveSession} disabled={sessionSaving}>
+                      {sessionSaving ? "Saving…" : "Save"}
+                    </button>
+                    <button className="btn" onClick={() => { setSessionForm(null); setSessionErr(null); }}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <p style={{ fontSize: 12, color: "var(--text-muted)", borderTop: "1px solid var(--border)", paddingTop: 10, marginTop: 14 }}>
+                Credential values are encrypted at rest (pgcrypto) and only ever decrypted for one outbound request at
+                a time - they're never shown back here after saving. Approving with no session registered is
+                pointless but not blocked; <code className="mono">agent_loop.py</code> just won't advertise
+                authenticated actions to the model until at least one exists.
               </p>
             </>
           )}

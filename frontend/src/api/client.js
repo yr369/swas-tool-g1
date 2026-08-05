@@ -41,6 +41,14 @@ export const api = {
   getProject: (id) => request(`/projects/${id}`),
   getAuthPolicy: (id) => request(`/projects/${id}/auth-policy`),
   listAuthSessions: (id) => request(`/projects/${id}/auth-sessions`),
+  updateAuthPolicy: (id, payload) =>
+    request(`/projects/${id}/auth-policy`, { method: "PUT", body: JSON.stringify(payload) }),
+  upsertAuthSession: (id, payload) =>
+    request(`/projects/${id}/auth-sessions`, { method: "POST", body: JSON.stringify(payload) }),
+  deleteAuthSession: (id, sessionName) =>
+    request(`/projects/${id}/auth-sessions/${encodeURIComponent(sessionName)}`, { method: "DELETE" }),
+  testAuthSession: (id, sessionName) =>
+    request(`/projects/${id}/auth-sessions/${encodeURIComponent(sessionName)}/test`, { method: "POST" }),
   updateProject: (id, payload) => request(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   createProject: (name, platform) =>
     request("/projects", { method: "POST", body: JSON.stringify({ name, platform }) }),
