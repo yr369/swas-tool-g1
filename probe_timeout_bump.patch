@@ -1,0 +1,22 @@
+diff --git a/backend/app/tools.py b/backend/app/tools.py
+index 50f2cce..36596d1 100644
+--- a/backend/app/tools.py
++++ b/backend/app/tools.py
+@@ -356,7 +356,7 @@ async def run_httpx(hosts: list[str]) -> ToolResult:
+         # This is fingerprint-once, reuse-everywhere: every other tool
+         # downstream gets this info instead of re-detecting on its own.
+         ["httpx-pd", "-silent", "-td", "-json"] + target_flags + header_flags,
+-        timeout_seconds=120,
++        timeout_seconds=300,
+         mutate_args_fn=httpx_mutation,
+     )
+ 
+@@ -366,7 +366,7 @@ async def run_gau(domain: str) -> ToolResult:
+     return await run_tool(
+         "gau",
+         ["gau", domain],
+-        timeout_seconds=120,
++        timeout_seconds=300,
+     )
+ 
+ 
