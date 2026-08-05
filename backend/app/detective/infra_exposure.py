@@ -37,6 +37,7 @@ from .shared import (
     _shannon_entropy,
     _replace_query_param,
     get_transport,
+    _GRAPHQL_PATHS,
 )
 
 _SECRET_KEYWORD_PATTERN = re.compile(

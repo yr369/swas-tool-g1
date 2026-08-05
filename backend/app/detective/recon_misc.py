@@ -38,6 +38,7 @@ from .shared import (
     _shannon_entropy,
     _replace_query_param,
     get_transport,
+    _GRAPHQL_PATHS,
 )
 
 _TAKEOVER_FINGERPRINTS: list[tuple[str, str, str]] = [
@@ -325,7 +326,6 @@ async def check_csp_weakness(url: str) -> str | None:
     return None
 
 
-_GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql", "/graphql/console"]
 _INTROSPECTION_QUERY = {
     "query": "{__schema{queryType{name} mutationType{name} types{name kind fields{name}}}}"
 }

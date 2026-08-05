@@ -175,3 +175,6 @@ def _replace_query_param(parsed, query_params: dict, target_param: str, value: s
     return urlunparse(parsed._replace(query=new_query))
 
 
+_GRAPHQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql", "/graphql/console"]
+
+
