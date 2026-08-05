@@ -55,14 +55,23 @@ class ProjectUpdate(BaseModel):
     # docstring for what this is used for.
     is_canary: Optional[bool] = None
     canary_baseline_finding_count: Optional[int] = None
+    # agent_loop.py investigation step-budget override (migration 018).
+    # None/omitted = leave unchanged. Pass 0 to clear back to the
+    # hardcoded default (_DEFAULT_MAX_STEPS) - same "sentinel clears an
+    # override" pattern as preferred_ai_model's "", chosen instead of ""
+    # here because this field is an int, not a string, and 0 is outside
+    # the valid 1-25 range so it can't collide with a real value.
+    agent_loop_max_steps: Optional[int] = None
 
 
 # ---------- Authenticated / multi-account testing ----------
-# Read-only web-facing surface over auth_policy.py / auth_sessions.py.
-# Approving a project and creating/deleting sessions stays CLI-only by
-# deliberate design (see auth_cli.py's docstring) - this only exposes
-# visibility into current status, nothing that can move a project out
-# of default-deny or handle a credential.
+# Web-facing surface over auth_policy.py / auth_sessions.py. Originally
+# read-only-only (approving a project and creating/deleting sessions was
+# CLI-only, see auth_cli.py's docstring) - that changed once the whole
+# app moved behind Caddy basic_auth for every route, removing the "no
+# login layer in front of the API" premise the CLI-only decision was
+# based on. Write endpoints now live in main.py alongside these models;
+# auth_cli.py still works unchanged as an alternative path.
 
 class AuthPolicy(BaseModel):
     status: Literal["unset", "approved", "denied"]
@@ -114,6 +123,7 @@ class Project(BaseModel):
     preferred_ai_model: Optional[str] = None
     is_canary: bool = False
     canary_baseline_finding_count: Optional[int] = None
+    agent_loop_max_steps: Optional[int] = None
     # Count of real findings (severity != 'info') - drives the grey/dim
     # card treatment in ProjectList when a project has nothing worth
     # opening it for. Deliberately excludes 'info' severity and the

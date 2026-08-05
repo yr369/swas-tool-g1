@@ -343,7 +343,7 @@ export function ProjectDetail() {
 
       <ScanHistorySection projectId={id} />
 
-      <AuthTestingSection projectId={id} />
+      <AuthTestingSection projectId={id} project={project} onSaved={loadAll} />
 
       <Section title="Scope">
         <ScopeInsights projectId={id} />
@@ -612,11 +612,19 @@ function emptySessionForm() {
   return { session_name: "", session_type: "cookie", header_name: "", notes: "", credential_value: "" };
 }
 
-function AuthTestingSection({ projectId }) {
+function AuthTestingSection({ projectId, project, onSaved }) {
   const [expanded, setExpanded] = useState(false);
   const [policy, setPolicy] = useState(null);
   const [sessions, setSessions] = useState(null);
   const [err, setErr] = useState(null);
+
+  const [maxStepsValue, setMaxStepsValue] = useState(project?.agent_loop_max_steps ?? "");
+  const [maxStepsSaving, setMaxStepsSaving] = useState(false);
+  const [maxStepsErr, setMaxStepsErr] = useState(null);
+
+  useEffect(() => {
+    setMaxStepsValue(project?.agent_loop_max_steps ?? "");
+  }, [project?.agent_loop_max_steps]);
 
   const [policyForm, setPolicyForm] = useState(null); // {status, policy_note, set_by}
   const [policySaving, setPolicySaving] = useState(false);
@@ -705,6 +713,25 @@ function AuthTestingSection({ projectId }) {
     }
   }
 
+  async function saveMaxSteps() {
+    const trimmed = String(maxStepsValue).trim();
+    const num = trimmed === "" ? 0 : Number(trimmed);
+    if (!Number.isInteger(num) || num < 0 || num > 25) {
+      setMaxStepsErr("Enter 1-25, or leave blank / 0 to use the default (12).");
+      return;
+    }
+    setMaxStepsSaving(true);
+    setMaxStepsErr(null);
+    try {
+      await api.updateProject(projectId, { agent_loop_max_steps: num });
+      if (onSaved) await onSaved();
+    } catch (e) {
+      setMaxStepsErr(e.message);
+    } finally {
+      setMaxStepsSaving(false);
+    }
+  }
+
   const statusColor = { approved: "var(--status-success)", denied: "var(--status-fail)", unset: "var(--text-muted)" };
 
   return (
@@ -714,6 +741,33 @@ function AuthTestingSection({ projectId }) {
       </button>
       {expanded && (
         <div style={{ marginTop: 14 }}>
+          <div style={{ marginBottom: 16, paddingBottom: 14, borderBottom: "1px solid var(--border)" }}>
+            <div className="eyebrow" style={{ marginBottom: 6 }}>
+              logic_hunter investigation step budget
+            </div>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 8px" }}>
+              How many read-only probes agent_loop.py can take per hypothesis before it has to conclude. Applies to
+              every logic_hunter investigation on this project, authenticated or not - default is 12 if left blank,
+              hard ceiling is 25 regardless of what's set here.
+            </p>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                max={25}
+                placeholder="12 (default)"
+                value={maxStepsValue}
+                onChange={(e) => setMaxStepsValue(e.target.value)}
+                style={{ maxWidth: 120 }}
+              />
+              <button className="btn" onClick={saveMaxSteps} disabled={maxStepsSaving}>
+                {maxStepsSaving ? "Saving…" : "Save"}
+              </button>
+            </div>
+            {maxStepsErr && <p style={{ color: "var(--status-fail)", fontSize: 12, margin: "6px 0 0" }}>{maxStepsErr}</p>}
+          </div>
+
           {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
           {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
           {policy && policyForm && (

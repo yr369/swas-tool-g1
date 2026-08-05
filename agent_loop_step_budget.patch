@@ -1,0 +1,361 @@
+diff --git a/backend/app/agent_loop.py b/backend/app/agent_loop.py
+index 92190bc..ae348be 100644
+--- a/backend/app/agent_loop.py
++++ b/backend/app/agent_loop.py
+@@ -13,7 +13,8 @@ documented-but-unused parameter change behavior?
+ 
+ This module generalizes that one bolted-on verification step into a real
+ multi-step agent: given a hypothesis and the target's known attack
+-surface, a strong model can issue up to `_MAX_STEPS` safe, read-only
++surface, a strong model can issue up to `_DEFAULT_MAX_STEPS` (or a
++per-project override, up to `_HARD_STEP_CEILING`) safe, read-only
+ probes, look at each result, and decide what to check next - then hands
+ back (a) an investigation summary appended to the finding's evidence,
+ same spirit as before, and (b) every endpoint it touched, so the caller
+@@ -55,7 +56,7 @@ important than investigation depth or cleverness:
+     session NAME (a label, not a secret) is recorded, so the resulting
+     finding can say "confirmed via session user_a" without ever holding
+     onto what that session actually was.
+-  - A hard step ceiling (`_MAX_STEPS`) is enforced by the Python loop
++  - A hard step ceiling (`_HARD_STEP_CEILING`) is enforced by the Python loop
+     itself, not just mentioned in the prompt - the loop physically
+     cannot issue more than this many model calls or requests no matter
+     what the model asks for or how the response is phrased.
+@@ -79,11 +80,12 @@ logger = logging.getLogger("swas.agent_loop")
+ # Same strong model already used for logic_hunter's initial hypothesis
+ # reasoning (hunt_cluster) - this is the other half of that same
+ # reasoning-heavy, low-volume budget (only runs per saved hypothesis,
+-# capped at _MAX_STEPS calls each), so it stays on the strong model
++# capped at _HARD_STEP_CEILING calls each), so it stays on the strong model
+ # rather than the cheap gate-tier one the old single-GET verifier used.
+ _MODEL = "gemini-2.5-pro"
+ 
+-_MAX_STEPS = 6
++_DEFAULT_MAX_STEPS = 12
++_HARD_STEP_CEILING = 25
+ _STEP_TIMEOUT = 10.0
+ _BODY_SAMPLE_CHARS = 800
+ _HISTORY_RESULT_CHARS = 500
+@@ -346,9 +348,9 @@ def _render_history_block(history: list[dict]) -> str:
+ 
+ 
+ async def _force_conclude(client: genai.Client, hypothesis: str, target_name: str,
+-                           target_type: str, history: list[dict]) -> tuple[str | None, float | None]:
++                           target_type: str, history: list[dict], max_steps: int) -> tuple[str | None, float | None]:
+     prompt = _FORCE_CONCLUDE_PROMPT.format(
+-        max_steps=_MAX_STEPS, target_name=target_name, target_type=target_type,
++        max_steps=max_steps, target_name=target_name, target_type=target_type,
+         hypothesis=hypothesis[:2000], history_block=_render_history_block(history),
+     )
+     try:
+@@ -374,7 +376,8 @@ def _render_summary(conclusion: str | None, confidence, steps_taken: int, histor
+ 
+ 
+ async def investigate(hypothesis: str, target_name: str, target_type: str | None,
+-                       surface_context: str, conn=None, project_id: int | None = None) -> dict:
++                       surface_context: str, conn=None, project_id: int | None = None,
++                       max_steps: int | None = None) -> dict:
+     """
+     Runs the bounded multi-step loop for one hypothesis. Returns:
+       {"summary": str,              - evidence-appendix text, same role the old
+@@ -391,10 +394,22 @@ async def investigate(hypothesis: str, target_name: str, target_type: str | None
+     never raises AuthPolicyError itself, it just silently falls back to
+     anonymous investigation when authenticated probing isn't available.
+ 
++    max_steps: per-call override of the step budget (e.g. a project's
++    agent_loop_max_steps column, migration 018). None uses
++    _DEFAULT_MAX_STEPS. Whatever comes in is always clamped to
++    [1, _HARD_STEP_CEILING] IN CODE, here, regardless of what the caller
++    passes - a bad config value (or a future caller that forgets to
++    validate) can never make this loop issue more than
++    _HARD_STEP_CEILING model calls/requests. This mirrors the same
++    "hard ceiling enforced by the Python loop itself" property the
++    module docstring already promises for the step count in general.
++
+     Never raises - any failure (model error, malformed JSON, etc.) ends
+     the loop early with whatever was learned so far rather than losing
+     the whole investigation.
+     """
++    effective_max_steps = max(1, min(max_steps or _DEFAULT_MAX_STEPS, _HARD_STEP_CEILING))
++
+     client = _get_client()
+     history: list[dict] = []
+     endpoints_seen: list[dict] = []
+@@ -419,10 +434,10 @@ async def investigate(hypothesis: str, target_name: str, target_type: str | None
+         session_block = ""
+         auth_rule_block = _NO_AUTH_RULE_BLOCK
+ 
+-    for step_num in range(1, _MAX_STEPS + 1):
++    for step_num in range(1, effective_max_steps + 1):
+         steps_taken = step_num
+         prompt = _AGENT_STEP_PROMPT.format(
+-            max_steps=_MAX_STEPS, step_num=step_num, target_name=target_name,
++            max_steps=effective_max_steps, step_num=step_num, target_name=target_name,
+             target_type=target_type or "website", surface_context=surface_context,
+             hypothesis=hypothesis[:2000], history_block=_render_history_block(history),
+             session_block=session_block, auth_rule_block=auth_rule_block,
+@@ -448,7 +463,9 @@ async def investigate(hypothesis: str, target_name: str, target_type: str | None
+         history.append({"action": action if isinstance(action, dict) else {"action": "invalid"}, "result": result})
+ 
+     if conclusion is None:
+-        conclusion, confidence = await _force_conclude(client, hypothesis, target_name, target_type or "website", history)
++        conclusion, confidence = await _force_conclude(
++            client, hypothesis, target_name, target_type or "website", history, effective_max_steps,
++        )
+ 
+     return {
+         "summary": _render_summary(conclusion, confidence, steps_taken, history),
+diff --git a/backend/app/logic_hunter.py b/backend/app/logic_hunter.py
+index dd6b5a4..9d2b79b 100644
+--- a/backend/app/logic_hunter.py
++++ b/backend/app/logic_hunter.py
+@@ -254,6 +254,9 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
+     just read" requirement from the build-order notes.
+     """
+     confidence = result.get("confidence") or 0.0
++    max_steps_row = await conn.fetchrow(
++        "SELECT agent_loop_max_steps FROM projects WHERE id = $1", project_id,
++    )
+     investigation = await agent_loop.investigate(
+         hypothesis=result["hypothesis"] or "",
+         target_name=target_name,
+@@ -261,6 +264,7 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
+         surface_context=result.get("surface_context") or "No attack-surface context available.",
+         conn=conn,
+         project_id=project_id,
++        max_steps=max_steps_row["agent_loop_max_steps"] if max_steps_row else None,
+     )
+     evidence = f"[ai-hypothesis: needs manual verification, confidence={confidence:.2f}]\n{result['hypothesis']}"
+     evidence += f"\n{investigation['summary']}"
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 5758027..a78ba55 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -877,7 +877,7 @@ async def list_projects():
+             """
+             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
+                    p.next_scheduled_scan_at, p.created_at,
+-                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
++                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count, p.agent_loop_max_steps,
+                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
+                    (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
+@@ -951,7 +951,7 @@ async def get_project(project_id: int):
+             """
+             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
+                    p.next_scheduled_scan_at, p.created_at,
+-                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
++                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count, p.agent_loop_max_steps,
+                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
+                    (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
+@@ -982,11 +982,14 @@ async def update_project(project_id: int, payload: ProjectUpdate):
+         v is None for v in (
+             payload.name, payload.platform, payload.preferred_ai_model,
+             payload.is_canary, payload.canary_baseline_finding_count,
++            payload.agent_loop_max_steps,
+         )
+     ):
+         raise HTTPException(status_code=400, detail="Provide at least one field to update")
+     if payload.name is not None and not payload.name.strip():
+         raise HTTPException(status_code=400, detail="name can't be empty")
++    if payload.agent_loop_max_steps is not None and not (0 <= payload.agent_loop_max_steps <= 25):
++        raise HTTPException(status_code=400, detail="agent_loop_max_steps must be 0 (clear override) or 1-25")
+ 
+     pool = database.get_pool()
+     async with pool.acquire() as conn:
+@@ -1002,6 +1005,13 @@ async def update_project(project_id: int, payload: ProjectUpdate):
+         )
+         clear_model_override = payload.preferred_ai_model == ""
+ 
++        # Same clear-sentinel pattern for agent_loop_max_steps, using 0
++        # instead of "" since this field is an int (see ProjectUpdate).
++        agent_loop_max_steps_value = (
++            None if payload.agent_loop_max_steps == 0 else payload.agent_loop_max_steps
++        )
++        clear_max_steps_override = payload.agent_loop_max_steps == 0
++
+         await conn.execute(
+             """
+             UPDATE projects
+@@ -1009,17 +1019,19 @@ async def update_project(project_id: int, payload: ProjectUpdate):
+                 platform = COALESCE($3, platform),
+                 preferred_ai_model = CASE WHEN $6 THEN NULL ELSE COALESCE($4, preferred_ai_model) END,
+                 is_canary = COALESCE($5, is_canary),
+-                canary_baseline_finding_count = COALESCE($7, canary_baseline_finding_count)
++                canary_baseline_finding_count = COALESCE($7, canary_baseline_finding_count),
++                agent_loop_max_steps = CASE WHEN $9 THEN NULL ELSE COALESCE($8, agent_loop_max_steps) END
+             WHERE id = $1
+             """,
+             project_id, payload.name, payload.platform, preferred_ai_model_value,
+             payload.is_canary, clear_model_override, payload.canary_baseline_finding_count,
++            agent_loop_max_steps_value, clear_max_steps_override,
+         )
+         row = await conn.fetchrow(
+             """
+             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
+                    p.next_scheduled_scan_at, p.created_at,
+-                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
++                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count, p.agent_loop_max_steps,
+                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
+                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
+                    (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
+diff --git a/backend/app/models.py b/backend/app/models.py
+index d75d0a8..6036b2a 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -55,14 +55,23 @@ class ProjectUpdate(BaseModel):
+     # docstring for what this is used for.
+     is_canary: Optional[bool] = None
+     canary_baseline_finding_count: Optional[int] = None
++    # agent_loop.py investigation step-budget override (migration 018).
++    # None/omitted = leave unchanged. Pass 0 to clear back to the
++    # hardcoded default (_DEFAULT_MAX_STEPS) - same "sentinel clears an
++    # override" pattern as preferred_ai_model's "", chosen instead of ""
++    # here because this field is an int, not a string, and 0 is outside
++    # the valid 1-25 range so it can't collide with a real value.
++    agent_loop_max_steps: Optional[int] = None
+ 
+ 
+ # ---------- Authenticated / multi-account testing ----------
+-# Read-only web-facing surface over auth_policy.py / auth_sessions.py.
+-# Approving a project and creating/deleting sessions stays CLI-only by
+-# deliberate design (see auth_cli.py's docstring) - this only exposes
+-# visibility into current status, nothing that can move a project out
+-# of default-deny or handle a credential.
++# Web-facing surface over auth_policy.py / auth_sessions.py. Originally
++# read-only-only (approving a project and creating/deleting sessions was
++# CLI-only, see auth_cli.py's docstring) - that changed once the whole
++# app moved behind Caddy basic_auth for every route, removing the "no
++# login layer in front of the API" premise the CLI-only decision was
++# based on. Write endpoints now live in main.py alongside these models;
++# auth_cli.py still works unchanged as an alternative path.
+ 
+ class AuthPolicy(BaseModel):
+     status: Literal["unset", "approved", "denied"]
+@@ -114,6 +123,7 @@ class Project(BaseModel):
+     preferred_ai_model: Optional[str] = None
+     is_canary: bool = False
+     canary_baseline_finding_count: Optional[int] = None
++    agent_loop_max_steps: Optional[int] = None
+     # Count of real findings (severity != 'info') - drives the grey/dim
+     # card treatment in ProjectList when a project has nothing worth
+     # opening it for. Deliberately excludes 'info' severity and the
+diff --git a/backend/db/migrations/018_agent_loop_max_steps.sql b/backend/db/migrations/018_agent_loop_max_steps.sql
+new file mode 100644
+index 0000000..a7769b1
+--- /dev/null
++++ b/backend/db/migrations/018_agent_loop_max_steps.sql
+@@ -0,0 +1,17 @@
++-- 018_agent_loop_max_steps.sql
++-- Per-project override for agent_loop.py's investigation step budget.
++--
++-- Same pattern as preferred_ai_model (batch 26 item 3): nullable, no
++-- default beyond NULL. NULL means "use the hardcoded default"
++-- (_DEFAULT_MAX_STEPS in agent_loop.py, bumped 6->12 alongside this
++-- migration) - this column only exists to let a specific project run
++-- deeper (up to 25) when its auth flows/chains genuinely need more
++-- steps to reach a boundary, without raising the default for every
++-- project and burning Gemini quota on runs that didn't need it.
++--
++-- The CHECK constraint (1-25) is a second, independent enforcement of
++-- the same hard ceiling agent_loop.py's Python loop already enforces in
++-- code (_HARD_STEP_CEILING) - a bad value can't even be written to the
++-- database, let alone reach the loop.
++ALTER TABLE projects ADD COLUMN IF NOT EXISTS agent_loop_max_steps INTEGER
++    CHECK (agent_loop_max_steps IS NULL OR (agent_loop_max_steps BETWEEN 1 AND 25));
+diff --git a/frontend/src/pages/ProjectDetail.jsx b/frontend/src/pages/ProjectDetail.jsx
+index dc03906..618f007 100644
+--- a/frontend/src/pages/ProjectDetail.jsx
++++ b/frontend/src/pages/ProjectDetail.jsx
+@@ -343,7 +343,7 @@ export function ProjectDetail() {
+ 
+       <ScanHistorySection projectId={id} />
+ 
+-      <AuthTestingSection projectId={id} />
++      <AuthTestingSection projectId={id} project={project} onSaved={loadAll} />
+ 
+       <Section title="Scope">
+         <ScopeInsights projectId={id} />
+@@ -612,12 +612,20 @@ function emptySessionForm() {
+   return { session_name: "", session_type: "cookie", header_name: "", notes: "", credential_value: "" };
+ }
+ 
+-function AuthTestingSection({ projectId }) {
++function AuthTestingSection({ projectId, project, onSaved }) {
+   const [expanded, setExpanded] = useState(false);
+   const [policy, setPolicy] = useState(null);
+   const [sessions, setSessions] = useState(null);
+   const [err, setErr] = useState(null);
+ 
++  const [maxStepsValue, setMaxStepsValue] = useState(project?.agent_loop_max_steps ?? "");
++  const [maxStepsSaving, setMaxStepsSaving] = useState(false);
++  const [maxStepsErr, setMaxStepsErr] = useState(null);
++
++  useEffect(() => {
++    setMaxStepsValue(project?.agent_loop_max_steps ?? "");
++  }, [project?.agent_loop_max_steps]);
++
+   const [policyForm, setPolicyForm] = useState(null); // {status, policy_note, set_by}
+   const [policySaving, setPolicySaving] = useState(false);
+ 
+@@ -705,6 +713,25 @@ function AuthTestingSection({ projectId }) {
+     }
+   }
+ 
++  async function saveMaxSteps() {
++    const trimmed = String(maxStepsValue).trim();
++    const num = trimmed === "" ? 0 : Number(trimmed);
++    if (!Number.isInteger(num) || num < 0 || num > 25) {
++      setMaxStepsErr("Enter 1-25, or leave blank / 0 to use the default (12).");
++      return;
++    }
++    setMaxStepsSaving(true);
++    setMaxStepsErr(null);
++    try {
++      await api.updateProject(projectId, { agent_loop_max_steps: num });
++      if (onSaved) await onSaved();
++    } catch (e) {
++      setMaxStepsErr(e.message);
++    } finally {
++      setMaxStepsSaving(false);
++    }
++  }
++
+   const statusColor = { approved: "var(--status-success)", denied: "var(--status-fail)", unset: "var(--text-muted)" };
+ 
+   return (
+@@ -714,6 +741,33 @@ function AuthTestingSection({ projectId }) {
+       </button>
+       {expanded && (
+         <div style={{ marginTop: 14 }}>
++          <div style={{ marginBottom: 16, paddingBottom: 14, borderBottom: "1px solid var(--border)" }}>
++            <div className="eyebrow" style={{ marginBottom: 6 }}>
++              logic_hunter investigation step budget
++            </div>
++            <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 8px" }}>
++              How many read-only probes agent_loop.py can take per hypothesis before it has to conclude. Applies to
++              every logic_hunter investigation on this project, authenticated or not - default is 12 if left blank,
++              hard ceiling is 25 regardless of what's set here.
++            </p>
++            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
++              <input
++                className="input"
++                type="number"
++                min={0}
++                max={25}
++                placeholder="12 (default)"
++                value={maxStepsValue}
++                onChange={(e) => setMaxStepsValue(e.target.value)}
++                style={{ maxWidth: 120 }}
++              />
++              <button className="btn" onClick={saveMaxSteps} disabled={maxStepsSaving}>
++                {maxStepsSaving ? "Saving…" : "Save"}
++              </button>
++            </div>
++            {maxStepsErr && <p style={{ color: "var(--status-fail)", fontSize: 12, margin: "6px 0 0" }}>{maxStepsErr}</p>}
++          </div>
++
+           {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
+           {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
+           {policy && policyForm && (

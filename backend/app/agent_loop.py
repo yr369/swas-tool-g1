@@ -13,7 +13,8 @@ documented-but-unused parameter change behavior?
 
 This module generalizes that one bolted-on verification step into a real
 multi-step agent: given a hypothesis and the target's known attack
-surface, a strong model can issue up to `_MAX_STEPS` safe, read-only
+surface, a strong model can issue up to `_DEFAULT_MAX_STEPS` (or a
+per-project override, up to `_HARD_STEP_CEILING`) safe, read-only
 probes, look at each result, and decide what to check next - then hands
 back (a) an investigation summary appended to the finding's evidence,
 same spirit as before, and (b) every endpoint it touched, so the caller
@@ -55,7 +56,7 @@ important than investigation depth or cleverness:
     session NAME (a label, not a secret) is recorded, so the resulting
     finding can say "confirmed via session user_a" without ever holding
     onto what that session actually was.
-  - A hard step ceiling (`_MAX_STEPS`) is enforced by the Python loop
+  - A hard step ceiling (`_HARD_STEP_CEILING`) is enforced by the Python loop
     itself, not just mentioned in the prompt - the loop physically
     cannot issue more than this many model calls or requests no matter
     what the model asks for or how the response is phrased.
@@ -79,11 +80,12 @@ logger = logging.getLogger("swas.agent_loop")
 # Same strong model already used for logic_hunter's initial hypothesis
 # reasoning (hunt_cluster) - this is the other half of that same
 # reasoning-heavy, low-volume budget (only runs per saved hypothesis,
-# capped at _MAX_STEPS calls each), so it stays on the strong model
+# capped at _HARD_STEP_CEILING calls each), so it stays on the strong model
 # rather than the cheap gate-tier one the old single-GET verifier used.
 _MODEL = "gemini-2.5-pro"
 
-_MAX_STEPS = 6
+_DEFAULT_MAX_STEPS = 12
+_HARD_STEP_CEILING = 25
 _STEP_TIMEOUT = 10.0
 _BODY_SAMPLE_CHARS = 800
 _HISTORY_RESULT_CHARS = 500
@@ -346,9 +348,9 @@ def _render_history_block(history: list[dict]) -> str:
 
 
 async def _force_conclude(client: genai.Client, hypothesis: str, target_name: str,
-                           target_type: str, history: list[dict]) -> tuple[str | None, float | None]:
+                           target_type: str, history: list[dict], max_steps: int) -> tuple[str | None, float | None]:
     prompt = _FORCE_CONCLUDE_PROMPT.format(
-        max_steps=_MAX_STEPS, target_name=target_name, target_type=target_type,
+        max_steps=max_steps, target_name=target_name, target_type=target_type,
         hypothesis=hypothesis[:2000], history_block=_render_history_block(history),
     )
     try:
@@ -374,7 +376,8 @@ def _render_summary(conclusion: str | None, confidence, steps_taken: int, histor
 
 
 async def investigate(hypothesis: str, target_name: str, target_type: str | None,
-                       surface_context: str, conn=None, project_id: int | None = None) -> dict:
+                       surface_context: str, conn=None, project_id: int | None = None,
+                       max_steps: int | None = None) -> dict:
     """
     Runs the bounded multi-step loop for one hypothesis. Returns:
       {"summary": str,              - evidence-appendix text, same role the old
@@ -391,10 +394,22 @@ async def investigate(hypothesis: str, target_name: str, target_type: str | None
     never raises AuthPolicyError itself, it just silently falls back to
     anonymous investigation when authenticated probing isn't available.
 
+    max_steps: per-call override of the step budget (e.g. a project's
+    agent_loop_max_steps column, migration 018). None uses
+    _DEFAULT_MAX_STEPS. Whatever comes in is always clamped to
+    [1, _HARD_STEP_CEILING] IN CODE, here, regardless of what the caller
+    passes - a bad config value (or a future caller that forgets to
+    validate) can never make this loop issue more than
+    _HARD_STEP_CEILING model calls/requests. This mirrors the same
+    "hard ceiling enforced by the Python loop itself" property the
+    module docstring already promises for the step count in general.
+
     Never raises - any failure (model error, malformed JSON, etc.) ends
     the loop early with whatever was learned so far rather than losing
     the whole investigation.
     """
+    effective_max_steps = max(1, min(max_steps or _DEFAULT_MAX_STEPS, _HARD_STEP_CEILING))
+
     client = _get_client()
     history: list[dict] = []
     endpoints_seen: list[dict] = []
@@ -419,10 +434,10 @@ async def investigate(hypothesis: str, target_name: str, target_type: str | None
         session_block = ""
         auth_rule_block = _NO_AUTH_RULE_BLOCK
 
-    for step_num in range(1, _MAX_STEPS + 1):
+    for step_num in range(1, effective_max_steps + 1):
         steps_taken = step_num
         prompt = _AGENT_STEP_PROMPT.format(
-            max_steps=_MAX_STEPS, step_num=step_num, target_name=target_name,
+            max_steps=effective_max_steps, step_num=step_num, target_name=target_name,
             target_type=target_type or "website", surface_context=surface_context,
             hypothesis=hypothesis[:2000], history_block=_render_history_block(history),
             session_block=session_block, auth_rule_block=auth_rule_block,
@@ -448,7 +463,9 @@ async def investigate(hypothesis: str, target_name: str, target_type: str | None
         history.append({"action": action if isinstance(action, dict) else {"action": "invalid"}, "result": result})
 
     if conclusion is None:
-        conclusion, confidence = await _force_conclude(client, hypothesis, target_name, target_type or "website", history)
+        conclusion, confidence = await _force_conclude(
+            client, hypothesis, target_name, target_type or "website", history, effective_max_steps,
+        )
 
     return {
         "summary": _render_summary(conclusion, confidence, steps_taken, history),

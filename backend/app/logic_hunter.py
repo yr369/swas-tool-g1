@@ -254,6 +254,9 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
     just read" requirement from the build-order notes.
     """
     confidence = result.get("confidence") or 0.0
+    max_steps_row = await conn.fetchrow(
+        "SELECT agent_loop_max_steps FROM projects WHERE id = $1", project_id,
+    )
     investigation = await agent_loop.investigate(
         hypothesis=result["hypothesis"] or "",
         target_name=target_name,
@@ -261,6 +264,7 @@ async def _save_hypothesis(conn, project_id: int, target_id: int, target_name: s
         surface_context=result.get("surface_context") or "No attack-surface context available.",
         conn=conn,
         project_id=project_id,
+        max_steps=max_steps_row["agent_loop_max_steps"] if max_steps_row else None,
     )
     evidence = f"[ai-hypothesis: needs manual verification, confidence={confidence:.2f}]\n{result['hypothesis']}"
     evidence += f"\n{investigation['summary']}"

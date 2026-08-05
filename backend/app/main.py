@@ -877,7 +877,7 @@ async def list_projects():
             """
             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
                    p.next_scheduled_scan_at, p.created_at,
-                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
+                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count, p.agent_loop_max_steps,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
                    (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
@@ -951,7 +951,7 @@ async def get_project(project_id: int):
             """
             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
                    p.next_scheduled_scan_at, p.created_at,
-                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
+                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count, p.agent_loop_max_steps,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
                    (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
@@ -982,11 +982,14 @@ async def update_project(project_id: int, payload: ProjectUpdate):
         v is None for v in (
             payload.name, payload.platform, payload.preferred_ai_model,
             payload.is_canary, payload.canary_baseline_finding_count,
+            payload.agent_loop_max_steps,
         )
     ):
         raise HTTPException(status_code=400, detail="Provide at least one field to update")
     if payload.name is not None and not payload.name.strip():
         raise HTTPException(status_code=400, detail="name can't be empty")
+    if payload.agent_loop_max_steps is not None and not (0 <= payload.agent_loop_max_steps <= 25):
+        raise HTTPException(status_code=400, detail="agent_loop_max_steps must be 0 (clear override) or 1-25")
 
     pool = database.get_pool()
     async with pool.acquire() as conn:
@@ -1002,6 +1005,13 @@ async def update_project(project_id: int, payload: ProjectUpdate):
         )
         clear_model_override = payload.preferred_ai_model == ""
 
+        # Same clear-sentinel pattern for agent_loop_max_steps, using 0
+        # instead of "" since this field is an int (see ProjectUpdate).
+        agent_loop_max_steps_value = (
+            None if payload.agent_loop_max_steps == 0 else payload.agent_loop_max_steps
+        )
+        clear_max_steps_override = payload.agent_loop_max_steps == 0
+
         await conn.execute(
             """
             UPDATE projects
@@ -1009,17 +1019,19 @@ async def update_project(project_id: int, payload: ProjectUpdate):
                 platform = COALESCE($3, platform),
                 preferred_ai_model = CASE WHEN $6 THEN NULL ELSE COALESCE($4, preferred_ai_model) END,
                 is_canary = COALESCE($5, is_canary),
-                canary_baseline_finding_count = COALESCE($7, canary_baseline_finding_count)
+                canary_baseline_finding_count = COALESCE($7, canary_baseline_finding_count),
+                agent_loop_max_steps = CASE WHEN $9 THEN NULL ELSE COALESCE($8, agent_loop_max_steps) END
             WHERE id = $1
             """,
             project_id, payload.name, payload.platform, preferred_ai_model_value,
             payload.is_canary, clear_model_override, payload.canary_baseline_finding_count,
+            agent_loop_max_steps_value, clear_max_steps_override,
         )
         row = await conn.fetchrow(
             """
             SELECT p.id, p.name, p.platform, p.status, p.scan_interval_hours,
                    p.next_scheduled_scan_at, p.created_at,
-                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count,
+                   p.preferred_ai_model, p.is_canary, p.canary_baseline_finding_count, p.agent_loop_max_steps,
                    (SELECT MAX(started_at) FROM scan_runs WHERE project_id = p.id) AS last_scan_at,
                    (SELECT COUNT(*) FROM scan_runs WHERE project_id = p.id) AS scan_count,
                    (SELECT COUNT(*) FROM findings WHERE project_id = p.id AND severity != 'info') AS open_findings_count,
