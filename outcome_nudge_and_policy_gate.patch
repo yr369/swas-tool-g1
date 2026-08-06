@@ -1,0 +1,704 @@
+diff --git a/backend/app/models.py b/backend/app/models.py
+index 6036b2a..2a08ec3 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -12,7 +12,7 @@ Each table in init.sql has a matching set of models here:
+ """
+ 
+ from datetime import datetime
+-from typing import Literal, Optional
++from typing import List, Literal, Optional
+ from pydantic import BaseModel
+ 
+ # Program platform the project/target belongs to. "private" covers
+@@ -110,6 +110,21 @@ class AuthSessionTestResult(BaseModel):
+     detail: str
+ 
+ 
++class ProjectPolicyUpdateRequest(BaseModel):
++    raw_text: str
++
++
++class PolicyExclusion(BaseModel):
++    category: str
++    reason: str = ""
++
++
++class ProjectPolicy(BaseModel):
++    raw_text: Optional[str] = None
++    exclusions: List[PolicyExclusion] = []
++    parsed_at: Optional[datetime] = None
++
++
+ class Project(BaseModel):
+     id: int
+     name: str
+diff --git a/backend/app/policy_gate.py b/backend/app/policy_gate.py
+new file mode 100644
+index 0000000..759d6d4
+--- /dev/null
++++ b/backend/app/policy_gate.py
+@@ -0,0 +1,125 @@
++"""
++policy_gate.py - turns a program's pasted scope/policy document into a
++structured list of what THAT program specifically excludes, and formats
++it for injection into triage.py's prompt.
++
++Why this exists separately from triage.py's existing generic
++policy-exclusion guidance (see _TRIAGE_PROMPT): that guidance is real
++and correct bug-bounty-industry-standard knowledge (DoS, self-XSS, open
++redirects alone, etc. are USUALLY excluded everywhere) - but "usually"
++isn't "always", and programs vary. A check across production data
++during batch work on this tool found the impact-hint scorer working
++correctly but starved of real outcome data to validate against; a
++program-specific override on top of the already-good generic guidance
++is a more direct lever than more scanner tuning; that's the origin of
++this module. Pasting a program's actual policy text once lets its real,
++specific rules augment (not replace) the generic guidance every finding
++already gets judged against.
++
++Fails open throughout: any parse failure returns [] (no exclusions
++added, existing behavior unchanged) rather than raising - a broken
++Gemini call must never block triage or scanning, same principle as
++gate.py and fp_filter.py.
++"""
++
++import json
++import logging
++import os
++
++from google import genai
++
++from .gemini_rotation import generate_with_rotation
++
++logger = logging.getLogger("swas.policy_gate")
++
++_CHEAP_MODEL = "gemini-2.0-flash"
++
++_PARSE_PROMPT = """You are extracting bug bounty program policy rules from a pasted \
++scope/policy document. Identify every vulnerability category or finding type this \
++SPECIFIC program explicitly excludes, treats as out-of-scope, or says it will not \
++reward - including anything unusual that differs from typical bug bounty norms.
++
++Policy document (may be partial, informally written, or a raw copy-paste from a \
++program page - work with what's given):
++---
++{raw_text}
++---
++
++Respond with ONLY a JSON array, no other text, no markdown fences. Each element:
++{{"category": "short name of the excluded finding type, e.g. \\"self-XSS\\" or \\"rate limiting\\"", \
++"reason": "one sentence, quoting or closely paraphrasing what the policy actually says about it"}}
++
++If the document explicitly says it WILL reward something usually excluded elsewhere \
++(e.g. "we do pay for confirmed DoS with PoC"), include that too with \
++"category": "ALLOWED: <thing>" so triage knows to treat it as an override, not an \
++exclusion. If the document has no clear exclusions or you can't find any, respond \
++with an empty JSON array: []
++"""
++
++
++def _get_client() -> genai.Client:
++    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
++
++
++async def parse_policy_exclusions(raw_text: str) -> list[dict]:
++    """
++    Calls Gemini once to extract structured exclusions from a pasted
++    policy document. Returns [] on any failure (empty input, API error,
++    malformed JSON) - callers should treat [] as "nothing to add" and
++    proceed exactly as if this module didn't exist, not as an error
++    that needs surfacing every time.
++    """
++    text = (raw_text or "").strip()
++    if not text:
++        return []
++
++    client = _get_client()
++    prompt = _PARSE_PROMPT.format(raw_text=text[:8000])  # cap - policy pages can be long, this is plenty for exclusion lists
++
++    try:
++        response, _model_used = await generate_with_rotation(client, prompt, preferred_model=_CHEAP_MODEL)
++        parsed = json.loads((response.text or "").strip().strip("`").removeprefix("json").strip())
++        if not isinstance(parsed, list):
++            logger.warning("Policy parse returned non-list JSON, discarding: %r", parsed)
++            return []
++        cleaned = [
++            {"category": str(item.get("category", "")).strip(), "reason": str(item.get("reason", "")).strip()}
++            for item in parsed
++            if isinstance(item, dict) and item.get("category")
++        ]
++        return cleaned
++    except Exception:
++        logger.exception("Policy exclusion parse failed - proceeding with no program-specific overrides")
++        return []
++
++
++def format_policy_context(exclusions: list[dict] | None) -> str:
++    """
++    Formats parsed exclusions into a prompt block for triage.py, same
++    pattern as _format_outcome_context there. Returns "" for None/empty
++    (the realistic case for most projects, which haven't had a policy
++    pasted in) - the prompt reads naturally without this section rather
++    than referencing an empty list.
++    """
++    if not exclusions:
++        return ""
++
++    lines = []
++    for item in exclusions:
++        category = item.get("category", "")
++        reason = item.get("reason", "")
++        if not category:
++            continue
++        lines.append(f"- {category}: {reason}" if reason else f"- {category}")
++
++    if not lines:
++        return ""
++
++    return (
++        "\nThis specific program's own published policy adds the following - these are "
++        "REAL rules from THIS program, not general bug-bounty norms, and take precedence "
++        "over the general guidance above where they conflict. Anything prefixed "
++        "\"ALLOWED:\" means this program explicitly WILL reward that category despite it "
++        "being commonly excluded elsewhere - do not downgrade severity for those:\n"
++        + "\n".join(lines) + "\n"
++    )
+diff --git a/backend/app/routers/health.py b/backend/app/routers/health.py
+index 004dfc6..edcbc15 100644
+--- a/backend/app/routers/health.py
++++ b/backend/app/routers/health.py
+@@ -90,6 +90,11 @@ async def health_dashboard():
+     one broken check, e.g. a tool binary genuinely missing, can't take
+     the whole dashboard down) - a section reporting an error is itself
+     useful signal, not a 500.
++
++    Also surfaces submitted findings with no outcome ever logged back
++    (see outcomes_awaiting/outcomes_awaiting_total below) - the entire
++    outcome-learning loop depends on that data existing, and it's easy
++    to forget days after a program actually responds.
+     """
+     pool = database.get_pool()
+ 
+@@ -176,6 +181,41 @@ async def health_dashboard():
+             "SELECT count(*) FROM scope_targets WHERE dead_since IS NOT NULL"
+         )
+ 
++        # Outcome-logging nudge: findings marked 'submitted' that never
++        # got a real-world result logged back via POST /api/outcomes.
++        # This is the entire learning loop's fuel (gate's impact-hint
++        # calibration, triage's outcome-history retrieval) - a check
++        # against production data found only 20 outcomes ever logged
++        # across 18,949 findings, not because the logging feature is
++        # missing (it's a button right on each submitted finding in
++        # FindingsList.jsx, plus an "only awaiting outcome" filter) but
++        # because it's easy to forget once a program actually responds,
++        # days or weeks after submission. Surfacing the count here - the
++        # same dashboard already used to notice retry-queue backlog or
++        # evidence rot - means it's visible without a manual SQL query,
++        # same as everything else on this page. Same capped-list-plus-
++        # total pattern as dead_targets above.
++        outcomes_awaiting_rows = await conn.fetch(
++            """
++            SELECT f.id, f.vuln_type, f.created_at, p.id AS project_id, p.name AS project_name
++            FROM findings f
++            JOIN scope_targets t ON t.id = f.target_id
++            JOIN projects p ON p.id = t.project_id
++            WHERE f.status = 'submitted'
++              AND NOT EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id)
++            ORDER BY f.created_at ASC
++            LIMIT 10
++            """
++        )
++        outcomes_awaiting_total = await conn.fetchval(
++            """
++            SELECT count(*)
++            FROM findings f
++            WHERE f.status = 'submitted'
++              AND NOT EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id)
++            """
++        )
++
+     canaries = []
+     for row in canary_rows:
+         baseline = row["canary_baseline_finding_count"]
+@@ -201,6 +241,17 @@ async def health_dashboard():
+         for r in dead_target_rows
+     ]
+ 
++    outcomes_awaiting = [
++        {
++            "finding_id": r["id"],
++            "vuln_type": r["vuln_type"],
++            "project_id": r["project_id"],
++            "project_name": r["project_name"],
++            "submitted_since": r["created_at"].isoformat() if r["created_at"] else None,
++        }
++        for r in outcomes_awaiting_rows
++    ]
++
+     return {
+         "database_ok": db_ok,
+         "ai": {
+@@ -232,6 +283,8 @@ async def health_dashboard():
+             "dead_targets": dead_targets,
+             "dead_targets_total": dead_targets_total,
+         },
++        "outcomes_awaiting": outcomes_awaiting,
++        "outcomes_awaiting_total": outcomes_awaiting_total,
+     }
+ 
+ 
+diff --git a/backend/app/routers/projects.py b/backend/app/routers/projects.py
+index 43f67b1..433c008 100644
+--- a/backend/app/routers/projects.py
++++ b/backend/app/routers/projects.py
+@@ -8,6 +8,7 @@ monolithic main.py.
+ import asyncio
+ import csv
+ import io
++import json
+ import logging
+ import shutil
+ import os
+@@ -18,7 +19,7 @@ import httpx
+ from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+ from fastapi.responses import FileResponse, StreamingResponse
+ 
+-from .. import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, readiness, report_writer, retry_queue, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
++from .. import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, policy_gate, readiness, report_writer, retry_queue, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+ from ..models import (
+     Project,
+     ProjectCreate,
+@@ -28,6 +29,8 @@ from ..models import (
+     AuthPolicyUpdateRequest,
+     AuthSessionUpsertRequest,
+     AuthSessionTestResult,
++    ProjectPolicyUpdateRequest,
++    ProjectPolicy,
+     ProjectBulkActionRequest,
+     ProjectBulkActionResult,
+     ScheduleUpdateRequest,
+@@ -417,6 +420,57 @@ async def test_auth_session(project_id: int, session_name: str):
+         return AuthSessionTestResult(session_name=session_name, ok=False, detail=str(exc))
+ 
+ 
++# --- Program-specific policy exclusions (see policy_gate.py) ---
++#
++# Separate from the auth-testing endpoints above, but same project-card
++# UI section philosophy: paste something in once, it augments every
++# scan/triage from then on without needing to be repeated per finding.
++
++@router.get("/api/projects/{project_id}/policy", response_model=ProjectPolicy)
++async def get_project_policy(project_id: int):
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        row = await conn.fetchrow(
++            "SELECT policy_raw_text, policy_exclusions, policy_parsed_at FROM projects WHERE id = $1",
++            project_id,
++        )
++    if row is None:
++        raise HTTPException(status_code=404, detail="Project not found")
++    exclusions = json.loads(row["policy_exclusions"]) if row["policy_exclusions"] else []
++    return ProjectPolicy(raw_text=row["policy_raw_text"], exclusions=exclusions, parsed_at=row["policy_parsed_at"])
++
++
++@router.put("/api/projects/{project_id}/policy", response_model=ProjectPolicy)
++async def update_project_policy(project_id: int, payload: ProjectPolicyUpdateRequest):
++    """
++    Stores the pasted policy text and re-parses it with Gemini via
++    policy_gate.parse_policy_exclusions - synchronous in this request
++    (not backgrounded) since it's one cheap-model call, same latency
++    class as a single triage call, and the person pasting this in wants
++    to see the extracted list immediately to sanity-check it, not poll
++    for a background job to finish.
++    """
++    pool = database.get_pool()
++    async with pool.acquire() as conn:
++        proj = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
++        if not proj:
++            raise HTTPException(status_code=404, detail="Project not found")
++
++        exclusions = await policy_gate.parse_policy_exclusions(payload.raw_text)
++
++        row = await conn.fetchrow(
++            """
++            UPDATE projects
++            SET policy_raw_text = $2, policy_exclusions = $3, policy_parsed_at = now()
++            WHERE id = $1
++            RETURNING policy_raw_text, policy_exclusions, policy_parsed_at
++            """,
++            project_id, payload.raw_text, json.dumps(exclusions),
++        )
++    parsed_exclusions = json.loads(row["policy_exclusions"]) if row["policy_exclusions"] else []
++    return ProjectPolicy(raw_text=row["policy_raw_text"], exclusions=parsed_exclusions, parsed_at=row["policy_parsed_at"])
++
++
+ @router.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
+ async def bulk_project_action(payload: ProjectBulkActionRequest):
+     """
+diff --git a/backend/app/triage.py b/backend/app/triage.py
+index 19a10f3..ccb6f0c 100644
+--- a/backend/app/triage.py
++++ b/backend/app/triage.py
+@@ -34,7 +34,7 @@ Tool: {tool_name}
+ ---
+ {evidence}
+ ---
+-{outcome_context}{vrt_context}
++{outcome_context}{vrt_context}{policy_context}
+ Respond with ONLY a JSON object, no other text, no markdown fences:
+ {{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null", "impact_evidence": "concrete proof of REAL impact found IN THE EVIDENCE ABOVE - an actual sensitive value shown (email/token/row/credential), an actual privileged action performed, an actual different user's data accessed - or an empty string if the evidence only shows the vulnerability mechanism firing (a 200 response, a reflected payload, a matched signature) without anything concrete beyond that"}}
+ 
+@@ -250,7 +250,7 @@ def _apply_impact_evidence_cap(result: dict) -> dict:
+ async def triage_finding(
+     tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None,
+     self_declared_severity: str | None = None, project_id: int | None = None,
+-    preferred_model_override: str | None = None,
++    preferred_model_override: str | None = None, policy_exclusions: list[dict] | None = None,
+ ) -> dict:
+     """
+     Returns {"severity": str, "confidence": float, "reasoning": str,
+@@ -291,6 +291,12 @@ async def triage_finding(
+     what makes detective.py findings go through the same independent
+     review as every other finding instead of skipping it.
+ 
++    policy_exclusions (optional): this project's parsed program-specific
++    policy exclusions (see policy_gate.py) - formatted and injected
++    alongside the prompt's existing generic policy-exclusion guidance.
++    None/empty (no policy pasted for this project yet, the common case)
++    behaves exactly as before.
++
+     Tries the cheap model first. If its own reported confidence is below
+     0.6, escalates ONE retry to the stronger model - this is the
+     "spend more only on the hard cases" behavior, not a blanket upgrade.
+@@ -303,10 +309,12 @@ async def triage_finding(
+     self_declared_context = _format_self_declared_context(self_declared_severity)
+     from . import vrt as vrt_module  # local import avoids a circular import at module load time
+     vrt_context = vrt_module.format_vrt_context(vrt_entries or [])
++    from . import policy_gate  # local import avoids a circular import at module load time
++    policy_context = policy_gate.format_policy_context(policy_exclusions)
+     prompt = _TRIAGE_PROMPT.format(
+         tool_name=tool_name, evidence=capped_evidence,
+         outcome_context=outcome_context, vrt_context=vrt_context,
+-        self_declared_context=self_declared_context,
++        self_declared_context=self_declared_context, policy_context=policy_context,
+     )
+ 
+     try:
+@@ -446,7 +454,8 @@ async def fetch_signature_stats(conn, signature: str) -> dict | None:
+ 
+ 
+ async def _triage_and_store_finding(
+-    conn, project_id: int, row, vrt_entries: list[dict], preferred_model_override: str | None = None
++    conn, project_id: int, row, vrt_entries: list[dict], preferred_model_override: str | None = None,
++    policy_exclusions: list[dict] | None = None,
+ ) -> dict:
+     """
+     Runs triage_finding for ONE finding row, applies the adversarial
+@@ -465,6 +474,10 @@ async def _triage_and_store_finding(
+     setting, if one was configured - fetched ONCE per triage batch by
+     the caller (not per-finding, to avoid an extra query per row) and
+     passed straight through to triage_finding.
++
++    policy_exclusions: this project's parsed policy exclusions (see
++    policy_gate.py), fetched ONCE per triage batch by the caller same as
++    preferred_model_override, passed straight through.
+     """
+     from . import target_intelligence
+ 
+@@ -477,6 +490,7 @@ async def _triage_and_store_finding(
+         outcome_stats=outcome_stats, vrt_entries=vrt_entries,
+         self_declared_severity=self_declared_severity,
+         project_id=project_id, preferred_model_override=preferred_model_override,
++        policy_exclusions=policy_exclusions,
+     )
+ 
+     # Adversarial skeptic pass (#7): only for findings about to sail
+@@ -572,8 +586,11 @@ async def triage_project_findings(conn, project_id: int, include_gate_failed: bo
+     """
+     from . import retry_queue, vrt as vrt_module
+ 
+-    project_row = await conn.fetchrow("SELECT preferred_ai_model FROM projects WHERE id = $1", project_id)
++    project_row = await conn.fetchrow(
++        "SELECT preferred_ai_model, policy_exclusions FROM projects WHERE id = $1", project_id
++    )
+     preferred_model_override = project_row["preferred_ai_model"] if project_row else None
++    policy_exclusions = json.loads(project_row["policy_exclusions"]) if project_row and project_row["policy_exclusions"] else None
+ 
+     gate_clause = "" if include_gate_failed else "AND gate_status != 'failed'"
+     rows = await conn.fetch(
+@@ -587,7 +604,9 @@ async def triage_project_findings(conn, project_id: int, include_gate_failed: bo
+     vrt_entries = await vrt_module.get_vrt_entries()  # fetched once, reused for every finding in this batch
+     triaged = 0
+     for row in rows:
+-        result = await _triage_and_store_finding(conn, project_id, row, vrt_entries, preferred_model_override)
++        result = await _triage_and_store_finding(
++            conn, project_id, row, vrt_entries, preferred_model_override, policy_exclusions,
++        )
+ 
+         if result.get("ai_call_failed"):
+             await retry_queue.enqueue(
+@@ -651,6 +670,7 @@ async def retry_pending_ai_failures(pool) -> int:
+ 
+         vrt_entries = await vrt_module.get_vrt_entries()
+         preferred_model_by_project: dict[int, str | None] = {}
++        policy_exclusions_by_project: dict[int, list[dict] | None] = {}
+ 
+         for item in items:
+             payload = item["payload"]
+@@ -662,9 +682,13 @@ async def retry_pending_ai_failures(pool) -> int:
+ 
+             if project_id not in preferred_model_by_project:
+                 project_row = await conn.fetchrow(
+-                    "SELECT preferred_ai_model FROM projects WHERE id = $1", project_id
++                    "SELECT preferred_ai_model, policy_exclusions FROM projects WHERE id = $1", project_id
+                 )
+                 preferred_model_by_project[project_id] = project_row["preferred_ai_model"] if project_row else None
++                policy_exclusions_by_project[project_id] = (
++                    json.loads(project_row["policy_exclusions"])
++                    if project_row and project_row["policy_exclusions"] else None
++                )
+ 
+             row = await conn.fetchrow(
+                 "SELECT id, target_id, tool_name, vuln_type, evidence, severity FROM findings WHERE id = $1",
+@@ -684,7 +708,8 @@ async def retry_pending_ai_failures(pool) -> int:
+ 
+             try:
+                 result = await _triage_and_store_finding(
+-                    conn, project_id, row, vrt_entries, preferred_model_by_project[project_id]
++                    conn, project_id, row, vrt_entries, preferred_model_by_project[project_id],
++                    policy_exclusions_by_project[project_id],
+                 )
+                 if result.get("ai_call_failed"):
+                     # triage_finding itself caught the exception and
+diff --git a/backend/db/migrations/019_project_policy_exclusions.sql b/backend/db/migrations/019_project_policy_exclusions.sql
+new file mode 100644
+index 0000000..8c6de0f
+--- /dev/null
++++ b/backend/db/migrations/019_project_policy_exclusions.sql
+@@ -0,0 +1,21 @@
++-- 019_project_policy_exclusions.sql
++-- Program-specific policy exclusions, fed into triage.py's prompt
++-- alongside its existing GENERIC policy-exclusion guidance (see
++-- _TRIAGE_PROMPT in triage.py - it already tells the model "DoS,
++-- self-XSS, open redirects, etc. are usually excluded" as general bug
++-- bounty knowledge). This table-column pair lets a specific program's
++-- actual, real published policy override or extend that generic
++-- knowledge - e.g. a program that explicitly DOES pay for rate-limit
++-- issues, or one with unusual additional exclusions the generic list
++-- doesn't know about.
++--
++-- policy_raw_text: what you pasted in (kept verbatim for re-parsing
++-- later or just re-reading what you gave it).
++-- policy_exclusions: Gemini's structured extraction, [{"category":
++-- str, "reason": str}, ...] - NULL until parsed at least once.
++-- policy_parsed_at: NULL until the first successful parse; lets the UI
++-- show "never parsed" vs "parsed on <date>, re-parse if the policy
++-- changed".
++ALTER TABLE projects ADD COLUMN IF NOT EXISTS policy_raw_text TEXT;
++ALTER TABLE projects ADD COLUMN IF NOT EXISTS policy_exclusions JSONB;
++ALTER TABLE projects ADD COLUMN IF NOT EXISTS policy_parsed_at TIMESTAMPTZ;
+diff --git a/frontend/src/api/client.js b/frontend/src/api/client.js
+index f8933e2..276e8dd 100644
+--- a/frontend/src/api/client.js
++++ b/frontend/src/api/client.js
+@@ -41,6 +41,9 @@ export const api = {
+   getProject: (id) => request(`/projects/${id}`),
+   getAuthPolicy: (id) => request(`/projects/${id}/auth-policy`),
+   listAuthSessions: (id) => request(`/projects/${id}/auth-sessions`),
++  getProjectPolicy: (id) => request(`/projects/${id}/policy`),
++  updateProjectPolicy: (id, rawText) =>
++    request(`/projects/${id}/policy`, { method: "PUT", body: JSON.stringify({ raw_text: rawText }) }),
+   updateAuthPolicy: (id, payload) =>
+     request(`/projects/${id}/auth-policy`, { method: "PUT", body: JSON.stringify(payload) }),
+   upsertAuthSession: (id, payload) =>
+diff --git a/frontend/src/pages/Observability.jsx b/frontend/src/pages/Observability.jsx
+index 0ea37e1..fdd5e66 100644
+--- a/frontend/src/pages/Observability.jsx
++++ b/frontend/src/pages/Observability.jsx
+@@ -186,6 +186,17 @@ export function Observability() {
+             </div>
+           )}
+         </Panel>
++
++        <Panel label="OUTCOMES AWAITING" accent={data.outcomes_awaiting_total > 0 ? "var(--sev-medium)" : undefined}>
++          {data.outcomes_awaiting_total === 0 ? (
++            <StatusLine ok okText="All caught up" />
++          ) : (
++            <span style={{ fontSize: 12, color: "var(--sev-medium)" }}>
++              {data.outcomes_awaiting_total} submitted finding{data.outcomes_awaiting_total === 1 ? "" : "s"} with no
++              logged result yet
++            </span>
++          )}
++        </Panel>
+       </div>
+ 
+       {data.evidence.dead_targets.length > 0 && (
+@@ -225,6 +236,44 @@ export function Observability() {
+           </div>
+         </div>
+       )}
++
++      {data.outcomes_awaiting.length > 0 && (
++        <div style={{ marginTop: 16 }}>
++          <div
++            className="ops-panel"
++            data-label={
++              data.outcomes_awaiting_total > data.outcomes_awaiting.length
++                ? `OUTCOMES AWAITING · ${data.outcomes_awaiting_total} (showing oldest ${data.outcomes_awaiting.length})`
++                : `OUTCOMES AWAITING · ${data.outcomes_awaiting_total}`
++            }
++            style={{ overflow: "hidden" }}
++          >
++            {data.outcomes_awaiting.map((o, i) => (
++              <Link
++                key={o.finding_id}
++                to={`/projects/${o.project_id}`}
++                style={{
++                  display: "flex",
++                  justifyContent: "space-between",
++                  padding: "10px 16px",
++                  borderBottom: i < data.outcomes_awaiting.length - 1 ? "1px solid var(--border)" : "none",
++                  fontSize: 12,
++                  textDecoration: "none",
++                  color: "inherit",
++                }}
++              >
++                <div>
++                  <span className="mono">{o.vuln_type || "(untyped finding)"}</span>
++                  <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>({o.project_name})</span>
++                </div>
++                <span style={{ color: "var(--text-muted)" }}>
++                  {o.submitted_since ? `since ${new Date(o.submitted_since).toLocaleDateString()}` : ""}
++                </span>
++              </Link>
++            ))}
++          </div>
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/frontend/src/pages/ProjectDetail.jsx b/frontend/src/pages/ProjectDetail.jsx
+index 618f007..a0519ef 100644
+--- a/frontend/src/pages/ProjectDetail.jsx
++++ b/frontend/src/pages/ProjectDetail.jsx
+@@ -345,6 +345,8 @@ export function ProjectDetail() {
+ 
+       <AuthTestingSection projectId={id} project={project} onSaved={loadAll} />
+ 
++      <ProgramPolicySection projectId={id} />
++
+       <Section title="Scope">
+         <ScopeInsights projectId={id} />
+         <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
+@@ -606,6 +608,108 @@ function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy,
+   );
+ }
+ 
++function ProgramPolicySection({ projectId }) {
++  const [expanded, setExpanded] = useState(false);
++  const [policy, setPolicy] = useState(null);
++  const [rawTextDraft, setRawTextDraft] = useState("");
++  const [saving, setSaving] = useState(false);
++  const [err, setErr] = useState(null);
++
++  async function load() {
++    try {
++      const p = await api.getProjectPolicy(projectId);
++      setPolicy(p);
++      setRawTextDraft(p.raw_text || "");
++    } catch (e) {
++      setErr(e.message);
++    }
++  }
++
++  async function toggle() {
++    const next = !expanded;
++    setExpanded(next);
++    if (next && policy === null) await load();
++  }
++
++  async function saveAndParse() {
++    setSaving(true);
++    setErr(null);
++    try {
++      const p = await api.updateProjectPolicy(projectId, rawTextDraft);
++      setPolicy(p);
++    } catch (e) {
++      setErr(e.message);
++    } finally {
++      setSaving(false);
++    }
++  }
++
++  return (
++    <div className="ops-panel" data-label="Program policy" style={{ marginBottom: 16, padding: "14px 18px 12px" }}>
++      <button className="btn" onClick={toggle}>
++        {expanded ? "Hide" : "Show"} policy
++      </button>
++      {expanded && (
++        <div style={{ marginTop: 14 }}>
++          {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
++          {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
++          {policy && (
++            <>
++              <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 8px" }}>
++                Paste this program's scope/policy page (or whatever text it publishes about what it excludes). Gemini
++                extracts the specific exclusions and feeds them into triage alongside the general bug-bounty guidance
++                it already uses - a real, program-specific rule takes precedence over the generic one where they
++                conflict. Re-paste and save any time the policy changes.
++              </p>
++              <textarea
++                className="input"
++                placeholder="Paste the program's scope/policy text here…"
++                value={rawTextDraft}
++                onChange={(e) => setRawTextDraft(e.target.value)}
++                rows={6}
++                style={{ width: "100%", marginBottom: 8 }}
++              />
++              <button className="btn" onClick={saveAndParse} disabled={saving || !rawTextDraft.trim()}>
++                {saving ? "Parsing…" : "Save & parse"}
++              </button>
++
++              <div style={{ marginTop: 14 }}>
++                <div className="eyebrow" style={{ marginBottom: 6 }}>
++                  Extracted exclusions ({policy.exclusions.length})
++                  {policy.parsed_at && (
++                    <span style={{ color: "var(--text-muted)", fontWeight: 400, marginLeft: 8 }}>
++                      parsed {formatDate(policy.parsed_at)}
++                    </span>
++                  )}
++                </div>
++                {policy.exclusions.length === 0 && (
++                  <p style={{ fontSize: 13, color: "var(--text-muted)" }}>
++                    {policy.raw_text
++                      ? "Parsed, but nothing extracted - either the pasted text had no clear exclusions, or the parse failed. Safe either way: triage just falls back to its generic guidance."
++                      : "Nothing pasted yet."}
++                  </p>
++                )}
++                {policy.exclusions.length > 0 && (
++                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
++                    {policy.exclusions.map((ex, i) => (
++                      <div key={i} style={{ fontSize: 12, color: "var(--text-secondary)" }}>
++                        <span className="mono" style={{ color: ex.category.startsWith("ALLOWED:") ? "var(--status-success)" : "var(--sev-medium)" }}>
++                          {ex.category}
++                        </span>
++                        {ex.reason && <span style={{ marginLeft: 6 }}>— {ex.reason}</span>}
++                      </div>
++                    ))}
++                  </div>
++                )}
++              </div>
++            </>
++          )}
++        </div>
++      )}
++    </div>
++  );
++}
++
+ const AUTH_SESSION_TYPES = ["cookie", "bearer_token", "header"];
+ 
+ function emptySessionForm() {

@@ -34,7 +34,7 @@ Tool: {tool_name}
 ---
 {evidence}
 ---
-{outcome_context}{vrt_context}
+{outcome_context}{vrt_context}{policy_context}
 Respond with ONLY a JSON object, no other text, no markdown fences:
 {{"severity": "critical|high|medium|low|info", "confidence": 0.0-1.0, "reasoning": "one sentence explaining the evidence AND, if the category is commonly restricted by bounty policy, saying so explicitly", "likely_program_outcome": "accepted|informative|out_of_scope|duplicate", "vrt_category": "closest matching VRT category name or null", "impact_evidence": "concrete proof of REAL impact found IN THE EVIDENCE ABOVE - an actual sensitive value shown (email/token/row/credential), an actual privileged action performed, an actual different user's data accessed - or an empty string if the evidence only shows the vulnerability mechanism firing (a 200 response, a reflected payload, a matched signature) without anything concrete beyond that"}}
 
@@ -250,7 +250,7 @@ def _apply_impact_evidence_cap(result: dict) -> dict:
 async def triage_finding(
     tool_name: str, evidence: str, outcome_stats: dict | None = None, vrt_entries: list[dict] | None = None,
     self_declared_severity: str | None = None, project_id: int | None = None,
-    preferred_model_override: str | None = None,
+    preferred_model_override: str | None = None, policy_exclusions: list[dict] | None = None,
 ) -> dict:
     """
     Returns {"severity": str, "confidence": float, "reasoning": str,
@@ -291,6 +291,12 @@ async def triage_finding(
     what makes detective.py findings go through the same independent
     review as every other finding instead of skipping it.
 
+    policy_exclusions (optional): this project's parsed program-specific
+    policy exclusions (see policy_gate.py) - formatted and injected
+    alongside the prompt's existing generic policy-exclusion guidance.
+    None/empty (no policy pasted for this project yet, the common case)
+    behaves exactly as before.
+
     Tries the cheap model first. If its own reported confidence is below
     0.6, escalates ONE retry to the stronger model - this is the
     "spend more only on the hard cases" behavior, not a blanket upgrade.
@@ -303,10 +309,12 @@ async def triage_finding(
     self_declared_context = _format_self_declared_context(self_declared_severity)
     from . import vrt as vrt_module  # local import avoids a circular import at module load time
     vrt_context = vrt_module.format_vrt_context(vrt_entries or [])
+    from . import policy_gate  # local import avoids a circular import at module load time
+    policy_context = policy_gate.format_policy_context(policy_exclusions)
     prompt = _TRIAGE_PROMPT.format(
         tool_name=tool_name, evidence=capped_evidence,
         outcome_context=outcome_context, vrt_context=vrt_context,
-        self_declared_context=self_declared_context,
+        self_declared_context=self_declared_context, policy_context=policy_context,
     )
 
     try:
@@ -446,7 +454,8 @@ async def fetch_signature_stats(conn, signature: str) -> dict | None:
 
 
 async def _triage_and_store_finding(
-    conn, project_id: int, row, vrt_entries: list[dict], preferred_model_override: str | None = None
+    conn, project_id: int, row, vrt_entries: list[dict], preferred_model_override: str | None = None,
+    policy_exclusions: list[dict] | None = None,
 ) -> dict:
     """
     Runs triage_finding for ONE finding row, applies the adversarial
@@ -465,6 +474,10 @@ async def _triage_and_store_finding(
     setting, if one was configured - fetched ONCE per triage batch by
     the caller (not per-finding, to avoid an extra query per row) and
     passed straight through to triage_finding.
+
+    policy_exclusions: this project's parsed policy exclusions (see
+    policy_gate.py), fetched ONCE per triage batch by the caller same as
+    preferred_model_override, passed straight through.
     """
     from . import target_intelligence
 
@@ -477,6 +490,7 @@ async def _triage_and_store_finding(
         outcome_stats=outcome_stats, vrt_entries=vrt_entries,
         self_declared_severity=self_declared_severity,
         project_id=project_id, preferred_model_override=preferred_model_override,
+        policy_exclusions=policy_exclusions,
     )
 
     # Adversarial skeptic pass (#7): only for findings about to sail
@@ -572,8 +586,11 @@ async def triage_project_findings(conn, project_id: int, include_gate_failed: bo
     """
     from . import retry_queue, vrt as vrt_module
 
-    project_row = await conn.fetchrow("SELECT preferred_ai_model FROM projects WHERE id = $1", project_id)
+    project_row = await conn.fetchrow(
+        "SELECT preferred_ai_model, policy_exclusions FROM projects WHERE id = $1", project_id
+    )
     preferred_model_override = project_row["preferred_ai_model"] if project_row else None
+    policy_exclusions = json.loads(project_row["policy_exclusions"]) if project_row and project_row["policy_exclusions"] else None
 
     gate_clause = "" if include_gate_failed else "AND gate_status != 'failed'"
     rows = await conn.fetch(
@@ -587,7 +604,9 @@ async def triage_project_findings(conn, project_id: int, include_gate_failed: bo
     vrt_entries = await vrt_module.get_vrt_entries()  # fetched once, reused for every finding in this batch
     triaged = 0
     for row in rows:
-        result = await _triage_and_store_finding(conn, project_id, row, vrt_entries, preferred_model_override)
+        result = await _triage_and_store_finding(
+            conn, project_id, row, vrt_entries, preferred_model_override, policy_exclusions,
+        )
 
         if result.get("ai_call_failed"):
             await retry_queue.enqueue(
@@ -651,6 +670,7 @@ async def retry_pending_ai_failures(pool) -> int:
 
         vrt_entries = await vrt_module.get_vrt_entries()
         preferred_model_by_project: dict[int, str | None] = {}
+        policy_exclusions_by_project: dict[int, list[dict] | None] = {}
 
         for item in items:
             payload = item["payload"]
@@ -662,9 +682,13 @@ async def retry_pending_ai_failures(pool) -> int:
 
             if project_id not in preferred_model_by_project:
                 project_row = await conn.fetchrow(
-                    "SELECT preferred_ai_model FROM projects WHERE id = $1", project_id
+                    "SELECT preferred_ai_model, policy_exclusions FROM projects WHERE id = $1", project_id
                 )
                 preferred_model_by_project[project_id] = project_row["preferred_ai_model"] if project_row else None
+                policy_exclusions_by_project[project_id] = (
+                    json.loads(project_row["policy_exclusions"])
+                    if project_row and project_row["policy_exclusions"] else None
+                )
 
             row = await conn.fetchrow(
                 "SELECT id, target_id, tool_name, vuln_type, evidence, severity FROM findings WHERE id = $1",
@@ -684,7 +708,8 @@ async def retry_pending_ai_failures(pool) -> int:
 
             try:
                 result = await _triage_and_store_finding(
-                    conn, project_id, row, vrt_entries, preferred_model_by_project[project_id]
+                    conn, project_id, row, vrt_entries, preferred_model_by_project[project_id],
+                    policy_exclusions_by_project[project_id],
                 )
                 if result.get("ai_call_failed"):
                     # triage_finding itself caught the exception and

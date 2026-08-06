@@ -41,6 +41,9 @@ export const api = {
   getProject: (id) => request(`/projects/${id}`),
   getAuthPolicy: (id) => request(`/projects/${id}/auth-policy`),
   listAuthSessions: (id) => request(`/projects/${id}/auth-sessions`),
+  getProjectPolicy: (id) => request(`/projects/${id}/policy`),
+  updateProjectPolicy: (id, rawText) =>
+    request(`/projects/${id}/policy`, { method: "PUT", body: JSON.stringify({ raw_text: rawText }) }),
   updateAuthPolicy: (id, payload) =>
     request(`/projects/${id}/auth-policy`, { method: "PUT", body: JSON.stringify(payload) }),
   upsertAuthSession: (id, payload) =>

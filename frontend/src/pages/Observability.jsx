@@ -186,6 +186,17 @@ export function Observability() {
             </div>
           )}
         </Panel>
+
+        <Panel label="OUTCOMES AWAITING" accent={data.outcomes_awaiting_total > 0 ? "var(--sev-medium)" : undefined}>
+          {data.outcomes_awaiting_total === 0 ? (
+            <StatusLine ok okText="All caught up" />
+          ) : (
+            <span style={{ fontSize: 12, color: "var(--sev-medium)" }}>
+              {data.outcomes_awaiting_total} submitted finding{data.outcomes_awaiting_total === 1 ? "" : "s"} with no
+              logged result yet
+            </span>
+          )}
+        </Panel>
       </div>
 
       {data.evidence.dead_targets.length > 0 && (
@@ -219,6 +230,44 @@ export function Observability() {
                 </div>
                 <span style={{ color: "var(--text-muted)" }}>
                   {t.dead_since ? `dark since ${new Date(t.dead_since).toLocaleDateString()}` : ""}
+                </span>
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {data.outcomes_awaiting.length > 0 && (
+        <div style={{ marginTop: 16 }}>
+          <div
+            className="ops-panel"
+            data-label={
+              data.outcomes_awaiting_total > data.outcomes_awaiting.length
+                ? `OUTCOMES AWAITING · ${data.outcomes_awaiting_total} (showing oldest ${data.outcomes_awaiting.length})`
+                : `OUTCOMES AWAITING · ${data.outcomes_awaiting_total}`
+            }
+            style={{ overflow: "hidden" }}
+          >
+            {data.outcomes_awaiting.map((o, i) => (
+              <Link
+                key={o.finding_id}
+                to={`/projects/${o.project_id}`}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  padding: "10px 16px",
+                  borderBottom: i < data.outcomes_awaiting.length - 1 ? "1px solid var(--border)" : "none",
+                  fontSize: 12,
+                  textDecoration: "none",
+                  color: "inherit",
+                }}
+              >
+                <div>
+                  <span className="mono">{o.vuln_type || "(untyped finding)"}</span>
+                  <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>({o.project_name})</span>
+                </div>
+                <span style={{ color: "var(--text-muted)" }}>
+                  {o.submitted_since ? `since ${new Date(o.submitted_since).toLocaleDateString()}` : ""}
                 </span>
               </Link>
             ))}

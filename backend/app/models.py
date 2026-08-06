@@ -12,7 +12,7 @@ Each table in init.sql has a matching set of models here:
 """
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel
 
 # Program platform the project/target belongs to. "private" covers
@@ -108,6 +108,21 @@ class AuthSessionTestResult(BaseModel):
     ok: bool
     status_code: Optional[int] = None
     detail: str
+
+
+class ProjectPolicyUpdateRequest(BaseModel):
+    raw_text: str
+
+
+class PolicyExclusion(BaseModel):
+    category: str
+    reason: str = ""
+
+
+class ProjectPolicy(BaseModel):
+    raw_text: Optional[str] = None
+    exclusions: List[PolicyExclusion] = []
+    parsed_at: Optional[datetime] = None
 
 
 class Project(BaseModel):

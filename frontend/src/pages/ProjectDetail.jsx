@@ -345,6 +345,8 @@ export function ProjectDetail() {
 
       <AuthTestingSection projectId={id} project={project} onSaved={loadAll} />
 
+      <ProgramPolicySection projectId={id} />
+
       <Section title="Scope">
         <ScopeInsights projectId={id} />
         <ScopeManager projectId={id} scope={scope} onChange={loadAll} />
@@ -602,6 +604,108 @@ function ProjectHeader({ project, inScopeCount, onSaved, queueEntry, queueBusy, 
         {platformLabel(project.platform)} · {inScopeCount} in-scope target
         {inScopeCount === 1 ? "" : "s"} · Created {formatDate(project.created_at)}
       </p>
+    </div>
+  );
+}
+
+function ProgramPolicySection({ projectId }) {
+  const [expanded, setExpanded] = useState(false);
+  const [policy, setPolicy] = useState(null);
+  const [rawTextDraft, setRawTextDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function load() {
+    try {
+      const p = await api.getProjectPolicy(projectId);
+      setPolicy(p);
+      setRawTextDraft(p.raw_text || "");
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function toggle() {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && policy === null) await load();
+  }
+
+  async function saveAndParse() {
+    setSaving(true);
+    setErr(null);
+    try {
+      const p = await api.updateProjectPolicy(projectId, rawTextDraft);
+      setPolicy(p);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="ops-panel" data-label="Program policy" style={{ marginBottom: 16, padding: "14px 18px 12px" }}>
+      <button className="btn" onClick={toggle}>
+        {expanded ? "Hide" : "Show"} policy
+      </button>
+      {expanded && (
+        <div style={{ marginTop: 14 }}>
+          {err && <p style={{ color: "var(--status-fail)", fontSize: 13 }}>{err}</p>}
+          {policy === null && !err && <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</p>}
+          {policy && (
+            <>
+              <p style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 8px" }}>
+                Paste this program's scope/policy page (or whatever text it publishes about what it excludes). Gemini
+                extracts the specific exclusions and feeds them into triage alongside the general bug-bounty guidance
+                it already uses - a real, program-specific rule takes precedence over the generic one where they
+                conflict. Re-paste and save any time the policy changes.
+              </p>
+              <textarea
+                className="input"
+                placeholder="Paste the program's scope/policy text here…"
+                value={rawTextDraft}
+                onChange={(e) => setRawTextDraft(e.target.value)}
+                rows={6}
+                style={{ width: "100%", marginBottom: 8 }}
+              />
+              <button className="btn" onClick={saveAndParse} disabled={saving || !rawTextDraft.trim()}>
+                {saving ? "Parsing…" : "Save & parse"}
+              </button>
+
+              <div style={{ marginTop: 14 }}>
+                <div className="eyebrow" style={{ marginBottom: 6 }}>
+                  Extracted exclusions ({policy.exclusions.length})
+                  {policy.parsed_at && (
+                    <span style={{ color: "var(--text-muted)", fontWeight: 400, marginLeft: 8 }}>
+                      parsed {formatDate(policy.parsed_at)}
+                    </span>
+                  )}
+                </div>
+                {policy.exclusions.length === 0 && (
+                  <p style={{ fontSize: 13, color: "var(--text-muted)" }}>
+                    {policy.raw_text
+                      ? "Parsed, but nothing extracted - either the pasted text had no clear exclusions, or the parse failed. Safe either way: triage just falls back to its generic guidance."
+                      : "Nothing pasted yet."}
+                  </p>
+                )}
+                {policy.exclusions.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {policy.exclusions.map((ex, i) => (
+                      <div key={i} style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                        <span className="mono" style={{ color: ex.category.startsWith("ALLOWED:") ? "var(--status-success)" : "var(--sev-medium)" }}>
+                          {ex.category}
+                        </span>
+                        {ex.reason && <span style={{ marginLeft: 6 }}>— {ex.reason}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

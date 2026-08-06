@@ -90,6 +90,11 @@ async def health_dashboard():
     one broken check, e.g. a tool binary genuinely missing, can't take
     the whole dashboard down) - a section reporting an error is itself
     useful signal, not a 500.
+
+    Also surfaces submitted findings with no outcome ever logged back
+    (see outcomes_awaiting/outcomes_awaiting_total below) - the entire
+    outcome-learning loop depends on that data existing, and it's easy
+    to forget days after a program actually responds.
     """
     pool = database.get_pool()
 
@@ -176,6 +181,41 @@ async def health_dashboard():
             "SELECT count(*) FROM scope_targets WHERE dead_since IS NOT NULL"
         )
 
+        # Outcome-logging nudge: findings marked 'submitted' that never
+        # got a real-world result logged back via POST /api/outcomes.
+        # This is the entire learning loop's fuel (gate's impact-hint
+        # calibration, triage's outcome-history retrieval) - a check
+        # against production data found only 20 outcomes ever logged
+        # across 18,949 findings, not because the logging feature is
+        # missing (it's a button right on each submitted finding in
+        # FindingsList.jsx, plus an "only awaiting outcome" filter) but
+        # because it's easy to forget once a program actually responds,
+        # days or weeks after submission. Surfacing the count here - the
+        # same dashboard already used to notice retry-queue backlog or
+        # evidence rot - means it's visible without a manual SQL query,
+        # same as everything else on this page. Same capped-list-plus-
+        # total pattern as dead_targets above.
+        outcomes_awaiting_rows = await conn.fetch(
+            """
+            SELECT f.id, f.vuln_type, f.created_at, p.id AS project_id, p.name AS project_name
+            FROM findings f
+            JOIN scope_targets t ON t.id = f.target_id
+            JOIN projects p ON p.id = t.project_id
+            WHERE f.status = 'submitted'
+              AND NOT EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id)
+            ORDER BY f.created_at ASC
+            LIMIT 10
+            """
+        )
+        outcomes_awaiting_total = await conn.fetchval(
+            """
+            SELECT count(*)
+            FROM findings f
+            WHERE f.status = 'submitted'
+              AND NOT EXISTS (SELECT 1 FROM finding_outcomes fo WHERE fo.finding_id = f.id)
+            """
+        )
+
     canaries = []
     for row in canary_rows:
         baseline = row["canary_baseline_finding_count"]
@@ -199,6 +239,17 @@ async def health_dashboard():
             "dead_since": r["dead_since"].isoformat() if r["dead_since"] else None,
         }
         for r in dead_target_rows
+    ]
+
+    outcomes_awaiting = [
+        {
+            "finding_id": r["id"],
+            "vuln_type": r["vuln_type"],
+            "project_id": r["project_id"],
+            "project_name": r["project_name"],
+            "submitted_since": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in outcomes_awaiting_rows
     ]
 
     return {
@@ -232,6 +283,8 @@ async def health_dashboard():
             "dead_targets": dead_targets,
             "dead_targets_total": dead_targets_total,
         },
+        "outcomes_awaiting": outcomes_awaiting,
+        "outcomes_awaiting_total": outcomes_awaiting_total,
     }
 
 

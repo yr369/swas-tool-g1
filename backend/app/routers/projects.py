@@ -8,6 +8,7 @@ monolithic main.py.
 import asyncio
 import csv
 import io
+import json
 import logging
 import shutil
 import os
@@ -18,7 +19,7 @@ import httpx
 from fastapi import APIRouter, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 
-from .. import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, readiness, report_writer, retry_queue, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
+from .. import auth_policy, auth_sessions, checkpoint, config, database, evidence_lifecycle, gate, gemini_rotation, logic_hunter, oob, pipeline, policy_gate, readiness, report_writer, retry_queue, scope_parser, screenshots, target_intelligence, tools, triage, vrt, ws_manager
 from ..models import (
     Project,
     ProjectCreate,
@@ -28,6 +29,8 @@ from ..models import (
     AuthPolicyUpdateRequest,
     AuthSessionUpsertRequest,
     AuthSessionTestResult,
+    ProjectPolicyUpdateRequest,
+    ProjectPolicy,
     ProjectBulkActionRequest,
     ProjectBulkActionResult,
     ScheduleUpdateRequest,
@@ -415,6 +418,57 @@ async def test_auth_session(project_id: int, session_name: str):
         )
     except Exception as exc:
         return AuthSessionTestResult(session_name=session_name, ok=False, detail=str(exc))
+
+
+# --- Program-specific policy exclusions (see policy_gate.py) ---
+#
+# Separate from the auth-testing endpoints above, but same project-card
+# UI section philosophy: paste something in once, it augments every
+# scan/triage from then on without needing to be repeated per finding.
+
+@router.get("/api/projects/{project_id}/policy", response_model=ProjectPolicy)
+async def get_project_policy(project_id: int):
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT policy_raw_text, policy_exclusions, policy_parsed_at FROM projects WHERE id = $1",
+            project_id,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    exclusions = json.loads(row["policy_exclusions"]) if row["policy_exclusions"] else []
+    return ProjectPolicy(raw_text=row["policy_raw_text"], exclusions=exclusions, parsed_at=row["policy_parsed_at"])
+
+
+@router.put("/api/projects/{project_id}/policy", response_model=ProjectPolicy)
+async def update_project_policy(project_id: int, payload: ProjectPolicyUpdateRequest):
+    """
+    Stores the pasted policy text and re-parses it with Gemini via
+    policy_gate.parse_policy_exclusions - synchronous in this request
+    (not backgrounded) since it's one cheap-model call, same latency
+    class as a single triage call, and the person pasting this in wants
+    to see the extracted list immediately to sanity-check it, not poll
+    for a background job to finish.
+    """
+    pool = database.get_pool()
+    async with pool.acquire() as conn:
+        proj = await conn.fetchrow("SELECT id FROM projects WHERE id = $1", project_id)
+        if not proj:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        exclusions = await policy_gate.parse_policy_exclusions(payload.raw_text)
+
+        row = await conn.fetchrow(
+            """
+            UPDATE projects
+            SET policy_raw_text = $2, policy_exclusions = $3, policy_parsed_at = now()
+            WHERE id = $1
+            RETURNING policy_raw_text, policy_exclusions, policy_parsed_at
+            """,
+            project_id, payload.raw_text, json.dumps(exclusions),
+        )
+    parsed_exclusions = json.loads(row["policy_exclusions"]) if row["policy_exclusions"] else []
+    return ProjectPolicy(raw_text=row["policy_raw_text"], exclusions=parsed_exclusions, parsed_at=row["policy_parsed_at"])
 
 
 @router.post("/api/projects/bulk-action", response_model=ProjectBulkActionResult)
