@@ -39,6 +39,10 @@ from .shared import (
     _replace_query_param,
     get_transport,
     _GRAPHQL_PATHS,
+    _TOKEN_PATTERN,
+    _SENSITIVE_FILE_HINTS,
+    _TEST_FIXTURE_PATH_HINTS,
+    _PLACEHOLDER_VALUE_HINTS,
 )
 
 _TAKEOVER_FINGERPRINTS: list[tuple[str, str, str]] = [

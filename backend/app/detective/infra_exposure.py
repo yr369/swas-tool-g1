@@ -38,7 +38,9 @@ from .shared import (
     _replace_query_param,
     get_transport,
     _GRAPHQL_PATHS,
+    _TOKEN_PATTERN,
 )
+from .recon_misc import _INTROSPECTION_QUERY
 
 _SECRET_KEYWORD_PATTERN = re.compile(
     r"(AWS_SECRET|DB_PASSWORD|JWT_SECRET|API_KEY|PRIVATE_KEY|ACCESS_TOKEN)",

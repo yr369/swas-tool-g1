@@ -1,0 +1,54 @@
+diff --git a/backend/app/detective/auth_access.py b/backend/app/detective/auth_access.py
+index 939bc54..6ca6412 100644
+--- a/backend/app/detective/auth_access.py
++++ b/backend/app/detective/auth_access.py
+@@ -38,6 +38,7 @@ from .shared import (
+     _replace_query_param,
+     get_transport,
+ )
++from .infra_exposure import _SENSITIVE_PARAM_NAME_RE
+ 
+ async def check_cors_misconfig(url: str) -> dict | None:
+     """
+diff --git a/backend/app/detective/infra_exposure.py b/backend/app/detective/infra_exposure.py
+index d4b4024..0810789 100644
+--- a/backend/app/detective/infra_exposure.py
++++ b/backend/app/detective/infra_exposure.py
+@@ -38,7 +38,9 @@ from .shared import (
+     _replace_query_param,
+     get_transport,
+     _GRAPHQL_PATHS,
++    _TOKEN_PATTERN,
+ )
++from .recon_misc import _INTROSPECTION_QUERY
+ 
+ _SECRET_KEYWORD_PATTERN = re.compile(
+     r"(AWS_SECRET|DB_PASSWORD|JWT_SECRET|API_KEY|PRIVATE_KEY|ACCESS_TOKEN)",
+diff --git a/backend/app/detective/recon_misc.py b/backend/app/detective/recon_misc.py
+index b4a2732..a081d6f 100644
+--- a/backend/app/detective/recon_misc.py
++++ b/backend/app/detective/recon_misc.py
+@@ -39,6 +39,10 @@ from .shared import (
+     _replace_query_param,
+     get_transport,
+     _GRAPHQL_PATHS,
++    _TOKEN_PATTERN,
++    _SENSITIVE_FILE_HINTS,
++    _TEST_FIXTURE_PATH_HINTS,
++    _PLACEHOLDER_VALUE_HINTS,
+ )
+ 
+ _TAKEOVER_FINGERPRINTS: list[tuple[str, str, str]] = [
+diff --git a/backend/app/detective/shared.py b/backend/app/detective/shared.py
+index 774dca5..f2ff127 100644
+--- a/backend/app/detective/shared.py
++++ b/backend/app/detective/shared.py
+@@ -8,6 +8,8 @@ for the package-level docstring and full batch history.
+ import logging
+ import math
+ import re
++from collections import Counter
++from urllib.parse import urlencode, urlparse, urlunparse
+ 
+ import httpx
+ 

@@ -8,6 +8,8 @@ for the package-level docstring and full batch history.
 import logging
 import math
 import re
+from collections import Counter
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import httpx
 

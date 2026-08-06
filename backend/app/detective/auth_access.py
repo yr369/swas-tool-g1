@@ -38,6 +38,7 @@ from .shared import (
     _replace_query_param,
     get_transport,
 )
+from .infra_exposure import _SENSITIVE_PARAM_NAME_RE
 
 async def check_cors_misconfig(url: str) -> dict | None:
     """
