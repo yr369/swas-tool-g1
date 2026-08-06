@@ -13,8 +13,9 @@ import asyncpg
 
 from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
-from .shared import logger
+from .shared import logger, _TAKEOVER_CHECK_CAP
 from .persistence import _get_recon_cache_if_fresh, _save_detective_finding_pooled, _save_recon_cache_pooled
+from .persistence import _RECON_CACHE_HOURS
 
 
 async def _phase_recon(

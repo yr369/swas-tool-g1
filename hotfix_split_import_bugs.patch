@@ -1,0 +1,103 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 50ad028..6d0cbb5 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -26,6 +26,7 @@ real runtime import (`import app.main`) plus a route-count check
+ against the pre-split file before delivery.
+ """
+ 
++import asyncio
+ import logging
+ import os
+ from contextlib import asynccontextmanager
+diff --git a/backend/app/pipeline/orchestrator.py b/backend/app/pipeline/orchestrator.py
+index b08016f..040b6d1 100644
+--- a/backend/app/pipeline/orchestrator.py
++++ b/backend/app/pipeline/orchestrator.py
+@@ -19,7 +19,7 @@ import asyncpg
+ from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+ 
+ from .shared import logger, PHASES
+-from .persistence import _persist_pipeline_state
++from .persistence import _get_recon_cache_if_fresh, _persist_pipeline_state
+ from .phase_fuzz import _phase_fuzz
+ from .phase_post import _phase_gate, _phase_logic_hunter, _phase_notify, _phase_triage, _phase_verify
+ from .phase_probe import _phase_probe
+diff --git a/backend/app/pipeline/persistence.py b/backend/app/pipeline/persistence.py
+index be8180c..588745d 100644
+--- a/backend/app/pipeline/persistence.py
++++ b/backend/app/pipeline/persistence.py
+@@ -18,6 +18,10 @@ import re
+ import asyncpg
+ 
+ from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
++from .shared import logger
++
++_AEM_HOSTNAME_PATTERN = re.compile(r"\baem\b|aem[-_]?(prod|stage|dev|author|publish)", re.IGNORECASE)
++_AEM_TECH_PATTERN = re.compile(r"aem|adobe experience manager", re.IGNORECASE)
+ 
+ def _log_aem_pivot_hint(host: str, tech: list[str]) -> None:
+     """
+diff --git a/backend/app/pipeline/phase_recon.py b/backend/app/pipeline/phase_recon.py
+index 6f24a3f..3d0f673 100644
+--- a/backend/app/pipeline/phase_recon.py
++++ b/backend/app/pipeline/phase_recon.py
+@@ -13,8 +13,9 @@ import asyncpg
+ 
+ from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+ 
+-from .shared import logger
++from .shared import logger, _TAKEOVER_CHECK_CAP
+ from .persistence import _get_recon_cache_if_fresh, _save_detective_finding_pooled, _save_recon_cache_pooled
++from .persistence import _RECON_CACHE_HOURS
+ 
+ 
+ async def _phase_recon(
+diff --git a/backend/app/pipeline/phase_scan.py b/backend/app/pipeline/phase_scan.py
+index 546b0d2..a086373 100644
+--- a/backend/app/pipeline/phase_scan.py
++++ b/backend/app/pipeline/phase_scan.py
+@@ -16,6 +16,7 @@ import os
+ import re
+ 
+ import asyncpg
++import httpx
+ 
+ from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+ 
+@@ -1911,7 +1912,3 @@ async def _phase_scan(
+ # config, /crx/de and other default admin interfaces, SSRF via AEM's
+ # own fetch/import features) instead of spending time on generic
+ # TLS/cert scanner output for that host.
+-_AEM_HOSTNAME_PATTERN = re.compile(r"\baem\b|aem[-_]?(prod|stage|dev|author|publish)", re.IGNORECASE)
+-_AEM_TECH_PATTERN = re.compile(r"aem|adobe experience manager", re.IGNORECASE)
+-
+-
+diff --git a/backend/app/routers/scope.py b/backend/app/routers/scope.py
+index d911537..4424dcd 100644
+--- a/backend/app/routers/scope.py
++++ b/backend/app/routers/scope.py
+@@ -56,7 +56,7 @@ from ..models import (
+     ReadinessResponse,
+     DiffResponse,
+ )
+-from ..scan_orchestration import _spawn_background_task
++from ..scan_orchestration import _run_target_pipeline_limited, _spawn_background_task
+ 
+ logger = logging.getLogger("swas.main")
+ 
+diff --git a/backend/app/scan_orchestration.py b/backend/app/scan_orchestration.py
+index 3499856..b65a05f 100644
+--- a/backend/app/scan_orchestration.py
++++ b/backend/app/scan_orchestration.py
+@@ -17,7 +17,9 @@ import logging
+ import os
+ from datetime import datetime, timedelta, timezone
+ 
+-from . import auth_policy, checkpoint, config, database, gemini_rotation, logic_hunter, pipeline, retry_queue, tools, ws_manager
++from fastapi import HTTPException
++
++from . import auth_policy, checkpoint, config, database, gemini_rotation, logic_hunter, pipeline, retry_queue, target_intelligence, tools, triage, ws_manager
+ 
+ logger = logging.getLogger("swas.main")
+ 

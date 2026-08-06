@@ -26,6 +26,7 @@ real runtime import (`import app.main`) plus a route-count check
 against the pre-split file before delivery.
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager

@@ -56,7 +56,7 @@ from ..models import (
     ReadinessResponse,
     DiffResponse,
 )
-from ..scan_orchestration import _spawn_background_task
+from ..scan_orchestration import _run_target_pipeline_limited, _spawn_background_task
 
 logger = logging.getLogger("swas.main")
 

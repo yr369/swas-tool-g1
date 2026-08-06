@@ -16,6 +16,7 @@ import os
 import re
 
 import asyncpg
+import httpx
 
 from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
@@ -1911,7 +1912,3 @@ async def _phase_scan(
 # config, /crx/de and other default admin interfaces, SSRF via AEM's
 # own fetch/import features) instead of spending time on generic
 # TLS/cert scanner output for that host.
-_AEM_HOSTNAME_PATTERN = re.compile(r"\baem\b|aem[-_]?(prod|stage|dev|author|publish)", re.IGNORECASE)
-_AEM_TECH_PATTERN = re.compile(r"aem|adobe experience manager", re.IGNORECASE)
-
-

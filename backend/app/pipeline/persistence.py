@@ -18,6 +18,10 @@ import re
 import asyncpg
 
 from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from .shared import logger
+
+_AEM_HOSTNAME_PATTERN = re.compile(r"\baem\b|aem[-_]?(prod|stage|dev|author|publish)", re.IGNORECASE)
+_AEM_TECH_PATTERN = re.compile(r"aem|adobe experience manager", re.IGNORECASE)
 
 def _log_aem_pivot_hint(host: str, tech: list[str]) -> None:
     """

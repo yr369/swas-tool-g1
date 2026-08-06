@@ -17,7 +17,9 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from . import auth_policy, checkpoint, config, database, gemini_rotation, logic_hunter, pipeline, retry_queue, tools, ws_manager
+from fastapi import HTTPException
+
+from . import auth_policy, checkpoint, config, database, gemini_rotation, logic_hunter, pipeline, retry_queue, target_intelligence, tools, triage, ws_manager
 
 logger = logging.getLogger("swas.main")
 
