@@ -49,9 +49,17 @@ async def _phase_gate(conn: asyncpg.Connection, project_id: int) -> None:
     line. Checkpointed/retried like every other phase; a gate failure
     itself fails open per-finding (see gate.run_gate), so this can only
     ever cost extra triage calls, never silently drop a real finding.
+
+    Also runs score_missing_impact_hints() separately (see its
+    docstring) - impact_hint scoring isn't gated behind severity=
+    'unknown', since most findings (nuclei, sqlmap - anything that
+    reports its own severity) never pass through that state at all.
     """
     gated = await gate.gate_project_findings(conn, project_id)
     logger.info("gate: reviewed %s finding(s) for project_id=%s", gated, project_id)
+    scored = await gate.score_missing_impact_hints(conn, project_id)
+    if scored:
+        logger.info("gate: impact-hint scored %s finding(s) missing it for project_id=%s", scored, project_id)
 
 
 async def _phase_logic_hunter(conn: asyncpg.Connection, project_id: int) -> None:

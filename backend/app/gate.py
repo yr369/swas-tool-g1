@@ -313,3 +313,45 @@ async def gate_project_findings(conn, project_id: int) -> int:
         await _rollup_cluster_gate_status(conn, project_id)
 
     return gated
+
+
+async def score_missing_impact_hints(conn, project_id: int) -> int:
+    """
+    Scores impact_hint/impact_signals for every finding in this project
+    that doesn't have one yet, regardless of severity or gate_status.
+
+    This exists as a separate pass from gate_project_findings because
+    that function's entry condition (severity='unknown' AND
+    gate_status='pending') was written for detective.py's self-declared-
+    severity workflow specifically, and most findings never pass through
+    it: nuclei (and any other tool that reports its own severity, e.g.
+    sqlmap) inserts findings with a real severity immediately, so they
+    never have severity='unknown' even once - _score_impact_hint being
+    inside gate_project_findings' loop meant nuclei/sqlmap findings, the
+    large majority of the table, never got scored at all. A production
+    check across the existing dataset found impact_hint=NULL on 100% of
+    findings for exactly this reason, most already gate_status='passed'/
+    'failed' from before this column even existed.
+
+    Deliberately does NOT touch gate_status/gate_reasoning - those stay
+    whatever the Question Gate (or its absence, for tools that never run
+    through it) already set. This only fills in the one thing every
+    finding should have regardless of which tool produced it or whether
+    it went through the pass/fail gate at all.
+    """
+    rows = await conn.fetch(
+        "SELECT id, vuln_type, evidence FROM findings "
+        "WHERE project_id = $1 AND impact_hint IS NULL",
+        project_id,
+    )
+
+    scored = 0
+    for row in rows:
+        impact = _score_impact_hint(row["vuln_type"], row["evidence"])
+        await conn.execute(
+            "UPDATE findings SET impact_hint = $1, impact_signals = $2 WHERE id = $3",
+            impact["hint"], "; ".join(impact["signals"])[:500], row["id"],
+        )
+        scored += 1
+
+    return scored
