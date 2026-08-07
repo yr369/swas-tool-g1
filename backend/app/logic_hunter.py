@@ -199,8 +199,8 @@ async def _upsert_surface_endpoints(conn, target_id: int, endpoints: list[dict])
         await conn.execute(
             """
             INSERT INTO attack_surface_endpoints
-                (target_id, url, is_live, last_status_code, sources, requires_auth, auth_evidence)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                (target_id, url, is_live, last_status_code, tech_stack, sources, requires_auth, auth_evidence)
+            VALUES ($1, $2, $3, $4, '[]'::jsonb, $5::jsonb, $6, $7)
             ON CONFLICT (target_id, url) DO UPDATE SET
                 times_seen = attack_surface_endpoints.times_seen + 1,
                 last_seen_at = now(),
@@ -383,3 +383,5 @@ async def hunt_project(conn, project_id: int) -> int:
         )
 
     return hunted
+
+
