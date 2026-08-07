@@ -304,3 +304,4 @@ async def get_recently_completed_phases(conn: asyncpg.Connection, target_id: int
         target_id, RESUME_WINDOW_MINUTES,
     )
     return {r["phase_name"] for r in rows}
+
