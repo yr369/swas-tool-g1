@@ -64,7 +64,7 @@ _TIMEOUT = httpx.Timeout(8.0, connect=4.0)
 # ---------------------------------------------------------------------
 # 1. Dead-target detection
 # ---------------------------------------------------------------------
-_LIVENESS_SAMPLE_SIZE = 3
+_LIVENESS_SAMPLE_SIZE = 8
 
 
 async def check_target_alive_before_scan(conn: asyncpg.Connection, target_id: int, target: str) -> bool:
@@ -99,7 +99,7 @@ async def check_target_alive_before_scan(conn: asyncpg.Connection, target_id: in
     if not cached_hosts:
         return True
 
-    sample = cached_hosts[:_LIVENESS_SAMPLE_SIZE]
+    sample = random.sample(cached_hosts, min(_LIVENESS_SAMPLE_SIZE, len(cached_hosts)))
     any_alive = False
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=False, follow_redirects=True) as client:
@@ -327,3 +327,4 @@ def group_and_throttle_alerts(findings: list[dict]) -> list[dict]:
         alerts.append({"message": message[:1000], "finding_ids": finding_ids})
 
     return alerts
+
