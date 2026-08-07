@@ -178,11 +178,10 @@ async def mark_needs_attention(
     await conn.execute(
         """
         UPDATE phase_runs
-        SET status = 'needs_attention', error_message = $2
+        SET status = 'needs_attention'
         WHERE id = $1
         """,
         phase_run_id,
-        reason[:2000],
     )
     if project_id is not None:
         await ws_manager.manager.broadcast(
