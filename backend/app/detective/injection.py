@@ -37,6 +37,7 @@ from .shared import (
     _shannon_entropy,
     _replace_query_param,
     get_transport,
+    _WAF_CHALLENGE_PATH_HINTS,
 )
 
 _SQLI_DELAY_SECONDS = 6
@@ -505,8 +506,20 @@ async def check_ssti(url: str) -> dict | None:
     must be ABSENT from a baseline (unmodified) request to the same URL
     before a match counts - if it's already present without the payload,
     it's coincidence, not evaluation.
+
+    A third layer, added after a real false positive: known WAF/CDN
+    challenge endpoints (see _WAF_CHALLENGE_PATH_HINTS) are skipped
+    outright. Imperva's own Incapsula bot-challenge script does
+    arithmetic transforms on its own tokens as part of how it works -
+    that clears both proof layers above legitimately (the math really
+    does evaluate, and it's really absent from baseline), because the
+    check is sound, it's just pointed at infrastructure instead of the
+    application. No baseline/evidence trick can tell those apart from
+    the outside; only knowing the endpoint belongs to the WAF can.
     """
     parsed = httpx.URL(url)
+    if _WAF_CHALLENGE_PATH_HINTS.search(parsed.path):
+        return None
     if not parsed.query:
         return None
     existing_params = dict(parsed.params)

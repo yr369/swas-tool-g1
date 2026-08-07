@@ -37,6 +37,7 @@ from .shared import (
     _shannon_entropy,
     _replace_query_param,
     get_transport,
+    _INHERENTLY_PUBLIC_PATH_HINTS,
 )
 from .infra_exposure import _SENSITIVE_PARAM_NAME_RE
 
@@ -246,7 +247,21 @@ async def check_auth_bypass_via_method_override(url: str) -> dict | None:
     with a non-trivial body (not just a same-length login/error page).
     This is deterministic - no coincidental-string risk at all, unlike
     several batch 7-9 checks that needed a later audit fix.
+
+    Real false positive this check needs to rule out (see
+    _INHERENTLY_PUBLIC_PATH_HINTS): .well-known/ paths and the bare
+    homepage are never legitimately access-controlled - RFC 8615 defines
+    .well-known/ specifically to be public, and a 403 on either of these
+    is WAF bot-detection being non-deterministic (some requests get
+    flagged, some don't), not real authorization. The clean-transition
+    proof bar above is genuinely sound for actually-protected resources;
+    it just can't distinguish "protected resource, bypassed" from
+    "never-protected resource, WAF flagged this one request as a bot"
+    without knowing the resource is inherently public to begin with.
     """
+    parsed = httpx.URL(url)
+    if _INHERENTLY_PUBLIC_PATH_HINTS.search(parsed.path):
+        return None
     try:
         client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
         try:
@@ -460,7 +475,17 @@ async def check_auth_bypass_via_verb_tampering(url: str) -> dict | None:
     deterministic proof bar as the override-header check - a clean
     401/403 baseline, then a real 200 with substantial content on a
     different verb - no substring-matching risk.
+
+    Same _INHERENTLY_PUBLIC_PATH_HINTS exclusion and reasoning as
+    check_auth_bypass_via_method_override above - a real production
+    false positive on Iberpay's .well-known/ paths and homepage showed
+    up in both checks together, since they share the same
+    401/403-then-200 proof shape and the same blind spot (can't tell a
+    never-protected public resource from a genuinely bypassed one).
     """
+    parsed = httpx.URL(url)
+    if _INHERENTLY_PUBLIC_PATH_HINTS.search(parsed.path):
+        return None
     try:
         client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
         try:

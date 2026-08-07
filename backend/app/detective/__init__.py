@@ -43,6 +43,8 @@ from .shared import (
     _TOKEN_PATTERN,
     _TEST_FIXTURE_PATH_HINTS,
     _PLACEHOLDER_VALUE_HINTS,
+    _WAF_CHALLENGE_PATH_HINTS,
+    _INHERENTLY_PUBLIC_PATH_HINTS,
     _shannon_entropy,
     _replace_query_param,
 )

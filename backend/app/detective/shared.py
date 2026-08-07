@@ -138,6 +138,49 @@ _TOKEN_PATTERN = re.compile(
 )
 
 
+# Real production false positives (2026-08-07, Iberpay scan, caught by a
+# second independent review - see the conversation this batch came from):
+# a proof-based SSTI check flagged Imperva/Incapsula's own bot-challenge
+# endpoint (_Incapsula_Resource) as vulnerable, because that endpoint's
+# own obfuscation logic does arithmetic transforms on its challenge
+# tokens - it LOOKS exactly like a template engine evaluating a payload,
+# because the check's proof bar (expected value present in response,
+# absent from baseline) is real and correct, it's just testing the
+# wrong layer. detective.py can't tell WAF-owned infrastructure from
+# the actual application from a URL alone, so known WAF/CDN
+# challenge-endpoint paths are excluded outright rather than tested -
+# a false positive here isn't "low severity", it's guaranteed wrong on
+# every single request to it, on every scan, forever, since it's
+# testing bot-detection logic that's designed to react to exactly this
+# kind of probing.
+#
+# Deliberately short and specific rather than a broad "looks like a CDN
+# path" heuristic - a wrong exclusion here silently blinds real checks,
+# so only add a pattern once it's caused a confirmed false positive,
+# not preemptively.
+_WAF_CHALLENGE_PATH_HINTS = re.compile(
+    r"/_Incapsula_Resource\b",
+    re.IGNORECASE,
+)
+
+# .well-known/ paths are defined by RFC 8615 to be intentionally public -
+# that's the entire point of the URI scheme (robots.txt-adjacent
+# discovery files, ACME challenge tokens, security.txt, openid-config,
+# etc). A 403 on one of these is bot-blocking or misconfiguration, never
+# legitimate access control, so a "bypass" of it isn't a real auth
+# bypass regardless of what status-code transition happens. Same Iberpay
+# false-positive batch as above: verb-tampering/method-override checks
+# flagged .well-known/ paths and the bare homepage as "critical auth
+# bypass" purely because Imperva's bot-detection is non-deterministic
+# (some requests get flagged as bot traffic, some don't) - that's not
+# access control being bypassed, it's WAF heuristics being inconsistent
+# on a resource that was never meant to be protected in the first place.
+_INHERENTLY_PUBLIC_PATH_HINTS = re.compile(
+    r"/\.well-known/|^/$",
+    re.IGNORECASE,
+)
+
+
 # Paths that are near-certain to hold test fixtures / example code rather
 # than real shipped secrets - open-source repos routinely hardcode
 # high-entropy-looking dummy tokens in exactly these locations (the

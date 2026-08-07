@@ -1,0 +1,152 @@
+diff --git a/backend/app/detective/__init__.py b/backend/app/detective/__init__.py
+index 30baabd..adea8f7 100644
+--- a/backend/app/detective/__init__.py
++++ b/backend/app/detective/__init__.py
+@@ -43,6 +43,8 @@ from .shared import (
+     _TOKEN_PATTERN,
+     _TEST_FIXTURE_PATH_HINTS,
+     _PLACEHOLDER_VALUE_HINTS,
++    _WAF_CHALLENGE_PATH_HINTS,
++    _INHERENTLY_PUBLIC_PATH_HINTS,
+     _shannon_entropy,
+     _replace_query_param,
+ )
+diff --git a/backend/app/detective/auth_access.py b/backend/app/detective/auth_access.py
+index 6ca6412..eae1bd4 100644
+--- a/backend/app/detective/auth_access.py
++++ b/backend/app/detective/auth_access.py
+@@ -37,6 +37,7 @@ from .shared import (
+     _shannon_entropy,
+     _replace_query_param,
+     get_transport,
++    _INHERENTLY_PUBLIC_PATH_HINTS,
+ )
+ from .infra_exposure import _SENSITIVE_PARAM_NAME_RE
+ 
+@@ -246,7 +247,21 @@ async def check_auth_bypass_via_method_override(url: str) -> dict | None:
+     with a non-trivial body (not just a same-length login/error page).
+     This is deterministic - no coincidental-string risk at all, unlike
+     several batch 7-9 checks that needed a later audit fix.
++
++    Real false positive this check needs to rule out (see
++    _INHERENTLY_PUBLIC_PATH_HINTS): .well-known/ paths and the bare
++    homepage are never legitimately access-controlled - RFC 8615 defines
++    .well-known/ specifically to be public, and a 403 on either of these
++    is WAF bot-detection being non-deterministic (some requests get
++    flagged, some don't), not real authorization. The clean-transition
++    proof bar above is genuinely sound for actually-protected resources;
++    it just can't distinguish "protected resource, bypassed" from
++    "never-protected resource, WAF flagged this one request as a bot"
++    without knowing the resource is inherently public to begin with.
+     """
++    parsed = httpx.URL(url)
++    if _INHERENTLY_PUBLIC_PATH_HINTS.search(parsed.path):
++        return None
+     try:
+         client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+         try:
+@@ -460,7 +475,17 @@ async def check_auth_bypass_via_verb_tampering(url: str) -> dict | None:
+     deterministic proof bar as the override-header check - a clean
+     401/403 baseline, then a real 200 with substantial content on a
+     different verb - no substring-matching risk.
++
++    Same _INHERENTLY_PUBLIC_PATH_HINTS exclusion and reasoning as
++    check_auth_bypass_via_method_override above - a real production
++    false positive on Iberpay's .well-known/ paths and homepage showed
++    up in both checks together, since they share the same
++    401/403-then-200 proof shape and the same blind spot (can't tell a
++    never-protected public resource from a genuinely bypassed one).
+     """
++    parsed = httpx.URL(url)
++    if _INHERENTLY_PUBLIC_PATH_HINTS.search(parsed.path):
++        return None
+     try:
+         client = httpx.AsyncClient(timeout=_TIMEOUT, transport=get_transport(), follow_redirects=False)
+         try:
+diff --git a/backend/app/detective/injection.py b/backend/app/detective/injection.py
+index 6b3c1bd..6a54f28 100644
+--- a/backend/app/detective/injection.py
++++ b/backend/app/detective/injection.py
+@@ -37,6 +37,7 @@ from .shared import (
+     _shannon_entropy,
+     _replace_query_param,
+     get_transport,
++    _WAF_CHALLENGE_PATH_HINTS,
+ )
+ 
+ _SQLI_DELAY_SECONDS = 6
+@@ -505,8 +506,20 @@ async def check_ssti(url: str) -> dict | None:
+     must be ABSENT from a baseline (unmodified) request to the same URL
+     before a match counts - if it's already present without the payload,
+     it's coincidence, not evaluation.
++
++    A third layer, added after a real false positive: known WAF/CDN
++    challenge endpoints (see _WAF_CHALLENGE_PATH_HINTS) are skipped
++    outright. Imperva's own Incapsula bot-challenge script does
++    arithmetic transforms on its own tokens as part of how it works -
++    that clears both proof layers above legitimately (the math really
++    does evaluate, and it's really absent from baseline), because the
++    check is sound, it's just pointed at infrastructure instead of the
++    application. No baseline/evidence trick can tell those apart from
++    the outside; only knowing the endpoint belongs to the WAF can.
+     """
+     parsed = httpx.URL(url)
++    if _WAF_CHALLENGE_PATH_HINTS.search(parsed.path):
++        return None
+     if not parsed.query:
+         return None
+     existing_params = dict(parsed.params)
+diff --git a/backend/app/detective/shared.py b/backend/app/detective/shared.py
+index f2ff127..3403b43 100644
+--- a/backend/app/detective/shared.py
++++ b/backend/app/detective/shared.py
+@@ -138,6 +138,49 @@ _TOKEN_PATTERN = re.compile(
+ )
+ 
+ 
++# Real production false positives (2026-08-07, Iberpay scan, caught by a
++# second independent review - see the conversation this batch came from):
++# a proof-based SSTI check flagged Imperva/Incapsula's own bot-challenge
++# endpoint (_Incapsula_Resource) as vulnerable, because that endpoint's
++# own obfuscation logic does arithmetic transforms on its challenge
++# tokens - it LOOKS exactly like a template engine evaluating a payload,
++# because the check's proof bar (expected value present in response,
++# absent from baseline) is real and correct, it's just testing the
++# wrong layer. detective.py can't tell WAF-owned infrastructure from
++# the actual application from a URL alone, so known WAF/CDN
++# challenge-endpoint paths are excluded outright rather than tested -
++# a false positive here isn't "low severity", it's guaranteed wrong on
++# every single request to it, on every scan, forever, since it's
++# testing bot-detection logic that's designed to react to exactly this
++# kind of probing.
++#
++# Deliberately short and specific rather than a broad "looks like a CDN
++# path" heuristic - a wrong exclusion here silently blinds real checks,
++# so only add a pattern once it's caused a confirmed false positive,
++# not preemptively.
++_WAF_CHALLENGE_PATH_HINTS = re.compile(
++    r"/_Incapsula_Resource\b",
++    re.IGNORECASE,
++)
++
++# .well-known/ paths are defined by RFC 8615 to be intentionally public -
++# that's the entire point of the URI scheme (robots.txt-adjacent
++# discovery files, ACME challenge tokens, security.txt, openid-config,
++# etc). A 403 on one of these is bot-blocking or misconfiguration, never
++# legitimate access control, so a "bypass" of it isn't a real auth
++# bypass regardless of what status-code transition happens. Same Iberpay
++# false-positive batch as above: verb-tampering/method-override checks
++# flagged .well-known/ paths and the bare homepage as "critical auth
++# bypass" purely because Imperva's bot-detection is non-deterministic
++# (some requests get flagged as bot traffic, some don't) - that's not
++# access control being bypassed, it's WAF heuristics being inconsistent
++# on a resource that was never meant to be protected in the first place.
++_INHERENTLY_PUBLIC_PATH_HINTS = re.compile(
++    r"/\.well-known/|^/$",
++    re.IGNORECASE,
++)
++
++
+ # Paths that are near-certain to hold test fixtures / example code rather
+ # than real shipped secrets - open-source repos routinely hardcode
+ # high-entropy-looking dummy tokens in exactly these locations (the
