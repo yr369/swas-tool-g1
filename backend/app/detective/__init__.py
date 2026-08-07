@@ -151,6 +151,7 @@ from .auth_access import (
     _EXCESSIVE_EXPOSURE_FIELD_NAMES,
     _find_sensitive_keys,
     check_excessive_data_exposure_api,
+    check_excessive_data_exposure_confirmed,
     _API_VERSION_RE,
     _DOWNGRADE_VERSIONS,
     check_api_version_downgrade_bypass,
