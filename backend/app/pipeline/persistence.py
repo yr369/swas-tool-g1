@@ -202,7 +202,7 @@ async def _save_surface_endpoints_pooled(
                 INSERT INTO attack_surface_endpoints
                     (target_id, url, is_live, last_status_code, tech_stack, sources, requires_auth, auth_evidence)
                 VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
-                ON CONFLICT (target_id, url) DO UPDATE SET
+                ON CONFLICT (target_id, md5(url)) DO UPDATE SET
                     times_seen = attack_surface_endpoints.times_seen + 1,
                     last_seen_at = now(),
                     last_status_code = EXCLUDED.last_status_code,
