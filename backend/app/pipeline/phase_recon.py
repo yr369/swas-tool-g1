@@ -4,14 +4,10 @@ split out of the former monolithic pipeline.py (batch: pipeline split).
 """
 
 import asyncio
-import json
-import logging
-import os
-import re
 
 import asyncpg
 
-from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from .. import detective, tools
 
 from .shared import logger, _TAKEOVER_CHECK_CAP
 from .persistence import _get_recon_cache_if_fresh, _save_detective_finding_pooled, _save_recon_cache_pooled

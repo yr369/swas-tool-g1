@@ -7,15 +7,11 @@ monolithic pipeline.py; kept together since none is more than ~40
 lines and none references phase_scan/recon/probe/fuzz internals.
 """
 
-import asyncio
-import json
-import logging
 import os
-import re
 
 import asyncpg
 
-from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from .. import evidence_lifecycle, gate, logic_hunter, target_intelligence, tools, triage, verify
 
 from .shared import logger
 

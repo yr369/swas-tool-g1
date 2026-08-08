@@ -10,13 +10,10 @@ the control flow, with each phase's actual work one import away.
 
 import asyncio
 import json
-import logging
-import os
-import re
 
 import asyncpg
 
-from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from .. import checkpoint, evidence_lifecycle, target_intelligence
 
 from .shared import logger, PHASES, timeout_for_phase
 from .persistence import _get_recon_cache_if_fresh, _persist_pipeline_state

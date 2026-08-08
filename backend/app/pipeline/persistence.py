@@ -9,15 +9,13 @@ both phase_recon.py and phase_scan.py) and duplicating them per-phase
 would reintroduce the exact drift-risk a split is meant to avoid.
 """
 
-import asyncio
 import json
-import logging
 import os
 import re
 
 import asyncpg
 
-from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from .. import evidence_lifecycle, finding_dedup, fp_filter
 from .shared import logger
 
 _AEM_HOSTNAME_PATTERN = re.compile(r"\baem\b|aem[-_]?(prod|stage|dev|author|publish)", re.IGNORECASE)

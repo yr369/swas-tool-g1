@@ -3,15 +3,11 @@ pipeline/phase_probe.py - the probe phase (httpx liveness/tech-detection
 pass), split out of the former monolithic pipeline.py.
 """
 
-import asyncio
 import json
-import logging
-import os
-import re
 
 import asyncpg
 
-from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
+from .. import screenshots, target_intelligence, tools
 
 from .shared import logger
 from .persistence import _save_surface_endpoints_pooled
