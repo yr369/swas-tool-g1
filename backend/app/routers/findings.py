@@ -172,12 +172,20 @@ async def triage_one_finding(finding_id: int):
     pool = database.get_pool()
     async with pool.acquire() as conn:
         finding = await conn.fetchrow(
-            "SELECT id, tool_name, vuln_type, evidence FROM findings WHERE id = $1", finding_id
+            """
+            SELECT f.id, f.tool_name, f.vuln_type, f.evidence, st.target_type
+            FROM findings f
+            JOIN scope_targets st ON st.id = f.target_id
+            WHERE f.id = $1
+            """,
+            finding_id,
         )
         if finding is None:
             raise HTTPException(status_code=404, detail="Finding not found")
 
-        signature = triage.build_signature(finding["tool_name"], finding["vuln_type"])
+        signature = triage.build_signature(
+            finding["tool_name"], finding["vuln_type"], finding["target_type"] or "website"
+        )
         outcome_stats = await _fetch_signature_stats(conn, signature)
         vrt_entries = await vrt.get_vrt_entries()
 

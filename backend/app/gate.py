@@ -193,7 +193,13 @@ def _score_impact_hint(vuln_type: str | None, evidence: str | None) -> dict:
         return {"hint": "has_impact_signal", "signals": positive[:5]}
     if negative and not positive:
         return {"hint": "likely_informative", "signals": negative[:5]}
-    return {"hint": "unclear", "signals": (positive or negative)[:3]}
+    # Both positive and negative markers present (e.g. an API key next to
+    # "missing header" text) - genuinely ambiguous, so the hint stays
+    # "unclear", but keep both sides in `signals` rather than dropping
+    # whichever list happened to be checked first. Otherwise a future
+    # "why did this land unclear" debugging session sees only half the
+    # evidence that was actually in the text.
+    return {"hint": "unclear", "signals": (positive + negative)[:3]}
 
 
 def _get_client() -> genai.Client:
@@ -289,14 +295,20 @@ async def gate_project_findings(conn, project_id: int) -> int:
     from . import triage as triage_module  # local import avoids a circular import at module load time
 
     rows = await conn.fetch(
-        "SELECT id, tool_name, vuln_type, evidence FROM findings "
-        "WHERE project_id = $1 AND severity = 'unknown' AND gate_status = 'pending'",
+        """
+        SELECT f.id, f.tool_name, f.vuln_type, f.evidence, st.target_type
+        FROM findings f
+        JOIN scope_targets st ON st.id = f.target_id
+        WHERE f.project_id = $1 AND f.severity = 'unknown' AND f.gate_status = 'pending'
+        """,
         project_id,
     )
 
     gated = 0
     for row in rows:
-        signature = triage_module.build_signature(row["tool_name"], row["vuln_type"])
+        signature = triage_module.build_signature(
+            row["tool_name"], row["vuln_type"], row["target_type"] or "website"
+        )
         outcome_stats = await triage_module.fetch_signature_stats(conn, signature)
         result = await run_gate(row["tool_name"], row["evidence"] or "", outcome_stats=outcome_stats)
         status = "passed" if result["pass"] else "failed"

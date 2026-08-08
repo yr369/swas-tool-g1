@@ -126,6 +126,15 @@ def build_signature(tool_name: str, vuln_type: str, target_type: str = "website"
     Builds the stable pattern key used to look up past outcomes - e.g.
     "nuclei:CVE-2023-48795:website". Keeping this in one function means
     triage and outcome-logging always agree on the same format.
+
+    target_type matters: the same tool+vuln_type can behave very
+    differently on a website vs. a mobile app vs. an API, so outcome
+    history should be segmented by it rather than pooled together.
+    Callers should pass the finding's real target_type (from
+    scope_targets, joined on target_id) whenever they have it - the
+    "website" default here only exists for call sites that genuinely
+    don't have that join available, not as a blanket stand-in for
+    every target.
     """
     return f"{tool_name}:{vuln_type}:{target_type}"
 
@@ -478,10 +487,18 @@ async def _triage_and_store_finding(
     policy_exclusions: this project's parsed policy exclusions (see
     policy_gate.py), fetched ONCE per triage batch by the caller same as
     preferred_model_override, passed straight through.
+
+    row["target_type"] (optional): the finding's target's actual
+    target_type (website/api/mobile/hardware/unknown), when the
+    caller's SELECT joined scope_targets for it. Falls back to
+    build_signature's own "website" default when absent, which is the
+    previous behavior for any caller not yet updated to join it in -
+    see build_signature's docstring for why this matters.
     """
     from . import target_intelligence
 
-    signature = build_signature(row["tool_name"], row["vuln_type"])
+    target_type = row.get("target_type") or "website"
+    signature = build_signature(row["tool_name"], row["vuln_type"], target_type)
     outcome_stats = await fetch_signature_stats(conn, signature)
     clean_evidence, self_declared_severity = _extract_self_declared_severity(row["evidence"] or "")
 
@@ -595,8 +612,10 @@ async def triage_project_findings(conn, project_id: int, include_gate_failed: bo
     gate_clause = "" if include_gate_failed else "AND gate_status != 'failed'"
     rows = await conn.fetch(
         f"""
-        SELECT id, target_id, tool_name, vuln_type, evidence FROM findings
-        WHERE project_id = $1 AND severity = 'unknown' {gate_clause}
+        SELECT f.id, f.target_id, f.tool_name, f.vuln_type, f.evidence, st.target_type
+        FROM findings f
+        JOIN scope_targets st ON st.id = f.target_id
+        WHERE f.project_id = $1 AND f.severity = 'unknown' {gate_clause}
         """,
         project_id,
     )
@@ -691,7 +710,12 @@ async def retry_pending_ai_failures(pool) -> int:
                 )
 
             row = await conn.fetchrow(
-                "SELECT id, target_id, tool_name, vuln_type, evidence, severity FROM findings WHERE id = $1",
+                """
+                SELECT f.id, f.target_id, f.tool_name, f.vuln_type, f.evidence, f.severity, st.target_type
+                FROM findings f
+                JOIN scope_targets st ON st.id = f.target_id
+                WHERE f.id = $1
+                """,
                 finding_id,
             )
             if row is None:
