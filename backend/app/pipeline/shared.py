@@ -7,6 +7,7 @@ filters/greps on that name keep working), and the phase-name list.
 """
 
 import logging
+import os
 
 _TAKEOVER_CHECK_CAP = 15
 _SENSITIVE_URL_CHECK_CAP = 15
@@ -96,5 +97,35 @@ _RATE_LIMIT_BYPASS_CHECK_CAP = 6      # deliberately bursts up to 12 requests pe
 logger = logging.getLogger("swas.pipeline")
 
 PHASES = ["recon", "probe", "fuzz", "scan", "verify", "gate", "logic_hunter", "triage", "notify"]
+
+# Wall-clock cap per phase, per target. Every individual HTTP call inside
+# detective/*.py already has its own httpx timeout, and subprocess calls
+# (oob.py, tools.py) are already wrapped in asyncio.wait_for - but nothing
+# capped the PHASE as a whole. A phase stuck in a retry/polling loop that
+# never itself raises (a hung tool subprocess not covered by tools.py's
+# wrapper, a pathological target, a stuck websocket read, etc.) could run
+# indefinitely - this is the confirmed cause of scans sitting in
+# 'scanning' for hours with nothing actually happening. scan gets the
+# longest budget (it runs ~130 detective.py checks across every live
+# host); notify is a single webhook POST and gets the shortest. Override
+# per-phase with PHASE_TIMEOUT_<PHASE>_SECONDS (e.g.
+# PHASE_TIMEOUT_SCAN_SECONDS=7200) without touching code.
+_DEFAULT_PHASE_TIMEOUT_SECONDS = int(os.environ.get("PHASE_TIMEOUT_DEFAULT_SECONDS", str(30 * 60)))
+
+PHASE_TIMEOUT_SECONDS = {
+    "recon": int(os.environ.get("PHASE_TIMEOUT_RECON_SECONDS", str(20 * 60))),
+    "probe": int(os.environ.get("PHASE_TIMEOUT_PROBE_SECONDS", str(15 * 60))),
+    "fuzz": int(os.environ.get("PHASE_TIMEOUT_FUZZ_SECONDS", str(30 * 60))),
+    "scan": int(os.environ.get("PHASE_TIMEOUT_SCAN_SECONDS", str(90 * 60))),
+    "verify": int(os.environ.get("PHASE_TIMEOUT_VERIFY_SECONDS", str(30 * 60))),
+    "gate": int(os.environ.get("PHASE_TIMEOUT_GATE_SECONDS", str(20 * 60))),
+    "logic_hunter": int(os.environ.get("PHASE_TIMEOUT_LOGIC_HUNTER_SECONDS", str(20 * 60))),
+    "triage": int(os.environ.get("PHASE_TIMEOUT_TRIAGE_SECONDS", str(30 * 60))),
+    "notify": int(os.environ.get("PHASE_TIMEOUT_NOTIFY_SECONDS", str(2 * 60))),
+}
+
+
+def timeout_for_phase(phase_name: str) -> int:
+    return PHASE_TIMEOUT_SECONDS.get(phase_name, _DEFAULT_PHASE_TIMEOUT_SECONDS)
 
 

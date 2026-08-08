@@ -18,7 +18,7 @@ import asyncpg
 
 from .. import auth_policy, auth_sessions, checkpoint, detective, evidence_lifecycle, finding_dedup, fp_filter, gate, git_dumper, logic_hunter, oob, screenshots, target_intelligence, tools, triage, verify
 
-from .shared import logger, PHASES
+from .shared import logger, PHASES, timeout_for_phase
 from .persistence import _get_recon_cache_if_fresh, _persist_pipeline_state
 from .phase_fuzz import _phase_fuzz
 from .phase_post import _phase_gate, _phase_logic_hunter, _phase_notify, _phase_triage, _phase_verify
@@ -241,13 +241,45 @@ async def _run_phase_with_retry(
         # _phase_scan/_phase_recon) is that nothing holds a pool
         # connection across slow outbound network calls anymore.
 
+        phase_timeout = timeout_for_phase(phase_name)
         try:
             async with checkpoint.run_phase(pool, phase_run_id, project_id, target_id, phase_name):
-                await _execute_phase(
-                    pool, project_id, target_id, phase_name, target,
-                    discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
+                # Wall-clock cap on the phase as a whole - see shared.py's
+                # PHASE_TIMEOUT_SECONDS docstring. asyncio.TimeoutError
+                # propagates up through checkpoint.run_phase's except
+                # clause same as any other exception (logged, row marked
+                # 'failed', error_type classified as network_timeout by
+                # error_taxonomy.py) - no special-casing needed here
+                # beyond picking the budget.
+                await asyncio.wait_for(
+                    _execute_phase(
+                        pool, project_id, target_id, phase_name, target,
+                        discovered_subdomains, live_hosts, discovered_urls, params_found, tech_stack,
+                    ),
+                    timeout=phase_timeout,
                 )
             return True  # checkpoint.run_phase already marked it completed
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s phase for target_id=%s exceeded its %ds budget - treating as failed",
+                phase_name, target_id, phase_timeout,
+            )
+            if attempt >= max_attempts:
+                async with pool.acquire() as conn:
+                    await checkpoint.mark_needs_attention(
+                        conn,
+                        phase_run_id,
+                        f"Timed out after {phase_timeout}s ({attempt} attempt(s)), giving up on this phase",
+                        project_id=project_id,
+                        target_id=target_id,
+                        phase_name=phase_name,
+                    )
+                return False
+            logger.info(
+                "Retrying %s for target_id=%s (attempt %s/%s)",
+                phase_name, target_id, attempt + 1, max_attempts,
+            )
 
         except Exception:
             # checkpoint.run_phase already logged this and marked the
