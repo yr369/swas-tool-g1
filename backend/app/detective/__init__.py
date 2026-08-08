@@ -192,6 +192,8 @@ from .auth_access import (
     _RATE_LIMIT_BYPASS_HEADERS,
     _RATE_LIMIT_PROBE_BURST,
     check_rate_limit_header_bypass,
+    check_idor_multi_account,
+    check_bfla_low_priv_admin_access,
 )
 
 from .cloud_storage import (
