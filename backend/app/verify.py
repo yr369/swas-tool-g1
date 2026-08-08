@@ -50,8 +50,6 @@ import uuid
 
 import httpx
 
-from . import oob
-
 logger = logging.getLogger("swas.verify")
 
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
@@ -174,7 +172,7 @@ async def _verify_xss_execution(evidence: str, vuln_type: str) -> tuple[str, str
     )
 
 
-async def verify_finding(vuln_type: str, evidence: str, finding_tag: str, oob_domain, oob_proc) -> tuple[str, str] | None:
+async def verify_finding(vuln_type: str, evidence: str, finding_tag: str) -> tuple[str, str] | None:
     """
     Dispatches to the right confirmation technique for this finding's
     vuln_type. Returns (verification_status, verification_evidence) or
@@ -193,11 +191,17 @@ async def verify_finding(vuln_type: str, evidence: str, finding_tag: str, oob_do
 async def verify_project_findings(conn, project_id: int) -> int:
     """
     Runs verification on every finding still pending verification
-    review for a project. Shared OOB session (see oob.py) is started
-    once for the whole run and reused across every SSRF-eligible
-    finding, then torn down at the end - starting one interactsh-client
-    process per finding would be wasteful and would fragment the canary
-    domain space for no benefit.
+    review for a project.
+
+    Note: neither implemented technique (host-header consequence
+    escalation, XSS execution proof) uses an OOB/interactsh session -
+    blind SSRF is verified separately in detective.py's own
+    check_ssrf_blind_oob, which manages its own OOB session. This
+    function used to start a shared interactsh-client session here
+    too "for future SSRF re-verification," but nothing ever read it -
+    starting a real subprocess and paying its network handshake on
+    every single verify-phase run for zero benefit. Removed; add it
+    back if/when a technique here actually needs it.
     """
     rows = await conn.fetch(
         "SELECT id, vuln_type, evidence FROM findings "
@@ -207,26 +211,20 @@ async def verify_project_findings(conn, project_id: int) -> int:
     if not rows:
         return 0
 
-    oob_domain, oob_proc = await oob.start_session()
     verified = 0
-    try:
-        for row in rows:
-            finding_tag = f"f{row['id']}"
-            result = await verify_finding(
-                row["vuln_type"], row["evidence"] or "", finding_tag, oob_domain, oob_proc,
-            )
-            if result is None:
-                # No technique for this vuln_type - leave it 'pending' so
-                # it's visibly distinguishable from "we tried and
-                # couldn't confirm" (tentative/unconfirmed).
-                continue
-            status, verify_evidence = result
-            await conn.execute(
-                "UPDATE findings SET verification_status = $1, verification_evidence = $2 WHERE id = $3",
-                status, verify_evidence[:1000], row["id"],
-            )
-            verified += 1
-    finally:
-        await oob.stop_session(oob_proc)
+    for row in rows:
+        finding_tag = f"f{row['id']}"
+        result = await verify_finding(row["vuln_type"], row["evidence"] or "", finding_tag)
+        if result is None:
+            # No technique for this vuln_type - leave it 'pending' so
+            # it's visibly distinguishable from "we tried and
+            # couldn't confirm" (tentative/unconfirmed).
+            continue
+        status, verify_evidence = result
+        await conn.execute(
+            "UPDATE findings SET verification_status = $1, verification_evidence = $2 WHERE id = $3",
+            status, verify_evidence[:1000], row["id"],
+        )
+        verified += 1
 
     return verified

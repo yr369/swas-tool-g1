@@ -266,7 +266,13 @@ async def format_cross_target_context(
 
 # Matches the largest dollar figure in a freeform reward_range string
 # like "$500 - $2,500" or "up to $10000" or "$250/low, $5000/critical".
-_MONEY_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*[kK]?")
+# The k-suffix is captured PER MATCH (group 2) rather than checked once
+# against the whole string - a string like "$100 - $10k" has two
+# numbers and only one of them takes the multiplier; scaling based on
+# "does the string contain a k anywhere" instead of "did THIS number
+# have a k after it" silently picks the wrong figure whenever a range
+# mixes a k-suffixed number with a plain one.
+_MONEY_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kK])?")
 
 
 def compute_payout_priority(reward_range: str | None) -> float:
@@ -285,21 +291,17 @@ def compute_payout_priority(reward_range: str | None) -> float:
     if not matches:
         return 1.0
     values = []
-    for m in matches:
+    for number_str, k_suffix in matches:
         try:
-            v = float(m.replace(",", ""))
+            v = float(number_str.replace(",", ""))
         except ValueError:
             continue
-        # crude k-suffix handling: if the original snippet around this
-        # number contains a 'k'/'K', the regex above already consumed
-        # it as part of the unit, so scale here based on string content.
+        if k_suffix:
+            v *= 1000
         values.append(v)
     if not values:
         return 1.0
-    best = max(values)
-    if "k" in reward_range.lower() and best < 1000:
-        best *= 1000
-    return best
+    return max(values)
 
 
 def normalize_tech_signature(tech_stack_union: str | None) -> str | None:
